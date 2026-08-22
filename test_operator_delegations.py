@@ -671,6 +671,109 @@ def test_concurrent_dispatched_cancel_preserves_first_confirmed_cancellation(
         assert attachment["evidence_ref"] == f"delegation:{delegation_id}"
 
 
+@pytest.mark.parametrize("with_mission", [False, True])
+@pytest.mark.parametrize("weaker_backend_state", ["completed", "running", "cancel_requested"])
+def test_concurrent_dispatched_cancel_promotes_delayed_confirmed_cancellation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    with_mission: bool,
+    weaker_backend_state: str,
+):
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    root = tmp_path / "hermes"
+    _enable_workspace(monkeypatch, workspace)
+    mission_id = _mission(root) if with_mission else ""
+    delegation_id = f"dlg-cancel-promote-{weaker_backend_state}-{str(with_mission).lower()}"
+    task_id = f"delegation-cancel-promote-{weaker_backend_state}-{str(with_mission).lower()}"
+    monkeypatch.setattr(
+        delegations.contract_mod,
+        "hermes_contract_dispatch",
+        lambda *args, **kwargs: json.dumps(
+            {"success": True, "changed": True, "backend": "pi_rpc", "state": "running"}
+        ),
+    )
+    dispatched = json.loads(delegations.hermes_delegation_dispatch(
+        json.dumps(_contract(workspace, task_id=task_id)),
+        mission_id=mission_id,
+        delegation_id=delegation_id,
+        confirm=True,
+        dry_run=False,
+        hermes_root=root,
+    ))
+    assert dispatched["success"] is True
+
+    confirmed_entered = threading.Event()
+    weaker_entered = threading.Event()
+    release_confirmed = threading.Event()
+    call_lock = threading.Lock()
+    calls = 0
+
+    def cancel(*args, **kwargs):
+        nonlocal calls
+        with call_lock:
+            calls += 1
+            call = calls
+        if call == 1:
+            confirmed_entered.set()
+            assert weaker_entered.wait(5)
+            assert release_confirmed.wait(5)
+            return json.dumps({"success": True, "changed": True, "state": "cancelled"})
+        weaker_entered.set()
+        return json.dumps({"success": True, "changed": False, "state": weaker_backend_state})
+
+    monkeypatch.setattr(delegations.runners, "hermes_runner_cancel", cancel)
+    results: list[dict] = []
+    confirmed = threading.Thread(target=lambda: results.append(json.loads(
+        delegations.hermes_delegation_cancel(
+            delegation_id, confirm=True, dry_run=False, hermes_root=root,
+        )
+    )))
+    weaker = threading.Thread(target=lambda: results.append(json.loads(
+        delegations.hermes_delegation_cancel(
+            delegation_id, confirm=True, dry_run=False, hermes_root=root,
+        )
+    )))
+    confirmed.start()
+    assert confirmed_entered.wait(5)
+    weaker.start()
+    assert weaker_entered.wait(5)
+    weaker.join(5)
+    assert not weaker.is_alive()
+    assert results[0]["success"] is True
+    assert results[0]["delegation"]["state"] == "reconciling"
+    assert results[0]["delegation"]["cancel_requested"] is True
+    release_confirmed.set()
+    confirmed.join(5)
+    assert not confirmed.is_alive()
+
+    promoted = results[1]
+    assert promoted["success"] is True
+    assert promoted["changed"] is True
+    assert promoted["delegation"]["state"] == "cancelled"
+    assert promoted["delegation"]["dispatch_phase"] == "cancelled"
+    assert promoted["delegation"]["terminal_at"] is not None
+    durable = json.loads(delegations.hermes_delegation_get(
+        delegation_id, hermes_root=root,
+    ))["delegation"]
+    assert durable["state"] == "cancelled"
+    assert durable["outcome"] == "cancelled"
+    assert durable["cancel_requested"] is True
+    assert durable["dispatch_phase"] == "cancelled"
+    cancel_events = [
+        event["event_type"] for event in durable["events"]
+        if event["event_type"] in {"delegation.cancelled", "delegation.cancel_requested"}
+    ]
+    assert cancel_events.count("delegation.cancelled") == 1
+    # Events are surfaced newest first.
+    assert cancel_events == ["delegation.cancelled", "delegation.cancel_requested"]
+    if mission_id:
+        mission = json.loads(missions.hermes_mission_get(mission_id, hermes_root=root))
+        attachment = next(item for item in mission["attachments"] if item["ref"] == delegation_id)
+        assert attachment["state"] == "cancelled"
+        assert attachment["evidence_ref"] == f"delegation:{delegation_id}"
+
+
 @pytest.mark.parametrize("cancel_kind", ["reserved", "dispatched"])
 @pytest.mark.parametrize("observed_state", ["running", "completed"])
 @pytest.mark.parametrize("apply", [False, True])

@@ -954,22 +954,54 @@ def hermes_delegation_cancel(
             _init(db)
             db.execute("BEGIN IMMEDIATE")
             current = dict(_get_row(db, delegation_id))
+            promoted_cancellation = False
             authority_fields = (
                 "schema", "mission_id", "task_id", "contract_sha256", "backend",
                 "state", "backend_state", "outcome", "validation_verdict",
                 "cancel_requested", "dispatch_phase", "dispatched_at", "updated_at", "terminal_at",
             )
             if any(current.get(key) != stored.get(key) for key in authority_fields):
-                db.commit()
-                return _dispatched_cancel_cas_lost(current, result)
-            dispatch_phase = "cancelled" if desired == "cancelled" else stored.get("dispatch_phase", "dispatched")
-            db.execute(
-                "UPDATE delegations SET state=?,backend_state=?,outcome=?,cancel_requested=1,dispatch_phase=?,updated_at=?,terminal_at=? WHERE delegation_id=?",
-                (desired, _bounded(backend_state, 128), outcome, dispatch_phase, now, now if desired in TERMINAL_STATES else None, delegation_id),
-            )
-            _event(db, delegation_id, event_type, from_state=stored["state"], to_state=desired, backend_state=backend_state)
+                immutable_lineage = (
+                    "schema", "mission_id", "task_id", "contract_sha256", "backend", "dispatched_at",
+                )
+                same_lineage = all(current.get(key) == stored.get(key) for key in immutable_lineage)
+                can_promote = (
+                    desired == "cancelled"
+                    and same_lineage
+                    and current.get("state") not in TERMINAL_STATES
+                    and bool(current.get("cancel_requested"))
+                    and current.get("dispatch_phase") == stored.get("dispatch_phase")
+                )
+                if not can_promote:
+                    db.commit()
+                    return _dispatched_cancel_cas_lost(current, result)
+                terminal_at = current.get("terminal_at") or now
+                db.execute(
+                    "UPDATE delegations SET state='cancelled',backend_state=?,outcome='cancelled',"
+                    "cancel_requested=1,dispatch_phase='cancelled',updated_at=?,terminal_at=? WHERE delegation_id=?",
+                    (_bounded(backend_state, 128), now, terminal_at, delegation_id),
+                )
+                _event(
+                    db,
+                    delegation_id,
+                    "delegation.cancelled",
+                    from_state=current["state"],
+                    to_state="cancelled",
+                    backend_state=backend_state,
+                )
+                promoted_cancellation = True
+            else:
+                dispatch_phase = "cancelled" if desired == "cancelled" else stored.get("dispatch_phase", "dispatched")
+                db.execute(
+                    "UPDATE delegations SET state=?,backend_state=?,outcome=?,cancel_requested=1,dispatch_phase=?,updated_at=?,terminal_at=? WHERE delegation_id=?",
+                    (desired, _bounded(backend_state, 128), outcome, dispatch_phase, now, now if desired in TERMINAL_STATES else None, delegation_id),
+                )
+                _event(db, delegation_id, event_type, from_state=stored["state"], to_state=desired, backend_state=backend_state)
             db.commit()
             row = dict(_get_row(db, delegation_id))
+        if promoted_cancellation:
+            desired = "cancelled"
+            event_type = "delegation.cancelled"
         mission_synced = True
         if row.get("mission_id"):
             mission_synced = _sync_mission_attachment(
