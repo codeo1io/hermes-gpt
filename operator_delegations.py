@@ -625,7 +625,9 @@ def hermes_delegation_dispatch(
         dispatch = json.loads(contract_mod.hermes_contract_dispatch(
             canonical, confirm=confirm, dry_run=False, timeout=timeout, hermes_root=root,
         ))
-        ambiguous = bool(dispatch.get("submission_may_have_succeeded") or (dispatch.get("changed") and not dispatch.get("success")))
+        ambiguous = bool(dispatch.get("submission_may_have_succeeded")) or (
+            not dispatch.get("success") and dispatch.get("changed") is not False
+        )
         if not dispatch.get("success") and not ambiguous:
             with _connect(path, write=True) as db:
                 _init(db)
@@ -692,6 +694,7 @@ def hermes_delegation_dispatch(
             "success": True,
             "schema_version": SCHEMA_VERSION,
             "changed": True,
+            **({"submission_may_have_succeeded": True} if ambiguous else {}),
             "delegation": _surface(row),
             "mission_linked": bool(mission_id),
             "dispatch": dispatch,

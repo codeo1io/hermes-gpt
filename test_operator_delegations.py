@@ -1375,6 +1375,60 @@ def test_definite_rejection_resets_reserved_and_retry_dispatches(tmp_path: Path,
     assert second["success"] and second["delegation"]["dispatch_phase"] == "dispatched"
 
 
+_CHANGED_MISSING = object()
+
+
+@pytest.mark.parametrize(
+    "backend_changed",
+    [_CHANGED_MISSING, None, 0, "false", []],
+    ids=["missing", "null", "falsey-non-bool", "truthy-non-bool", "malformed-container"],
+)
+def test_ambiguous_failed_dispatch_cannot_reinvoke_backend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    backend_changed: object,
+):
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    root = tmp_path / "hermes"
+    _enable_workspace(monkeypatch, workspace)
+    calls = 0
+
+    def dispatch(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        response = {"success": False, "code": "BACKEND_FAILURE"}
+        if backend_changed is not _CHANGED_MISSING:
+            response["changed"] = backend_changed
+        return json.dumps(response)
+
+    monkeypatch.setattr(delegations.contract_mod, "hermes_contract_dispatch", dispatch)
+    contract = json.dumps(_contract(workspace, task_id="delegation-ambiguous-retry"))
+    first = json.loads(delegations.hermes_delegation_dispatch(
+        contract,
+        delegation_id="dlg-ambiguous-retry",
+        confirm=True,
+        dry_run=False,
+        hermes_root=root,
+    ))
+    retry = json.loads(delegations.hermes_delegation_dispatch(
+        contract,
+        delegation_id="dlg-ambiguous-retry",
+        confirm=True,
+        dry_run=False,
+        hermes_root=root,
+    ))
+
+    assert calls == 1
+    assert first["submission_may_have_succeeded"] is True
+    assert first["delegation"]["state"] == "reconciling"
+    assert first["delegation"]["dispatch_phase"] == "invoking"
+    assert retry["success"] is False
+    assert retry["code"] == "DELEGATION_DISPATCH_AMBIGUOUS"
+    assert retry["submission_may_have_succeeded"] is True
+    assert retry["delegation"]["dispatch_phase"] == "invoking"
+
+
 def test_missing_or_corrupt_manifest_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     workspace = tmp_path / "ws"
     workspace.mkdir()
