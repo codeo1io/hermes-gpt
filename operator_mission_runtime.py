@@ -855,13 +855,18 @@ def hermes_mission_reconcile(
             _audit("hermes_mission_reconcile", policy, dry_run=False, success=True, changed=True, mission_id=mission_id, summary=f"mission reconciled {completion_mission['status']}->completed")
             return json.dumps({"success": True, "schema_version": SCHEMA_VERSION, "tool": "hermes_mission_reconcile", "mission_id": mission_id, "status": "completed", "observed": completion_observed, "changed": True})
 
+        # Observe potentially slow external attachment stores without holding
+        # the Mission write lock, then commit through the Mission version CAS.
+        mission = completion_mission
+        observed = completion_observed
+        current = str(mission["status"])
+        desired = _desired_mission_status(mission, observed)
         live_notice: dict[str, Any] | None = None
         with _connect(path, write=True) as db:
             _begin_write(db)
-            mission = _row_to_mission(db, _get_row(db, mission_id))
-            current = str(mission["status"])
-            observed = _observe_attachments(root, mission)
-            desired = _desired_mission_status(mission, observed)
+            current_row = _get_row(db, mission_id)
+            if int(current_row["version"]) != int(mission["version"]):
+                raise ValueError("Mission authority changed after child observation")
             if desired == "completed":
                 raise ValueError("Mission child observation changed during completion; retry reconciliation")
             original = {(a["kind"], a["ref"]): (a["state"], bool(a.get("verified"))) for a in mission["attachments"]}

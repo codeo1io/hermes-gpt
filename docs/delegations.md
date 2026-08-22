@@ -18,7 +18,7 @@ The delegation database stores only bounded lineage and lifecycle metadata: dele
 
 A delegation never marks work successful because a worker says it succeeded. Reconciliation reads the existing runner/Fabric observations for the Work Contract task id, but backend terminal success remains `reconciling` until the matching immutable Work Contract lineage has a `SATISFIED` validation verdict. Missing, unreadable, or `UNVERIFIED` evidence therefore fails closed. When a Work Contract is supplied to reconciliation, its canonical SHA and task id must match the stored lineage before validation can contribute evidence.
 
-Mission linkage uses the existing `delegation` attachment kind. Dispatch creates/updates a pending/running attachment. A Mission attachment becomes `succeeded` only when delegation reconciliation has both authoritative backend completion and a `SATISFIED` Work Contract verdict; that bridge records the contract digest as its verification reference. Cancellation records `cancelled` only after the backend cancellation path returns success.
+Mission linkage uses the existing `delegation` attachment kind. Dispatch creates/updates a pending/running attachment. A Mission attachment becomes `succeeded` only when delegation reconciliation has both authoritative backend completion and a `SATISFIED` Work Contract verdict; that bridge records the contract digest as its verification reference. Cancellation records `cancelled` only when the backend explicitly confirms `cancelled`/`canceled`. Other successful backend responses remain reconciling. An explicit unsuccessful, unchanged backend response releases the provisional cancellation latch; ambiguous failures remain latched for authoritative reconciliation.
 
 ## OpenCode backend
 

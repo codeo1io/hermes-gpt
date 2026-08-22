@@ -90,11 +90,13 @@ def _make_kanban_board(boards_dir: Path, slug: str, runs: list[dict]) -> None:
 def hermes_root(tmp_path: Path, monkeypatch) -> Path:
     """Build a hermetic Hermes root + workspace with observed run sources."""
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
-    op.set_audit_log_override(tmp_path / "audit.jsonl")
     contract_mod.mission._cache_clear()
 
     root = tmp_path / "hermes"
     root.mkdir(parents=True, exist_ok=True)
+    audit_path = root / "logs" / "hermes_gpt_operator_audit.jsonl"
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    op.set_audit_log_override(audit_path)
     (root / "config.yaml").write_text("model: test-model\nprovider: test-provider\n", encoding="utf-8")
 
     ws = tmp_path / "ws"
@@ -1094,21 +1096,49 @@ def test_validate_does_not_modify_state(hermes_root):
     cache.parent.mkdir(parents=True, exist_ok=True)
     cache.write_text("def cached(): pass\n", encoding="utf-8")
 
+    c = _contract_for_ws(ws, task_id="t-done")
+    _add_review_evidence(c, reviewer="default")
     before = {
         p.relative_to(hermes_root).as_posix(): (p.stat().st_size, p.stat().st_mtime_ns)
         for p in hermes_root.rglob("*")
-        if p.is_file()
+        if p.is_file() and p != op.audit_log_path()
     }
-    c = _contract_for_ws(ws, task_id="t-done")
-    _add_review_evidence(c, reviewer="default")
     out = _run_validate(c, hermes_root)
     assert out["verdict"] == "SATISFIED"
     after = {
         p.relative_to(hermes_root).as_posix(): (p.stat().st_size, p.stat().st_mtime_ns)
         for p in hermes_root.rglob("*")
-        if p.is_file()
+        if p.is_file() and p != op.audit_log_path()
     }
     assert after == before
+
+
+def test_custom_root_audit_evidence_is_isolated(tmp_path: Path):
+    custom = tmp_path / "custom-hermes"
+    other = tmp_path / "other-hermes"
+    for root in (custom, other):
+        (root / "logs").mkdir(parents=True)
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    c = _contract_for_ws(ws, task_id="custom-audit-task")
+    c["forbidden_actions"] = [{"action": "public_publish", "class": "HIGH", "reason": "forbidden"}]
+    c["authorization"]["approved_by"] = c["assigned_profile"]
+    c["authorization"].pop("approval_reference", None)
+    canonical, parsed, sha = contract_mod._parse_contract(json.dumps(c))
+    del canonical
+    custom_records = [
+        {"tool": "hermes_contract_validate", "contract_sha256": sha, "verdict": "SATISFIED", "reviewer": "independent"},
+        {"tool": "public_publish", "task_id": parsed["task_id"], "profile": parsed["assigned_profile"], "forbidden_action": "public_publish"},
+    ]
+    (custom / "logs" / "hermes_gpt_operator_audit.jsonl").write_text(
+        "".join(json.dumps(record) + "\n" for record in custom_records), encoding="utf-8"
+    )
+    (other / "logs" / "hermes_gpt_operator_audit.jsonl").write_text("", encoding="utf-8")
+
+    assert contract_mod._check_review(parsed, sha, custom)["status"] == "PASS"
+    assert contract_mod._check_forbidden(parsed, custom, sha)["status"] == "FAIL"
+    assert contract_mod._check_review(parsed, sha, other)["status"] == "FAIL"
+    assert contract_mod._check_forbidden(parsed, other, sha)["status"] == "PASS"
 
 
 # ---------------------------------------------------------------------------

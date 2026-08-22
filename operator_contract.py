@@ -639,11 +639,25 @@ def _observed_runs(task_id: str, hermes_root: Path) -> list[dict[str, Any]]:
     )
 
 
-def _observed_audit(limit: int = _MAX_REVIEW_EVIDENCE_SCAN) -> list[dict[str, Any]]:
+def _observed_audit(
+    hermes_root: Path,
+    limit: int = _MAX_REVIEW_EVIDENCE_SCAN,
+) -> list[dict[str, Any]]:
+    """Read audit evidence only from the selected Hermes root."""
+    log_path = _resolve_root(hermes_root) / "logs" / "hermes_gpt_operator_audit.jsonl"
+    records: list[dict[str, Any]] = []
     try:
-        return op.audit_tail(limit=limit)
-    except Exception:
+        with log_path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(record, dict):
+                    records.append(record)
+    except OSError:
         return []
+    return records[-limit:] if limit > 0 else records
 
 
 # ---------------------------------------------------------------------------
@@ -908,7 +922,7 @@ def _check_review(contract: dict[str, Any], contract_sha256: str, hermes_root: P
         }
 
     # Evidence 1: an audit hermes_contract_validate acceptance by a distinct reviewer.
-    for rec in _observed_audit():
+    for rec in _observed_audit(hermes_root):
         if rec.get("tool") != "hermes_contract_validate":
             continue
         if rec.get("contract_sha256") != contract_sha256:
@@ -1041,7 +1055,7 @@ def _check_forbidden(
     # Audit trail scan (D5): scope strictly to this contract's task identity.
     # Profile-only matching allowed an unrelated concurrent contract to fail this
     # one; records without a matching task_id are intentionally ignored.
-    for rec in _observed_audit():
+    for rec in _observed_audit(hermes_root):
         if str(rec.get("task_id") or "") != task_id:
             continue
         profile = str(rec.get("profile") or "")
@@ -1363,7 +1377,7 @@ def _validate_impl(contract: dict[str, Any], sha: str, runner: Callable[..., tup
     evidence: dict[str, Any] = {
         "run": _observed_runs(contract["task_id"], hermes_root)[:5],
         "artifacts": [],
-        "audit_count": len(_observed_audit()),
+        "audit_count": len(_observed_audit(hermes_root)),
     }
     for c in checks:
         if c.get("evidence"):

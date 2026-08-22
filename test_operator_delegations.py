@@ -239,6 +239,106 @@ def test_no_approval_reconcile_fails_closed_when_confirmed_cancel_starts_after_o
     assert cancelled[0]["delegation"]["state"] == "cancelled"
 
 
+@pytest.mark.parametrize("completion_path", ["approve", "transition", "reconcile"])
+def test_mission_completion_rejects_concurrent_reconcile_authority_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    completion_path: str,
+):
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    root = tmp_path / "hermes"
+    _enable_workspace(monkeypatch, workspace)
+    mission_id = f"msn-stale-success-{completion_path}"
+    delegation_id = f"dlg-stale-success-{completion_path}"
+    task_id = f"stale-success-{completion_path}-task"
+    approval_required = completion_path == "approve"
+    if not approval_required:
+        monkeypatch.setenv(op.OPERATOR_LEVEL_ENV, "owner")
+        monkeypatch.setenv(op.OWNER_ACTIVE_ENV, "1")
+        monkeypatch.setenv(op.OWNER_ACK_ENV, op.OWNER_ACK_REQUIRED_VALUE)
+    _successful_mission_delegation(
+        root, workspace, monkeypatch, mission_id=mission_id,
+        delegation_id=delegation_id, task_id=task_id,
+        final_approval_required=approval_required,
+    )
+    if approval_required:
+        assert json.loads(missions.hermes_mission_reconcile(
+            mission_id, confirm=True, dry_run=False, hermes_root=root,
+        ))["status"] == "awaiting_approval"
+    if completion_path in {"approve", "transition"}:
+        monkeypatch.setenv(op.OPERATOR_LEVEL_ENV, "owner")
+        monkeypatch.setenv(op.OWNER_ACTIVE_ENV, "1")
+        monkeypatch.setenv(op.OWNER_ACK_ENV, op.OWNER_ACK_REQUIRED_VALUE)
+
+    observed = threading.Event()
+    release = threading.Event()
+    original_guard = missions._completion_guard
+
+    def paused_guard(*args, **kwargs):
+        observed.set()
+        assert release.wait(5)
+        return original_guard(*args, **kwargs)
+
+    monkeypatch.setattr(missions, "_completion_guard", paused_guard)
+    result: list[dict] = []
+    if completion_path == "approve":
+        call = lambda: missions.hermes_mission_approve(mission_id, "approval:stale", confirm=True, dry_run=False, hermes_root=root)
+    elif completion_path == "transition":
+        call = lambda: missions.hermes_mission_transition(mission_id, "completed", confirm=True, dry_run=False, hermes_root=root)
+    else:
+        call = lambda: missions.hermes_mission_reconcile(mission_id, confirm=True, dry_run=False, hermes_root=root)
+    thread = threading.Thread(target=lambda: result.append(json.loads(call())))
+    thread.start()
+    assert observed.wait(5)
+
+    meta_path, _, _ = runners._job_paths(task_id, root)
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta.update({"state": "running", "outcome": "running", "ended_at": ""})
+    runners._atomic_json(meta_path, meta)
+    invalidated = json.loads(delegations.hermes_delegation_reconcile(
+        delegation_id, apply=True, hermes_root=root,
+    ))
+    assert invalidated["delegation"]["state"] == "running"
+    release.set()
+    thread.join(5)
+    assert not thread.is_alive()
+    assert result[0]["success"] is False
+    assert json.loads(missions.hermes_mission_get(mission_id, hermes_root=root))["status"] != "completed"
+
+
+def test_cancel_backend_rejection_releases_provisional_latch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    root = tmp_path / "hermes"
+    _enable_workspace(monkeypatch, workspace)
+    monkeypatch.setattr(delegations.contract_mod, "hermes_contract_dispatch", lambda *a, **k: json.dumps({"success": True, "changed": True, "state": "running"}))
+    contract = _contract(workspace, task_id="cancel-rejected-task")
+    json.loads(delegations.hermes_delegation_dispatch(json.dumps(contract), delegation_id="dlg-cancel-rejected", confirm=True, dry_run=False, hermes_root=root))
+    before = json.loads(delegations.hermes_delegation_get("dlg-cancel-rejected", hermes_root=root))["delegation"]
+    monkeypatch.setattr(delegations.runners, "hermes_runner_cancel", lambda *a, **k: json.dumps({"success": False, "changed": False, "code": "NOT_CANCELLABLE"}))
+    out = json.loads(delegations.hermes_delegation_cancel("dlg-cancel-rejected", confirm=True, dry_run=False, hermes_root=root))
+    assert out["success"] is False and out["changed"] is False
+    row = out["delegation"]
+    assert row["cancel_requested"] is False
+    assert row["cancellation_in_progress"] is False
+    assert row["authority_version"] == before["authority_version"] + 2
+
+
+def test_successful_cancel_failed_state_remains_reconciling(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    root = tmp_path / "hermes"
+    _enable_workspace(monkeypatch, workspace)
+    monkeypatch.setattr(delegations.contract_mod, "hermes_contract_dispatch", lambda *a, **k: json.dumps({"success": True, "changed": True, "state": "running"}))
+    contract = _contract(workspace, task_id="cancel-failed-state-task")
+    json.loads(delegations.hermes_delegation_dispatch(json.dumps(contract), delegation_id="dlg-cancel-failed-state", confirm=True, dry_run=False, hermes_root=root))
+    monkeypatch.setattr(delegations.runners, "hermes_runner_cancel", lambda *a, **k: json.dumps({"success": True, "changed": False, "state": "failed"}))
+    out = json.loads(delegations.hermes_delegation_cancel("dlg-cancel-failed-state", confirm=True, dry_run=False, hermes_root=root))
+    assert out["delegation"]["state"] == "reconciling"
+    assert out["delegation"]["terminal_at"] is None
+
+
 def test_list_before_dispatch_is_noncreating(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     workspace = tmp_path / "ws"
     workspace.mkdir()
