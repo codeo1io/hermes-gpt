@@ -29,7 +29,7 @@ SCHEMA_VERSION = "0.9-delegation.2"
 DELEGATION_SCHEMA = "hermes.delegation/v1"
 DELEGATION_ID_RE = re.compile(r"^dlg-[A-Za-z0-9][A-Za-z0-9._-]{0,59}$")
 STATES = frozenset({"reserved", "queued", "running", "reconciling", "succeeded", "failed", "cancelled"})
-DISPATCH_PHASES = frozenset({"reserved", "invoking", "dispatched"})
+DISPATCH_PHASES = frozenset({"reserved", "invoking", "dispatched", "cancelled"})
 TERMINAL_STATES = frozenset({"succeeded", "failed", "cancelled"})
 MAX_LIST = 200
 
@@ -344,6 +344,18 @@ def _dispatch_in_progress(row: dict[str, Any]) -> str:
     }, ensure_ascii=False, indent=2)
 
 
+def _dispatch_cancelled(row: dict[str, Any]) -> str:
+    return json.dumps({
+        "success": False,
+        "schema_version": SCHEMA_VERSION,
+        "code": "DELEGATION_DISPATCH_CANCELLED",
+        "safe_message": "Cancelled delegation lineage cannot be dispatched again.",
+        "changed": False,
+        "delegation": _surface(row),
+        "suggested_action": "Create a new delegation and task lineage if new work is required.",
+    }, ensure_ascii=False, indent=2)
+
+
 def _reserved_cancel_cas_lost(row: dict[str, Any]) -> str:
     return json.dumps({
         "success": False,
@@ -474,6 +486,9 @@ def hermes_delegation_dispatch(
                 stored_manifest = _manifest_row(db, delegation_id)
                 if stored_manifest["context_sha256"] != manifest["context_sha256"]:
                     raise ValueError("delegation validation lineage mismatch")
+                if existing["state"] == "cancelled":
+                    db.commit()
+                    return _dispatch_cancelled(existing)
                 if existing["dispatch_phase"] != "reserved":
                     db.commit()
                     if existing["dispatch_phase"] == "invoking":
@@ -501,12 +516,15 @@ def hermes_delegation_dispatch(
             _init(db)
             db.execute("BEGIN IMMEDIATE")
             changed = db.execute(
-                "UPDATE delegations SET dispatch_phase='invoking',updated_at=? WHERE delegation_id=? AND dispatch_phase='reserved'",
+                "UPDATE delegations SET dispatch_phase='invoking',updated_at=? "
+                "WHERE delegation_id=? AND dispatch_phase='reserved' AND state='reserved' AND cancel_requested=0",
                 (_now(), delegation_id),
             ).rowcount
             if changed != 1:
                 row = dict(_get_row(db, delegation_id))
                 db.commit()
+                if row["state"] == "cancelled":
+                    return _dispatch_cancelled(row)
                 if row["dispatch_phase"] == "invoking":
                     return _dispatch_in_progress(row)
                 return json.dumps({"success": True, "schema_version": SCHEMA_VERSION, "changed": False, "idempotent": True, "delegation": _surface(row)}, ensure_ascii=False, indent=2)
@@ -809,7 +827,12 @@ def hermes_delegation_cancel(
             now = _now()
             with _connect(path, write=True) as db:
                 _init(db)
-                changed = db.execute("UPDATE delegations SET state='cancelled',backend_state='not_invoked',outcome='cancelled',cancel_requested=1,updated_at=?,terminal_at=? WHERE delegation_id=? AND dispatch_phase='reserved'", (now, now, delegation_id)).rowcount
+                changed = db.execute(
+                    "UPDATE delegations SET state='cancelled',backend_state='not_invoked',outcome='cancelled',"
+                    "cancel_requested=1,dispatch_phase='cancelled',updated_at=?,terminal_at=? "
+                    "WHERE delegation_id=? AND dispatch_phase='reserved' AND state='reserved' AND cancel_requested=0",
+                    (now, now, delegation_id),
+                ).rowcount
                 if changed != 1:
                     row = dict(_get_row(db, delegation_id))
                     db.commit()

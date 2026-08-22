@@ -671,6 +671,78 @@ def test_reserved_cancel_mission_sync_failure_is_hard_error(tmp_path: Path, monk
     assert out["changed"] is True and out["delegation"]["state"] == "cancelled"
 
 
+@pytest.mark.parametrize("with_mission", [False, True])
+def test_reserved_cancel_exact_dispatch_retry_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    with_mission: bool,
+):
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    root = tmp_path / "hermes"
+    _enable_workspace(monkeypatch, workspace)
+    mission_id = _mission(root) if with_mission else ""
+    contract = _contract(workspace, task_id=f"delegation-cancelled-retry-{with_mission}")
+    delegation_id = f"dlg-cancelled-retry-{str(with_mission).lower()}"
+    monkeypatch.setattr(
+        delegations.contract_mod,
+        "hermes_contract_dispatch",
+        lambda *a, **k: json.dumps({"success": False, "changed": False, "code": "REJECTED"}),
+    )
+    first = json.loads(delegations.hermes_delegation_dispatch(
+        json.dumps(contract),
+        mission_id=mission_id,
+        delegation_id=delegation_id,
+        confirm=True,
+        dry_run=False,
+        hermes_root=root,
+    ))
+    assert first["success"] is False
+
+    cancelled = json.loads(delegations.hermes_delegation_cancel(
+        delegation_id,
+        confirm=True,
+        dry_run=False,
+        hermes_root=root,
+    ))
+    assert cancelled["success"] is True
+    assert cancelled["delegation"]["state"] == "cancelled"
+    assert cancelled["delegation"]["dispatch_phase"] == "cancelled"
+    assert cancelled["delegation"]["cancel_requested"] is True
+
+    calls = 0
+
+    def dispatch(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return json.dumps({"success": True, "changed": True, "state": "queued"})
+
+    monkeypatch.setattr(delegations.contract_mod, "hermes_contract_dispatch", dispatch)
+    retry = json.loads(delegations.hermes_delegation_dispatch(
+        json.dumps(contract),
+        mission_id=mission_id,
+        delegation_id=delegation_id,
+        confirm=True,
+        dry_run=False,
+        hermes_root=root,
+    ))
+    assert retry["success"] is False
+    assert retry["code"] == "DELEGATION_DISPATCH_CANCELLED"
+    assert retry["changed"] is False
+    assert retry.get("idempotent") is not True
+    assert calls == 0
+
+    row = json.loads(delegations.hermes_delegation_get(delegation_id, hermes_root=root))["delegation"]
+    assert row["state"] == "cancelled"
+    assert row["dispatch_phase"] == "cancelled"
+    assert row["cancel_requested"] is True
+    if with_mission:
+        mission = json.loads(missions.hermes_mission_get(mission_id, hermes_root=root))
+        attachment = next(item for item in mission["attachments"] if item["kind"] == "delegation" and item["ref"] == delegation_id)
+        assert attachment["state"] == "cancelled"
+        assert attachment["evidence_ref"] == f"delegation:{delegation_id}"
+
+
 def test_secret_like_manifest_value_rejected_before_backend_or_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     workspace = tmp_path / "ws"
     workspace.mkdir()
