@@ -530,7 +530,9 @@ def test_concurrent_exact_retry_invokes_backend_once(tmp_path: Path, monkeypatch
     release.set()
     thread.join(5)
     assert calls == 1
-    assert retry["success"] is True and retry["idempotent"] is True
+    assert retry["success"] is False
+    assert retry["code"] == "DELEGATION_DISPATCH_AMBIGUOUS"
+    assert retry["submission_may_have_succeeded"] is True
     assert retry["delegation"]["dispatch_phase"] == "invoking"
     assert result[0]["delegation"]["dispatch_phase"] == "dispatched"
 
@@ -579,6 +581,94 @@ def test_missing_or_corrupt_manifest_fails_closed(tmp_path: Path, monkeypatch: p
         db.commit()
     out = json.loads(delegations.hermes_delegation_reconcile("dlg-manifest", apply=False, hermes_root=root))
     assert not out["success"] and out["code"] == "DELEGATION_RECONCILE_FAILED"
+
+
+def test_legacy_manifest_can_be_backfilled_only_from_matching_contract_on_apply(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    root = tmp_path / "hermes"
+    _enable_workspace(monkeypatch, workspace)
+    contract = _contract(workspace, task_id="delegation-legacy-manifest")
+    monkeypatch.setattr(delegations.contract_mod, "hermes_contract_dispatch", lambda *a, **k: json.dumps({"success": True, "changed": True, "state": "queued"}))
+    assert json.loads(delegations.hermes_delegation_dispatch(json.dumps(contract), delegation_id="dlg-legacy-manifest", confirm=True, dry_run=False, hermes_root=root))["success"]
+    with delegations._connect(delegations._db_path(root), write=True) as db:
+        db.execute("DELETE FROM delegation_validation_manifests WHERE delegation_id='dlg-legacy-manifest'")
+        db.commit()
+
+    missing = json.loads(delegations.hermes_delegation_reconcile("dlg-legacy-manifest", apply=False, hermes_root=root))
+    assert missing["success"] is False
+    supplied_preview = json.loads(delegations.hermes_delegation_reconcile("dlg-legacy-manifest", contract_json=json.dumps(contract), apply=False, hermes_root=root))
+    assert supplied_preview["success"] is True
+    with delegations._connect(delegations._db_path(root), write=False) as db:
+        assert db.execute("SELECT 1 FROM delegation_validation_manifests WHERE delegation_id='dlg-legacy-manifest'").fetchone() is None
+    backfilled = json.loads(delegations.hermes_delegation_reconcile("dlg-legacy-manifest", contract_json=json.dumps(contract), apply=True, hermes_root=root))
+    assert backfilled["success"] is True
+    subsequent = json.loads(delegations.hermes_delegation_reconcile("dlg-legacy-manifest", apply=False, hermes_root=root))
+    assert subsequent["success"] is True
+
+
+def test_reserved_cancel_requires_confirmation_without_mutation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    root = tmp_path / "hermes"
+    _enable_workspace(monkeypatch, workspace)
+    monkeypatch.setattr(delegations.contract_mod, "hermes_contract_dispatch", lambda *a, **k: json.dumps({"success": False, "changed": False, "code": "REJECTED"}))
+    contract = _contract(workspace, task_id="delegation-reserved-confirm")
+    json.loads(delegations.hermes_delegation_dispatch(json.dumps(contract), delegation_id="dlg-reserved-confirm", confirm=True, dry_run=False, hermes_root=root))
+
+    out = json.loads(delegations.hermes_delegation_cancel("dlg-reserved-confirm", confirm=False, dry_run=False, hermes_root=root))
+    assert out["success"] is False and out["code"] == "CONFIRMATION_REQUIRED" and out["changed"] is False
+    row = json.loads(delegations.hermes_delegation_get("dlg-reserved-confirm", hermes_root=root))["delegation"]
+    assert row["state"] == "reserved" and row["cancel_requested"] is False
+    assert [event["event_type"] for event in row["events"]] == ["delegation.dispatch_rejected", "delegation.invoking", "delegation.reserved"]
+
+
+def test_reserved_cancel_cas_loss_does_not_forge_cancellation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    root = tmp_path / "hermes"
+    _enable_workspace(monkeypatch, workspace)
+    monkeypatch.setattr(delegations.contract_mod, "hermes_contract_dispatch", lambda *a, **k: json.dumps({"success": False, "changed": False, "code": "REJECTED"}))
+    contract = _contract(workspace, task_id="delegation-cancel-race")
+    json.loads(delegations.hermes_delegation_dispatch(json.dumps(contract), delegation_id="dlg-cancel-race", confirm=True, dry_run=False, hermes_root=root))
+    real_connect = delegations._connect
+    raced = False
+
+    class RacingConnection:
+        def __init__(self, db): self.db = db
+        def __enter__(self): self.db.__enter__(); return self
+        def __exit__(self, *args): return self.db.__exit__(*args)
+        def __getattr__(self, name): return getattr(self.db, name)
+        def execute(self, sql, parameters=()):
+            nonlocal raced
+            if not raced and sql.startswith("UPDATE delegations SET state='cancelled'"):
+                raced = True
+                self.db.execute("UPDATE delegations SET dispatch_phase='invoking' WHERE delegation_id=?", (parameters[-1],))
+            return self.db.execute(sql, parameters)
+
+    monkeypatch.setattr(delegations, "_connect", lambda path, write=False: RacingConnection(real_connect(path, write=write)) if write else real_connect(path, write=write))
+    out = json.loads(delegations.hermes_delegation_cancel("dlg-cancel-race", confirm=True, dry_run=False, hermes_root=root))
+    assert out["success"] is False and out["code"] == "DELEGATION_CANCEL_AMBIGUOUS" and out["changed"] is False
+    assert out["delegation"]["dispatch_phase"] == "invoking"
+    row = json.loads(delegations.hermes_delegation_get("dlg-cancel-race", hermes_root=root))["delegation"]
+    assert row["state"] == "reserved" and row["cancel_requested"] is False
+    assert "delegation.cancelled" not in [event["event_type"] for event in row["events"]]
+
+
+def test_reserved_cancel_mission_sync_failure_is_hard_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    root = tmp_path / "hermes"
+    _enable_workspace(monkeypatch, workspace)
+    mission_id = _mission(root)
+    monkeypatch.setattr(delegations.contract_mod, "hermes_contract_dispatch", lambda *a, **k: json.dumps({"success": False, "changed": False, "code": "REJECTED"}))
+    contract = _contract(workspace, task_id="delegation-reserved-sync")
+    json.loads(delegations.hermes_delegation_dispatch(json.dumps(contract), mission_id=mission_id, delegation_id="dlg-reserved-sync", confirm=True, dry_run=False, hermes_root=root))
+    monkeypatch.setattr(missions, "record_attachment_state", lambda *a, **k: False)
+
+    out = json.loads(delegations.hermes_delegation_cancel("dlg-reserved-sync", confirm=True, dry_run=False, hermes_root=root))
+    assert out["success"] is False and out["code"] == "DELEGATION_MISSION_SYNC_FAILED"
+    assert out["changed"] is True and out["delegation"]["state"] == "cancelled"
 
 
 def test_secret_like_manifest_value_rejected_before_backend_or_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
