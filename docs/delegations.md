@@ -22,6 +22,8 @@ Mission linkage uses the existing `delegation` attachment kind. Dispatch creates
 
 An exact cancellation retry does not invoke backend cancellation again while `cancellation_in_progress` is set for that lineage. It returns an explicit in-progress/ambiguous idempotent response and leaves the latch in place for the first caller or authoritative reconciliation.
 
+Authoritative reconciliation resolves that provisional latch only from a fresh terminal backend observation. Explicit `cancelled`/`canceled` observation promotes durable cancellation; terminal failure clears the latch and records failure; terminal completion clears the latch but still requires the normal matching Work Contract validation before success. Missing, ambiguous, unknown, or nonterminal observation retains `cancellation_in_progress` and remains fail-closed as `reconciling`.
+
 ## OpenCode backend
 
 v0.9 also adds `opencode` as a first-class local runner backend. Hermes invokes the installed non-interactive OpenCode CLI using `opencode run --format json --pure --dir <workspace>`. The objective is piped over stdin rather than placed on process argv. `--auto` is never enabled by Hermes.
