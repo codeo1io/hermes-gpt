@@ -384,6 +384,29 @@ def _reserved_cancel_cas_lost(row: dict[str, Any]) -> str:
     }, ensure_ascii=False, indent=2)
 
 
+def _dispatched_cancel_cas_lost(row: dict[str, Any], result: dict[str, Any]) -> str:
+    if row.get("state") == "cancelled" and bool(row.get("cancel_requested")):
+        return json.dumps({
+            "success": True,
+            "schema_version": SCHEMA_VERSION,
+            "changed": False,
+            "stale_cancellation": True,
+            "delegation": _surface(row),
+            "cancel": result,
+        }, ensure_ascii=False, indent=2)
+    return json.dumps({
+        "success": False,
+        "schema_version": SCHEMA_VERSION,
+        "code": "DELEGATION_CANCEL_AMBIGUOUS",
+        "safe_message": "Delegation authority changed while backend cancellation was in progress.",
+        "changed": False,
+        "stale_cancellation": True,
+        "delegation": _surface(row),
+        "cancel": result,
+        "suggested_action": "Preserve the current durable state and reconcile before retrying cancellation.",
+    }, ensure_ascii=False, indent=2)
+
+
 def _latest_observation(task_id: str, hermes_root: Path) -> dict[str, Any] | None:
     runs = contract_mod._observed_runs(task_id, hermes_root)
     if not runs:
@@ -929,6 +952,16 @@ def hermes_delegation_cancel(
         event_type = "delegation.cancelled" if desired == "cancelled" else "delegation.cancel_requested"
         with _connect(path, write=True) as db:
             _init(db)
+            db.execute("BEGIN IMMEDIATE")
+            current = dict(_get_row(db, delegation_id))
+            authority_fields = (
+                "schema", "mission_id", "task_id", "contract_sha256", "backend",
+                "state", "backend_state", "outcome", "validation_verdict",
+                "cancel_requested", "dispatch_phase", "dispatched_at", "updated_at", "terminal_at",
+            )
+            if any(current.get(key) != stored.get(key) for key in authority_fields):
+                db.commit()
+                return _dispatched_cancel_cas_lost(current, result)
             dispatch_phase = "cancelled" if desired == "cancelled" else stored.get("dispatch_phase", "dispatched")
             db.execute(
                 "UPDATE delegations SET state=?,backend_state=?,outcome=?,cancel_requested=1,dispatch_phase=?,updated_at=?,terminal_at=? WHERE delegation_id=?",
