@@ -16,6 +16,7 @@ import json
 import os
 import re
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -88,6 +89,8 @@ def _init(db: sqlite3.Connection) -> None:
             backend_ref_json TEXT NOT NULL DEFAULT '{}',
             validation_verdict TEXT NOT NULL DEFAULT '',
             cancel_requested INTEGER NOT NULL DEFAULT 0,
+            authority_version INTEGER NOT NULL DEFAULT 1,
+            cancellation_in_progress INTEGER NOT NULL DEFAULT 0,
             dispatch_phase TEXT NOT NULL DEFAULT 'dispatched',
             created_at TEXT NOT NULL,
             dispatched_at TEXT NOT NULL,
@@ -122,6 +125,10 @@ def _init(db: sqlite3.Connection) -> None:
     columns = {str(row[1]) for row in db.execute("PRAGMA table_info(delegations)").fetchall()}
     if "dispatch_phase" not in columns:
         db.execute("ALTER TABLE delegations ADD COLUMN dispatch_phase TEXT NOT NULL DEFAULT 'dispatched'")
+    if "authority_version" not in columns:
+        db.execute("ALTER TABLE delegations ADD COLUMN authority_version INTEGER NOT NULL DEFAULT 1")
+    if "cancellation_in_progress" not in columns:
+        db.execute("ALTER TABLE delegations ADD COLUMN cancellation_in_progress INTEGER NOT NULL DEFAULT 0")
     db.commit()
 
 
@@ -178,6 +185,7 @@ def _surface(row: sqlite3.Row | dict[str, Any], *, events: list[dict[str, Any]] 
         backend_ref = {}
     value["backend_ref"] = backend_ref if isinstance(backend_ref, dict) else {}
     value["cancel_requested"] = bool(value.get("cancel_requested"))
+    value["cancellation_in_progress"] = bool(value.get("cancellation_in_progress"))
     if events is not None:
         value["events"] = events
     return value
@@ -308,6 +316,39 @@ def _sync_mission_attachment(
         verified=verified,
         hermes_root=_root(hermes_root),
     )
+
+
+@contextmanager
+def mission_completion_guard(
+    mission_id: str,
+    snapshots: dict[str, int],
+    *,
+    hermes_root: Path | None = None,
+):
+    """Linearize Mission completion against delegation cancellation authority."""
+    if not snapshots:
+        yield
+        return
+    path = _db_path(hermes_root)
+    with _connect(path, write=True) as db:
+        _init(db)
+        db.execute("BEGIN IMMEDIATE")
+        for delegation_id, authority_version in snapshots.items():
+            row = dict(_get_row(db, delegation_id))
+            if (
+                row.get("mission_id") != mission_id
+                or int(row.get("authority_version") or 0) != int(authority_version)
+                or bool(row.get("cancel_requested"))
+                or bool(row.get("cancellation_in_progress"))
+            ):
+                raise ValueError("delegation authority changed after Mission observation")
+        try:
+            yield
+        except BaseException:
+            db.rollback()
+            raise
+        else:
+            db.commit()
 
 
 def _mission_sync_failure(
@@ -799,6 +840,9 @@ def hermes_delegation_reconcile(
         if authoritative_cancel:
             desired = "cancelled"
             outcome = stored.get("outcome") or "cancelled"
+        elif bool(stored.get("cancel_requested")) or bool(stored.get("cancellation_in_progress")):
+            desired = "reconciling"
+            outcome = ""
         elif observed is None or (observed_desired == "succeeded" and verdict != "SATISFIED"):
             desired = "reconciling"
         verified_success = desired == "succeeded" and verdict == "SATISFIED"
@@ -836,7 +880,8 @@ def hermes_delegation_reconcile(
             current = dict(_get_row(db, delegation_id))
             authority_fields = (
                 "schema", "mission_id", "task_id", "contract_sha256", "backend",
-                "state", "cancel_requested", "dispatch_phase", "terminal_at", "updated_at",
+                "state", "cancel_requested", "cancellation_in_progress", "authority_version",
+                "dispatch_phase", "terminal_at", "updated_at",
             )
             stale = any(current.get(key) != stored.get(key) for key in authority_fields)
             if stale:
@@ -913,7 +958,7 @@ def hermes_delegation_cancel(
                 _init(db)
                 changed = db.execute(
                     "UPDATE delegations SET state='cancelled',backend_state='not_invoked',outcome='cancelled',"
-                    "cancel_requested=1,dispatch_phase='cancelled',updated_at=?,terminal_at=? "
+                    "cancel_requested=1,cancellation_in_progress=0,authority_version=authority_version+1,dispatch_phase='cancelled',updated_at=?,terminal_at=? "
                     "WHERE delegation_id=? AND dispatch_phase='reserved' AND state='reserved' AND cancel_requested=0",
                     (now, now, delegation_id),
                 ).rowcount
@@ -933,6 +978,42 @@ def hermes_delegation_cancel(
                 return _mission_sync_failure("cancellation", row, changed=True)
             _audit(tool="hermes_delegation_cancel", policy=policy, dry_run=False, success=True, changed=True, delegation_id=delegation_id, task_id=row["task_id"], backend=row["backend"])
             return json.dumps({"success": True, "schema_version": SCHEMA_VERSION, "changed": True, "delegation": _surface(row)}, ensure_ascii=False, indent=2)
+        effective_dry = policy.effective_dry_run(dry_run)
+        if not effective_dry and not confirm:
+            return json.dumps({"success": False, "schema_version": SCHEMA_VERSION, "code": "CONFIRMATION_REQUIRED", "safe_message": "delegation cancellation requires confirm=true", "changed": False, "delegation_id": delegation_id}, ensure_ascii=False, indent=2)
+        if not effective_dry:
+            with _connect(path, write=True) as db:
+                _init(db)
+                db.execute("BEGIN IMMEDIATE")
+                current = dict(_get_row(db, delegation_id))
+                if current["state"] in TERMINAL_STATES:
+                    db.commit()
+                    return json.dumps({"success": True, "schema_version": SCHEMA_VERSION, "changed": False, "delegation": _surface(current)}, ensure_ascii=False, indent=2)
+                if current.get("mission_id"):
+                    mission = json.loads(mission_runtime.hermes_mission_get(current["mission_id"], hermes_root=root))
+                    if not mission.get("success") or mission.get("status") == "completed":
+                        db.commit()
+                        raise ValueError("completed Mission delegation cancellation authority is closed")
+                changed = db.execute(
+                    "UPDATE delegations SET cancel_requested=1,cancellation_in_progress=1,authority_version=authority_version+1,updated_at=? "
+                    "WHERE delegation_id=? AND state NOT IN ('succeeded','failed','cancelled') AND cancellation_in_progress=0",
+                    (_now(), delegation_id),
+                ).rowcount
+                if changed != 1:
+                    row = dict(_get_row(db, delegation_id))
+                    if (
+                        bool(row.get("cancellation_in_progress"))
+                        and bool(row.get("cancel_requested"))
+                        and row.get("state") not in TERMINAL_STATES
+                    ):
+                        db.commit()
+                        stored = row
+                    else:
+                        db.commit()
+                        return _dispatched_cancel_cas_lost(row, {})
+                else:
+                    db.commit()
+                    stored = dict(_get_row(db, delegation_id))
         result = json.loads(runners.hermes_runner_cancel(
             stored["task_id"],
             backend=stored["backend"],
@@ -940,7 +1021,7 @@ def hermes_delegation_cancel(
             dry_run=dry_run,
             hermes_root=root,
         ))
-        if dry_run or policy.effective_dry_run(dry_run):
+        if effective_dry:
             return json.dumps({"success": bool(result.get("success")), "schema_version": SCHEMA_VERSION, "changed": False, "dry_run": True, "delegation_id": delegation_id, "cancel": result}, ensure_ascii=False, indent=2)
         if not result.get("success"):
             return json.dumps({"success": False, "schema_version": SCHEMA_VERSION, "changed": False, "delegation_id": delegation_id, "cancel": result}, ensure_ascii=False, indent=2)
@@ -958,7 +1039,8 @@ def hermes_delegation_cancel(
             authority_fields = (
                 "schema", "mission_id", "task_id", "contract_sha256", "backend",
                 "state", "backend_state", "outcome", "validation_verdict",
-                "cancel_requested", "dispatch_phase", "dispatched_at", "updated_at", "terminal_at",
+                "cancel_requested", "cancellation_in_progress", "authority_version",
+                "dispatch_phase", "dispatched_at", "updated_at", "terminal_at",
             )
             if any(current.get(key) != stored.get(key) for key in authority_fields):
                 immutable_lineage = (
@@ -978,7 +1060,7 @@ def hermes_delegation_cancel(
                 terminal_at = current.get("terminal_at") or now
                 db.execute(
                     "UPDATE delegations SET state='cancelled',backend_state=?,outcome='cancelled',"
-                    "cancel_requested=1,dispatch_phase='cancelled',updated_at=?,terminal_at=? WHERE delegation_id=?",
+                    "cancel_requested=1,cancellation_in_progress=0,dispatch_phase='cancelled',updated_at=?,terminal_at=? WHERE delegation_id=?",
                     (_bounded(backend_state, 128), now, terminal_at, delegation_id),
                 )
                 _event(
@@ -993,7 +1075,7 @@ def hermes_delegation_cancel(
             else:
                 dispatch_phase = "cancelled" if desired == "cancelled" else stored.get("dispatch_phase", "dispatched")
                 db.execute(
-                    "UPDATE delegations SET state=?,backend_state=?,outcome=?,cancel_requested=1,dispatch_phase=?,updated_at=?,terminal_at=? WHERE delegation_id=?",
+                    "UPDATE delegations SET state=?,backend_state=?,outcome=?,cancel_requested=1,cancellation_in_progress=0,dispatch_phase=?,updated_at=?,terminal_at=? WHERE delegation_id=?",
                     (desired, _bounded(backend_state, 128), outcome, dispatch_phase, now, now if desired in TERMINAL_STATES else None, delegation_id),
                 )
                 _event(db, delegation_id, event_type, from_state=stored["state"], to_state=desired, backend_state=backend_state)
