@@ -20,6 +20,8 @@ A delegation never marks work successful because a worker says it succeeded. Rec
 
 Mission linkage uses the existing `delegation` attachment kind. Dispatch creates/updates a pending/running attachment. A Mission attachment becomes `succeeded` only when delegation reconciliation has both authoritative backend completion and a `SATISFIED` Work Contract verdict; that bridge records the contract digest as its verification reference. Cancellation records `cancelled` only when the backend explicitly confirms `cancelled`/`canceled`. Other successful backend responses remain reconciling. An explicit unsuccessful, unchanged backend response releases the provisional cancellation latch; ambiguous failures remain latched for authoritative reconciliation.
 
+An exact cancellation retry does not invoke backend cancellation again while `cancellation_in_progress` is set for that lineage. It returns an explicit in-progress/ambiguous idempotent response and leaves the latch in place for the first caller or authoritative reconciliation.
+
 ## OpenCode backend
 
 v0.9 also adds `opencode` as a first-class local runner backend. Hermes invokes the installed non-interactive OpenCode CLI using `opencode run --format json --pure --dir <workspace>`. The objective is piped over stdin rather than placed on process argv. `--auto` is never enabled by Hermes.

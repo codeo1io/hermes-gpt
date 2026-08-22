@@ -789,6 +789,20 @@ def _completion_guard(root: Path, mission_id: str, observed: list[dict[str, Any]
     return delegations.mission_completion_guard(mission_id, snapshots, hermes_root=root)
 
 
+def _cancellation_guard(root: Path, mission_id: str, observed: list[dict[str, Any]]):
+    import operator_delegations as delegations
+
+    snapshots = {
+        str(item["ref"]): int(item["authority_version"])
+        for item in observed
+        if item["kind"] == "delegation" and "authority_version" in item
+    }
+    delegation_count = sum(1 for item in observed if item["kind"] == "delegation")
+    if len(snapshots) != delegation_count:
+        raise ValueError("delegation cancellation authority snapshot is incomplete")
+    return delegations.mission_cancellation_guard(mission_id, snapshots, hermes_root=root)
+
+
 def _desired_mission_status(mission: dict[str, Any], observed: list[dict[str, Any]]) -> str:
     current = str(mission["status"])
     if current in TERMINAL_STATUSES:
@@ -910,14 +924,15 @@ def hermes_mission_transition(
             raise PermissionError("direct mission transition requires confirm=true")
         path = _db_path(hermes_root)
 
-        def validate(mission: dict[str, Any]) -> tuple[str, bool]:
+        def validate(mission: dict[str, Any], observed: list[dict[str, Any]] | None = None) -> tuple[str, bool]:
             current = str(mission["status"])
             if current in TERMINAL_STATUSES:
                 raise ValueError("terminal mission status cannot transition")
             if status == current:
                 return current, False
             if status == "cancelled":
-                observed = _observe_attachments(_root(hermes_root), mission)
+                if observed is None:
+                    observed = _observe_attachments(_root(hermes_root), mission)
                 active = [a for a in observed if a["kind"] == "delegation" and a["state"] in {"pending", "running", "blocked"}]
                 if active:
                     raise ValueError("mission cancellation requires all delegation children to be terminal")
@@ -958,6 +973,26 @@ def hermes_mission_transition(
             _publish_live_event(live_notice, hermes_root)
             _audit("hermes_mission_transition", policy, dry_run=False, success=True, changed=changed, mission_id=mission_id, summary=f"mission {current}->completed")
             return json.dumps({"success": True, "schema_version": SCHEMA_VERSION, "tool": "hermes_mission_transition", "mission_id": mission_id, "from_status": current, "to_status": "completed", "changed": changed})
+        if status == "cancelled":
+            root = _root(hermes_root)
+            with _connect(path, write=False) as db:
+                mission = _row_to_mission(db, _get_row(db, mission_id))
+            observed = _observe_attachments(root, mission)
+            current, changed = validate(mission, observed)
+            live_notice: dict[str, Any] | None = None
+            with _cancellation_guard(root, mission_id, observed), _connect(path, write=True) as db:
+                _begin_write(db)
+                current_row = _get_row(db, mission_id)
+                if int(current_row["version"]) != int(mission["version"]):
+                    raise ValueError("Mission authority changed after child cancellation observation")
+                if changed:
+                    now = _now()
+                    db.execute("UPDATE missions SET status='cancelled',version=version+1,updated_at=? WHERE mission_id=?", (now, mission_id))
+                    live_notice = _event(db, mission_id, "mission.transition", from_status=current, to_status="cancelled", reason=reason)
+                db.commit()
+            _publish_live_event(live_notice, hermes_root)
+            _audit("hermes_mission_transition", policy, dry_run=False, success=True, changed=changed, mission_id=mission_id, summary=f"mission {current}->cancelled")
+            return json.dumps({"success": True, "schema_version": SCHEMA_VERSION, "tool": "hermes_mission_transition", "mission_id": mission_id, "from_status": current, "to_status": "cancelled", "changed": changed})
         live_notice: dict[str, Any] | None = None
         with _connect(path, write=True) as db:
             _begin_write(db)

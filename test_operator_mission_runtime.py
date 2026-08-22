@@ -340,6 +340,43 @@ def test_noncompletion_reconcile_observes_outside_mission_write_lock(
     assert reconciled[0]["success"] is False
 
 
+def test_parent_cancellation_observes_outside_mission_write_lock(
+    hermes_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    assert _j(mission.hermes_mission_create(_spec(), confirm=True, dry_run=False, hermes_root=hermes_root))["success"]
+    assert _j(mission.hermes_mission_attach(
+        "msn-test", "workflow", "sw-child", state="pending",
+        confirm=True, dry_run=False, hermes_root=hermes_root,
+    ))["success"]
+    entered = threading.Event()
+    release = threading.Event()
+    original_observe = mission._observe_attachments
+
+    def paused_observe(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return original_observe(*args, **kwargs)
+
+    monkeypatch.setattr(mission, "_observe_attachments", paused_observe)
+    cancelled: list[dict] = []
+    thread = threading.Thread(target=lambda: cancelled.append(_j(mission.hermes_mission_transition(
+        "msn-test", "cancelled", confirm=True, dry_run=False, hermes_root=hermes_root,
+    ))))
+    thread.start()
+    assert entered.wait(5)
+    updated = _j(mission.hermes_mission_update(
+        "msn-test", json.dumps({"title": "Concurrent cancellation update"}),
+        confirm=True, dry_run=False, hermes_root=hermes_root,
+    ))
+    assert updated["success"] is True
+    release.set()
+    thread.join(5)
+    assert not thread.is_alive()
+    assert cancelled[0]["success"] is False
+    assert _j(mission.hermes_mission_get("msn-test", hermes_root=hermes_root))["status"] != "cancelled"
+
+
 def test_acceptance_and_owner_profile_freeze_after_work_attached(hermes_root: Path):
     assert _j(mission.hermes_mission_create(_spec(), confirm=True, dry_run=False, hermes_root=hermes_root))["success"]
     assert _j(mission.hermes_mission_attach("msn-test", "delegation", "dlg-1", state="pending", confirm=True, dry_run=False, hermes_root=hermes_root))["success"]

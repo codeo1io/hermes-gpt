@@ -351,6 +351,41 @@ def mission_completion_guard(
             db.commit()
 
 
+@contextmanager
+def mission_cancellation_guard(
+    mission_id: str,
+    snapshots: dict[str, int],
+    *,
+    hermes_root: Path | None = None,
+):
+    """Linearize parent cancellation against terminal delegation authority."""
+    if not snapshots:
+        yield
+        return
+    path = _db_path(hermes_root)
+    with _connect(path, write=True) as db:
+        _init(db)
+        db.execute("BEGIN IMMEDIATE")
+        for delegation_id, authority_version in snapshots.items():
+            row = dict(_get_row(db, delegation_id))
+            terminal_cancel = row.get("state") == "cancelled" and bool(row.get("cancel_requested"))
+            if (
+                row.get("mission_id") != mission_id
+                or int(row.get("authority_version") or 0) != int(authority_version)
+                or row.get("state") not in TERMINAL_STATES
+                or bool(row.get("cancellation_in_progress"))
+                or (bool(row.get("cancel_requested")) and not terminal_cancel)
+            ):
+                raise ValueError("delegation authority changed after Mission cancellation observation")
+        try:
+            yield
+        except BaseException:
+            db.rollback()
+            raise
+        else:
+            db.commit()
+
+
 def _mission_sync_failure(
     operation: str,
     row: dict[str, Any],
@@ -394,6 +429,21 @@ def _dispatch_cancelled(row: dict[str, Any]) -> str:
         "changed": False,
         "delegation": _surface(row),
         "suggested_action": "Create a new delegation and task lineage if new work is required.",
+    }, ensure_ascii=False, indent=2)
+
+
+def _cancellation_in_progress(row: dict[str, Any]) -> str:
+    return json.dumps({
+        "success": False,
+        "schema_version": SCHEMA_VERSION,
+        "code": "DELEGATION_CANCELLATION_IN_PROGRESS",
+        "safe_message": "Cancellation is already in progress for this exact delegation lineage; its backend outcome is not yet authoritative.",
+        "changed": False,
+        "cancellation_in_progress": True,
+        "cancellation_outcome_ambiguous": True,
+        "idempotent_retry": True,
+        "delegation": _surface(row),
+        "suggested_action": "Reconcile the durable delegation; do not invoke backend cancellation again while cancellation_in_progress is set.",
     }, ensure_ascii=False, indent=2)
 
 
@@ -1013,7 +1063,7 @@ def hermes_delegation_cancel(
                         and row.get("state") not in TERMINAL_STATES
                     ):
                         db.commit()
-                        stored = row
+                        return _cancellation_in_progress(row)
                     else:
                         db.commit()
                         return _dispatched_cancel_cas_lost(row, {})
