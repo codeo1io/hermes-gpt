@@ -1053,12 +1053,12 @@ def hermes_delegation_cancel(
                 return json.dumps({"success": False, "schema_version": SCHEMA_VERSION, "changed": False, "delegation_id": delegation_id, "delegation": _surface(current), "cancel": result}, ensure_ascii=False, indent=2)
             return json.dumps({"success": False, "schema_version": SCHEMA_VERSION, "changed": False, "delegation_id": delegation_id, "cancel": result}, ensure_ascii=False, indent=2)
         now = _now()
-        backend_state = str(result.get("state") or "cancelled")
-        normalized = _normalize_state(backend_state)
+        backend_state = str(result.get("state") or "").strip()
+        normalized_backend_state = backend_state.lower().replace("-", "_")
         # Cancellation finality requires an explicit cancelled/canceled backend
         # confirmation.  Every other response remains reconciling until normal
         # authoritative observation establishes the terminal execution result.
-        desired = "cancelled" if normalized == "cancelled" else "reconciling"
+        desired = "cancelled" if normalized_backend_state in {"cancelled", "canceled"} else "reconciling"
         outcome = desired if desired in TERMINAL_STATES else ""
         event_type = "delegation.cancelled" if desired == "cancelled" else "delegation.cancel_requested"
         with _connect(path, write=True) as db:

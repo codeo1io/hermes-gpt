@@ -838,6 +838,79 @@ def test_cancel_backend_completed_self_report_stays_reconciling(tmp_path: Path, 
 
 
 @pytest.mark.parametrize("with_mission", [False, True])
+@pytest.mark.parametrize(
+    ("backend_payload", "expected_backend_state"),
+    [
+        pytest.param({}, "", id="missing"),
+        pytest.param({"state": ""}, "", id="empty"),
+        pytest.param({"state": None}, "", id="null"),
+        pytest.param({"state": "unexpected"}, "unexpected", id="unexpected"),
+    ],
+)
+def test_successful_cancel_without_explicit_cancelled_state_stays_reconciling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    with_mission: bool,
+    backend_payload: dict,
+    expected_backend_state: str,
+):
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    root = tmp_path / "hermes"
+    _enable_workspace(monkeypatch, workspace)
+    mission_id = _mission(root) if with_mission else ""
+    suffix = expected_backend_state or "absent"
+    delegation_id = f"dlg-cancel-explicit-{suffix}-{str(with_mission).lower()}"
+    task_id = f"cancel-explicit-{suffix}-{str(with_mission).lower()}"
+    monkeypatch.setattr(
+        delegations.contract_mod,
+        "hermes_contract_dispatch",
+        lambda *args, **kwargs: json.dumps(
+            {"success": True, "changed": True, "backend": "pi_rpc", "state": "running"}
+        ),
+    )
+    assert json.loads(delegations.hermes_delegation_dispatch(
+        json.dumps(_contract(workspace, task_id=task_id)),
+        mission_id=mission_id,
+        delegation_id=delegation_id,
+        confirm=True,
+        dry_run=False,
+        hermes_root=root,
+    ))["success"] is True
+    monkeypatch.setattr(
+        delegations.runners,
+        "hermes_runner_cancel",
+        lambda *args, **kwargs: json.dumps(
+            {"success": True, "changed": True, **backend_payload}
+        ),
+    )
+
+    out = json.loads(delegations.hermes_delegation_cancel(
+        delegation_id, confirm=True, dry_run=False, hermes_root=root,
+    ))
+
+    assert out["success"] is True
+    row = out["delegation"]
+    assert row["state"] == "reconciling"
+    assert row["backend_state"] == expected_backend_state
+    assert row["outcome"] == ""
+    assert row["terminal_at"] is None
+    assert row["cancel_requested"] is True
+    assert row["cancellation_in_progress"] is False
+    assert row["dispatch_phase"] == "dispatched"
+    durable = json.loads(delegations.hermes_delegation_get(
+        delegation_id, hermes_root=root,
+    ))["delegation"]
+    assert durable["events"][0]["event_type"] == "delegation.cancel_requested"
+    assert all(event["event_type"] != "delegation.cancelled" for event in durable["events"])
+    if mission_id:
+        mission = json.loads(missions.hermes_mission_get(mission_id, hermes_root=root))
+        attachment = next(item for item in mission["attachments"] if item["ref"] == delegation_id)
+        assert attachment["state"] == "blocked"
+        assert attachment["evidence_ref"] == f"delegation:{delegation_id}"
+
+
+@pytest.mark.parametrize("with_mission", [False, True])
 @pytest.mark.parametrize("stale_backend_state", ["cancelled", "completed", "running", "cancel_requested"])
 def test_concurrent_dispatched_cancel_preserves_first_confirmed_cancellation(
     tmp_path: Path,
