@@ -839,19 +839,18 @@ def hermes_mission_reconcile(
             and _desired_mission_status(completion_mission, completion_observed) == "completed"
         ):
             live_notice: dict[str, Any] | None = None
-            with _completion_guard(root, mission_id, completion_observed):
-                with _connect(path, write=True) as db:
-                    _begin_write(db)
-                    current_row = _get_row(db, mission_id)
-                    if int(current_row["version"]) != int(completion_mission["version"]):
-                        raise ValueError("Mission authority changed after child observation")
-                    current = str(current_row["status"])
-                    now = _now()
-                    for item in completion_observed:
-                        db.execute("UPDATE attachments SET state=?,verified=?,updated_at=? WHERE mission_id=? AND kind=? AND ref=?", (item["state"], 1 if item["verified"] else 0, now, mission_id, item["kind"], item["ref"]))
-                    db.execute("UPDATE missions SET status='completed',version=version+1,updated_at=? WHERE mission_id=?", (now, mission_id))
-                    live_notice = _event(db, mission_id, "mission.reconciled", from_status=current, to_status="completed", details={"observed": completion_observed})
-                    db.commit()
+            with _completion_guard(root, mission_id, completion_observed), _connect(path, write=True) as db:
+                _begin_write(db)
+                current_row = _get_row(db, mission_id)
+                if int(current_row["version"]) != int(completion_mission["version"]):
+                    raise ValueError("Mission authority changed after child observation")
+                current = str(current_row["status"])
+                now = _now()
+                for item in completion_observed:
+                    db.execute("UPDATE attachments SET state=?,verified=?,updated_at=? WHERE mission_id=? AND kind=? AND ref=?", (item["state"], 1 if item["verified"] else 0, now, mission_id, item["kind"], item["ref"]))
+                db.execute("UPDATE missions SET status='completed',version=version+1,updated_at=? WHERE mission_id=?", (now, mission_id))
+                live_notice = _event(db, mission_id, "mission.reconciled", from_status=current, to_status="completed", details={"observed": completion_observed})
+                db.commit()
             _publish_live_event(live_notice, hermes_root)
             _audit("hermes_mission_reconcile", policy, dry_run=False, success=True, changed=True, mission_id=mission_id, summary=f"mission reconciled {completion_mission['status']}->completed")
             return json.dumps({"success": True, "schema_version": SCHEMA_VERSION, "tool": "hermes_mission_reconcile", "mission_id": mission_id, "status": "completed", "observed": completion_observed, "changed": True})
@@ -942,16 +941,15 @@ def hermes_mission_transition(
             if _desired_mission_status(mission, observed) != "completed":
                 raise ValueError("mission children do not justify completion")
             live_notice: dict[str, Any] | None = None
-            with _completion_guard(root, mission_id, observed):
-                with _connect(path, write=True) as db:
-                    _begin_write(db)
-                    current_row = _get_row(db, mission_id)
-                    if int(current_row["version"]) != int(mission["version"]):
-                        raise ValueError("Mission authority changed after child observation")
-                    now = _now()
-                    db.execute("UPDATE missions SET status='completed',version=version+1,updated_at=? WHERE mission_id=?", (now, mission_id))
-                    live_notice = _event(db, mission_id, "mission.transition", from_status=current, to_status="completed", reason=reason)
-                    db.commit()
+            with _completion_guard(root, mission_id, observed), _connect(path, write=True) as db:
+                _begin_write(db)
+                current_row = _get_row(db, mission_id)
+                if int(current_row["version"]) != int(mission["version"]):
+                    raise ValueError("Mission authority changed after child observation")
+                now = _now()
+                db.execute("UPDATE missions SET status='completed',version=version+1,updated_at=? WHERE mission_id=?", (now, mission_id))
+                live_notice = _event(db, mission_id, "mission.transition", from_status=current, to_status="completed", reason=reason)
+                db.commit()
             _publish_live_event(live_notice, hermes_root)
             _audit("hermes_mission_transition", policy, dry_run=False, success=True, changed=changed, mission_id=mission_id, summary=f"mission {current}->completed")
             return json.dumps({"success": True, "schema_version": SCHEMA_VERSION, "tool": "hermes_mission_transition", "mission_id": mission_id, "from_status": current, "to_status": "completed", "changed": changed})
@@ -1009,17 +1007,16 @@ def hermes_mission_approve(
         with _connect(path, write=False) as db:
             mission = _row_to_mission(db, _get_row(db, mission_id))
         observed = validate(mission)
-        with _completion_guard(root, mission_id, observed):
-            with _connect(path, write=True) as db:
-                _begin_write(db)
-                current_row = _get_row(db, mission_id)
-                if int(current_row["version"]) != int(mission["version"]):
-                    raise ValueError("Mission authority changed after child observation")
-                current = str(current_row["status"])
-                now = _now()
-                db.execute("UPDATE missions SET status=?,approval_json=?,version=version+1,updated_at=? WHERE mission_id=?", (target, json.dumps(approval, sort_keys=True), now, mission_id))
-                live_notice = _event(db, mission_id, "mission.approved", from_status=current, to_status=target, details={"approval_reference": approval_reference})
-                db.commit()
+        with _completion_guard(root, mission_id, observed), _connect(path, write=True) as db:
+            _begin_write(db)
+            current_row = _get_row(db, mission_id)
+            if int(current_row["version"]) != int(mission["version"]):
+                raise ValueError("Mission authority changed after child observation")
+            current = str(current_row["status"])
+            now = _now()
+            db.execute("UPDATE missions SET status=?,approval_json=?,version=version+1,updated_at=? WHERE mission_id=?", (target, json.dumps(approval, sort_keys=True), now, mission_id))
+            live_notice = _event(db, mission_id, "mission.approved", from_status=current, to_status=target, details={"approval_reference": approval_reference})
+            db.commit()
         _publish_live_event(live_notice, hermes_root)
         _audit("hermes_mission_approve", policy, dry_run=False, success=True, changed=True, mission_id=mission_id, summary="mission Owner-approved")
         return json.dumps({"success": True, "schema_version": SCHEMA_VERSION, "tool": "hermes_mission_approve", "mission_id": mission_id, "status": target, "approval": approval, "changed": True})
