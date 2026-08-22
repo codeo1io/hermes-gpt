@@ -356,6 +356,21 @@ def _dispatch_cancelled(row: dict[str, Any]) -> str:
     }, ensure_ascii=False, indent=2)
 
 
+def _dispatch_cas_lost(row: dict[str, Any]) -> str:
+    if row.get("state") == "cancelled" or row.get("cancel_requested"):
+        return _dispatch_cancelled(row)
+    return json.dumps({
+        "success": False,
+        "schema_version": SCHEMA_VERSION,
+        "code": "DELEGATION_DISPATCH_AMBIGUOUS",
+        "safe_message": "Delegation authority changed while backend invocation was in progress.",
+        "changed": False,
+        "submission_may_have_succeeded": True,
+        "delegation": _surface(row),
+        "suggested_action": "Preserve the current durable state and reconcile; do not redispatch this lineage.",
+    }, ensure_ascii=False, indent=2)
+
+
 def _reserved_cancel_cas_lost(row: dict[str, Any]) -> str:
     return json.dumps({
         "success": False,
@@ -550,9 +565,19 @@ def hermes_delegation_dispatch(
         if not dispatch.get("success") and not ambiguous:
             with _connect(path, write=True) as db:
                 _init(db)
-                db.execute("UPDATE delegations SET dispatch_phase='reserved',updated_at=? WHERE delegation_id=? AND dispatch_phase='invoking'", (_now(), delegation_id))
-                _event(db, delegation_id, "delegation.dispatch_rejected", from_state="reserved", to_state="reserved")
+                db.execute("BEGIN IMMEDIATE")
+                changed = db.execute(
+                    "UPDATE delegations SET dispatch_phase='reserved',updated_at=? "
+                    "WHERE delegation_id=? AND dispatch_phase='invoking' AND state='reserved' AND cancel_requested=0",
+                    (_now(), delegation_id),
+                ).rowcount
+                if changed == 1:
+                    _event(db, delegation_id, "delegation.dispatch_rejected", from_state="reserved", to_state="reserved")
                 db.commit()
+                row = dict(_get_row(db, delegation_id))
+            if changed != 1:
+                invocation_claimed = False
+                return _dispatch_cas_lost(row)
             invocation_claimed = False
             return json.dumps({"success": False, "schema_version": SCHEMA_VERSION, "delegation_id": delegation_id, "task_id": task_id, "backend": backend, "changed": False, "dispatch": dispatch}, ensure_ascii=False, indent=2)
 
@@ -567,12 +592,20 @@ def hermes_delegation_dispatch(
             state = "queued"
         with _connect(path, write=True) as db:
             _init(db)
+            db.execute("BEGIN IMMEDIATE")
             phase = "invoking" if ambiguous else "dispatched"
-            db.execute("UPDATE delegations SET state=?,backend_state=?,backend_ref_json=?,dispatch_phase=?,dispatched_at=?,updated_at=? WHERE delegation_id=? AND dispatch_phase='invoking'", (state, _bounded(backend_state, 128), json.dumps(_backend_ref(dispatch), sort_keys=True), phase, now, now, delegation_id))
-            _event(db, delegation_id, "delegation.dispatched", to_state=state, backend_state=backend_state)
+            changed = db.execute(
+                "UPDATE delegations SET state=?,backend_state=?,backend_ref_json=?,dispatch_phase=?,dispatched_at=?,updated_at=? "
+                "WHERE delegation_id=? AND dispatch_phase='invoking' AND state='reserved' AND cancel_requested=0",
+                (state, _bounded(backend_state, 128), json.dumps(_backend_ref(dispatch), sort_keys=True), phase, now, now, delegation_id),
+            ).rowcount
+            if changed == 1:
+                _event(db, delegation_id, "delegation.dispatched", to_state=state, backend_state=backend_state)
             db.commit()
             row = dict(_get_row(db, delegation_id))
         invocation_claimed = False
+        if changed != 1:
+            return _dispatch_cas_lost(row)
         mission_linked = True
         if mission_id:
             mission_linked = _sync_mission_attachment(
@@ -604,8 +637,13 @@ def hermes_delegation_dispatch(
             try:
                 with _connect(_db_path(root), write=True) as db:
                     _init(db)
-                    db.execute("UPDATE delegations SET state='reconciling',backend_state='ambiguous',updated_at=? WHERE delegation_id=? AND dispatch_phase='invoking'", (_now(), delegation_id))
-                    _event(db, delegation_id, "delegation.dispatch_ambiguous", from_state="reserved", to_state="reconciling", backend_state="ambiguous")
+                    changed = db.execute(
+                        "UPDATE delegations SET state='reconciling',backend_state='ambiguous',updated_at=? "
+                        "WHERE delegation_id=? AND dispatch_phase='invoking' AND state='reserved' AND cancel_requested=0",
+                        (_now(), delegation_id),
+                    ).rowcount
+                    if changed == 1:
+                        _event(db, delegation_id, "delegation.dispatch_ambiguous", from_state="reserved", to_state="reconciling", backend_state="ambiguous")
                     db.commit()
             except (OSError, sqlite3.Error):
                 pass
@@ -771,6 +809,25 @@ def hermes_delegation_reconcile(
             terminal_at = None
         with _connect(path, write=True) as db:
             _init(db)
+            db.execute("BEGIN IMMEDIATE")
+            current = dict(_get_row(db, delegation_id))
+            authority_fields = (
+                "schema", "mission_id", "task_id", "contract_sha256", "backend",
+                "state", "cancel_requested", "dispatch_phase", "terminal_at", "updated_at",
+            )
+            stale = any(current.get(key) != stored.get(key) for key in authority_fields)
+            if stale:
+                db.commit()
+                return json.dumps({
+                    "success": True,
+                    "schema_version": SCHEMA_VERSION,
+                    "changed": False,
+                    "applied": False,
+                    "stale_observation": True,
+                    "delegation": _surface(current),
+                    "observed": observed,
+                    "evidence_ref": "",
+                }, ensure_ascii=False, indent=2)
             if contract_json:
                 db.execute(
                     "INSERT INTO delegation_validation_manifests(delegation_id,schema,context_sha256,manifest_json,created_at,updated_at) "
@@ -872,9 +929,10 @@ def hermes_delegation_cancel(
         event_type = "delegation.cancelled" if desired == "cancelled" else "delegation.cancel_requested"
         with _connect(path, write=True) as db:
             _init(db)
+            dispatch_phase = "cancelled" if desired == "cancelled" else stored.get("dispatch_phase", "dispatched")
             db.execute(
-                "UPDATE delegations SET state=?,backend_state=?,outcome=?,cancel_requested=1,updated_at=?,terminal_at=? WHERE delegation_id=?",
-                (desired, _bounded(backend_state, 128), outcome, now, now if desired in TERMINAL_STATES else None, delegation_id),
+                "UPDATE delegations SET state=?,backend_state=?,outcome=?,cancel_requested=1,dispatch_phase=?,updated_at=?,terminal_at=? WHERE delegation_id=?",
+                (desired, _bounded(backend_state, 128), outcome, dispatch_phase, now, now if desired in TERMINAL_STATES else None, delegation_id),
             )
             _event(db, delegation_id, event_type, from_state=stored["state"], to_state=desired, backend_state=backend_state)
             db.commit()

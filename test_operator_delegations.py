@@ -222,6 +222,95 @@ def test_reconcile_backend_success_uses_durable_validation_manifest(tmp_path: Pa
     assert attachment["verified"]
 
 
+def test_reconcile_cas_preserves_concurrently_confirmed_cancellation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    root = tmp_path / "hermes"
+    _enable_workspace(monkeypatch, workspace)
+    mission_id = _mission(root)
+    monkeypatch.setattr(
+        delegations.contract_mod,
+        "hermes_contract_dispatch",
+        lambda *a, **k: json.dumps({"success": True, "changed": True, "state": "running"}),
+    )
+    task_id = "delegation-reconcile-cancel-race"
+    assert json.loads(delegations.hermes_delegation_dispatch(
+        json.dumps(_contract(workspace, task_id=task_id)),
+        mission_id=mission_id,
+        delegation_id="dlg-reconcile-cancel-race",
+        confirm=True,
+        dry_run=False,
+        hermes_root=root,
+    ))["success"]
+    meta_path, _, _ = runners._job_paths(task_id, root)
+    runners._atomic_json(meta_path, {
+        "schema_version": runners.SCHEMA_VERSION,
+        "task_id": task_id,
+        "backend": "pi_rpc",
+        "state": "completed",
+        "outcome": "completed",
+        "created_at": "2026-08-22T00:00:00+00:00",
+        "started_at": "2026-08-22T00:00:01+00:00",
+        "ended_at": "2026-08-22T00:00:02+00:00",
+        "error": "",
+    })
+    entered = threading.Event()
+    release = threading.Event()
+    original_validate = delegations.contract_mod._validate_manifest_impl
+
+    def paused_validate(*args, **kwargs):
+        result = original_validate(*args, **kwargs)
+        entered.set()
+        assert release.wait(5)
+        return result
+
+    monkeypatch.setattr(delegations.contract_mod, "_validate_manifest_impl", paused_validate)
+    result: list[dict] = []
+    thread = threading.Thread(target=lambda: result.append(json.loads(
+        delegations.hermes_delegation_reconcile(
+            "dlg-reconcile-cancel-race", apply=True, hermes_root=root,
+        )
+    )))
+    thread.start()
+    assert entered.wait(5)
+    monkeypatch.setattr(
+        delegations.runners,
+        "hermes_runner_cancel",
+        lambda *a, **k: json.dumps({"success": True, "changed": True, "state": "cancelled"}),
+    )
+    cancelled = json.loads(delegations.hermes_delegation_cancel(
+        "dlg-reconcile-cancel-race", confirm=True, dry_run=False, hermes_root=root,
+    ))
+    assert cancelled["delegation"]["state"] == "cancelled"
+    release.set()
+    thread.join(5)
+    assert not thread.is_alive()
+    assert result[0]["stale_observation"] is True
+    assert result[0]["applied"] is False
+    assert result[0]["evidence_ref"] == ""
+    assert result[0]["delegation"]["state"] == "cancelled"
+    durable = json.loads(delegations.hermes_delegation_get(
+        "dlg-reconcile-cancel-race", hermes_root=root,
+    ))["delegation"]
+    assert durable["state"] == "cancelled"
+    assert durable["dispatch_phase"] == "cancelled"
+    mission = json.loads(missions.hermes_mission_reconcile(
+        mission_id, confirm=True, dry_run=False, hermes_root=root,
+    ))
+    assert mission["success"] is True
+    assert mission["status"] not in {"awaiting_approval", "completed"}
+    observed_attachment = next(item for item in mission["observed"] if item["ref"] == "dlg-reconcile-cancel-race")
+    assert observed_attachment["state"] == "cancelled"
+    assert observed_attachment["verified"] is False
+    current_mission = json.loads(missions.hermes_mission_get(mission_id, hermes_root=root))
+    attachment = next(item for item in current_mission["attachments"] if item["ref"] == "dlg-reconcile-cancel-race")
+    assert attachment["state"] == "cancelled"
+    assert bool(attachment["verified"]) is False
+
+
 
 def test_reconcile_satisfied_contract_promotes_verified_mission_attachment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     workspace = tmp_path / "ws"
@@ -646,6 +735,66 @@ def test_concurrent_exact_retry_invokes_backend_once(tmp_path: Path, monkeypatch
     assert retry["submission_may_have_succeeded"] is True
     assert retry["delegation"]["dispatch_phase"] == "invoking"
     assert result[0]["delegation"]["dispatch_phase"] == "dispatched"
+
+
+def test_dispatch_completion_cas_preserves_inflight_confirmed_cancellation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    root = tmp_path / "hermes"
+    _enable_workspace(monkeypatch, workspace)
+    mission_id = _mission(root)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def dispatch(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return json.dumps({"success": True, "changed": True, "state": "queued"})
+
+    monkeypatch.setattr(delegations.contract_mod, "hermes_contract_dispatch", dispatch)
+    monkeypatch.setattr(
+        delegations.runners,
+        "hermes_runner_cancel",
+        lambda *a, **k: json.dumps({"success": True, "changed": True, "state": "cancelled"}),
+    )
+    result: list[dict] = []
+    thread = threading.Thread(target=lambda: result.append(json.loads(
+        delegations.hermes_delegation_dispatch(
+            json.dumps(_contract(workspace, task_id="delegation-dispatch-cancel-race")),
+            mission_id=mission_id,
+            delegation_id="dlg-dispatch-cancel-race",
+            confirm=True,
+            dry_run=False,
+            hermes_root=root,
+        )
+    )))
+    thread.start()
+    assert entered.wait(5)
+    cancelled = json.loads(delegations.hermes_delegation_cancel(
+        "dlg-dispatch-cancel-race", confirm=True, dry_run=False, hermes_root=root,
+    ))
+    assert cancelled["success"] is True
+    assert cancelled["delegation"]["state"] == "cancelled"
+    assert cancelled["delegation"]["dispatch_phase"] == "cancelled"
+    release.set()
+    thread.join(5)
+    assert not thread.is_alive()
+    assert result[0]["success"] is False
+    assert result[0]["code"] == "DELEGATION_DISPATCH_CANCELLED"
+    assert result[0]["delegation"]["state"] == "cancelled"
+    durable = json.loads(delegations.hermes_delegation_get(
+        "dlg-dispatch-cancel-race", hermes_root=root,
+    ))["delegation"]
+    assert durable["state"] == "cancelled"
+    assert durable["dispatch_phase"] == "cancelled"
+    assert durable["cancel_requested"] is True
+    mission = json.loads(missions.hermes_mission_get(mission_id, hermes_root=root))
+    attachment = next(item for item in mission["attachments"] if item["ref"] == "dlg-dispatch-cancel-race")
+    assert attachment["state"] == "cancelled"
+    assert bool(attachment["verified"]) is False
 
 
 def test_collision_requires_exact_delegation_and_task_lineage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

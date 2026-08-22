@@ -435,7 +435,7 @@ def _parse_contract(contract_json: str) -> tuple[str, dict[str, Any], str]:
     return canonical, contract, _contract_sha256(canonical)
 
 
-VALIDATION_MANIFEST_SCHEMA = "hermes.contract-validation-manifest/v1"
+VALIDATION_MANIFEST_SCHEMA = "hermes.contract-validation-manifest/v2"
 
 
 def _validation_manifest(contract: dict[str, Any], contract_sha256: str) -> dict[str, Any]:
@@ -464,6 +464,12 @@ def _validation_manifest(contract: dict[str, Any], contract_sha256: str) -> dict
         "completion_criteria": contract["completion_criteria"],
         "authorization": contract["authorization"],
     }
+    context["execution"] = None
+    if isinstance(contract.get("execution"), dict):
+        # Validation needs the canonical backend selector to distinguish local,
+        # explicit Fabric, and auto-routed execution. Backend-specific options
+        # are dispatch inputs and are deliberately not durable validation data.
+        context["execution"] = {"backend": contract["execution"]["backend"]}
     encoded = json.dumps(context, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     # Durable validation context must never contain a token which our normal
     # output policy would redact.  Reject instead of silently persisting a
@@ -496,11 +502,28 @@ def _contract_from_validation_manifest(manifest: dict[str, Any]) -> tuple[dict[s
     required = {
         "task_id", "assigned_agent", "assigned_profile", "allowed_scope",
         "forbidden_actions", "expected_artifacts", "tests", "review_requirements",
-        "completion_criteria", "authorization",
+        "completion_criteria", "authorization", "execution",
     }
     if set(context) != required:
         raise ValueError("validation manifest context fields are invalid")
     contract = dict(context)
+    execution = context["execution"]
+    if execution is None:
+        contract.pop("execution")
+    elif (
+        not isinstance(execution, dict)
+        or set(execution) != {"backend"}
+        or not isinstance(execution.get("backend"), str)
+    ):
+        raise ValueError("validation manifest execution selector is invalid")
+    else:
+        normalized_execution = op_runners.normalize_execution({
+            "backend": execution["backend"],
+            "options": {},
+        })
+        if normalized_execution is None:
+            raise ValueError("validation manifest execution selector is invalid")
+        contract["execution"] = normalized_execution
     contract.update({"schema": CONTRACT_SCHEMA, "objective": "", "inputs": [], "constraints": []})
     return contract, sha
 

@@ -12,6 +12,7 @@ rejects a false "done" claim (NOT_SATISFIED / INCONCLUSIVE +
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -225,6 +226,59 @@ def test_validation_manifest_uses_public_validation_algorithm_with_parity(hermes
     assert "RAW_REVIEW_BODY_MUST_NOT_PERSIST" not in encoded
     assert "inputs" not in manifest["context"]
     assert "constraints" not in manifest["context"]
+
+
+@pytest.mark.parametrize("backend", ["fabric", "auto"])
+def test_validation_manifest_preserves_execution_routing_parity(
+    hermes_root: Path,
+    backend: str,
+):
+    contract = _contract_for_ws(hermes_root.parent / "ws")
+    contract["task_id"] = f"manifest-routing-{backend}"
+    contract["assigned_agent"] = "auto" if backend == "auto" else "fabric-node"
+    contract["execution"] = {
+        "backend": backend,
+        "options": {"preferences": ["remote"]} if backend == "auto" else {"node": "fabric-node"},
+    }
+    contract["forbidden_actions"] = [
+        {"action": "publish", "class": "HIGH", "reason": "must remain forbidden"}
+    ]
+    canonical, parsed, sha = contract_mod._parse_contract(json.dumps(contract))
+    if backend == "auto":
+        journal = hermes_root / "fabric" / "routing-decisions.jsonl"
+        journal.parent.mkdir(parents=True)
+        journal.write_text(json.dumps({
+            "schema": "hermes.fabric-routing-decision/v1",
+            "task_id": parsed["task_id"],
+            "original_contract_sha256": sha,
+            "selected": {"remote": True, "transport_backend": "fabric"},
+        }) + "\n", encoding="utf-8")
+
+    public = json.loads(contract_mod.hermes_contract_validate(canonical, hermes_root=hermes_root))
+    manifest = contract_mod._validation_manifest(parsed, sha)
+    reconstructed, reconstructed_sha = contract_mod._contract_from_validation_manifest(manifest)
+    private = contract_mod._validate_manifest_impl(manifest, None, hermes_root)
+
+    assert reconstructed_sha == sha
+    assert reconstructed["execution"] == {"backend": backend, "options": {}}
+    assert manifest["context"]["execution"] == {"backend": backend}
+    assert private["verdict"] == public["verdict"]
+    assert private["checks"] == public["checks"]
+    forbidden = next(check for check in private["checks"] if check["kind"] == "forbidden")
+    assert forbidden["status"] == "UNVERIFIED"
+    assert "options" not in manifest["context"]["execution"]
+
+
+def test_legacy_validation_manifest_without_execution_lineage_fails_closed(hermes_root: Path):
+    contract = _contract_for_ws(hermes_root.parent / "ws")
+    _canonical, parsed, sha = contract_mod._parse_contract(json.dumps(contract))
+    manifest = contract_mod._validation_manifest(parsed, sha)
+    manifest["schema"] = "hermes.contract-validation-manifest/v1"
+    manifest["context"].pop("execution")
+    encoded = json.dumps(manifest["context"], ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    manifest["context_sha256"] = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    with pytest.raises(ValueError, match="schema"):
+        contract_mod._contract_from_validation_manifest(manifest)
 
 
 def _add_review_evidence(contract: dict, *, reviewer: str = "default") -> None:
