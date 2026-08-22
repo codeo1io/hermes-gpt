@@ -733,8 +733,12 @@ def hermes_delegation_reconcile(
         validation = contract_mod._validate_manifest_impl(manifest, None, root)
         verdict = str(validation.get("verdict") or "")
 
+        authoritative_cancel = stored["state"] == "cancelled" and bool(stored.get("cancel_requested"))
         desired = observed_desired
-        if observed is None or (observed_desired == "succeeded" and verdict != "SATISFIED"):
+        if authoritative_cancel:
+            desired = "cancelled"
+            outcome = stored.get("outcome") or "cancelled"
+        elif observed is None or (observed_desired == "succeeded" and verdict != "SATISFIED"):
             desired = "reconciling"
         verified_success = desired == "succeeded" and verdict == "SATISFIED"
 

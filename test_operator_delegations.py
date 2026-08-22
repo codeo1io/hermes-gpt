@@ -480,6 +480,117 @@ def test_cancel_backend_completed_self_report_stays_reconciling(tmp_path: Path, 
     assert fetched["delegation"]["events"][0]["event_type"] == "delegation.cancel_requested"
 
 
+@pytest.mark.parametrize("cancel_kind", ["reserved", "dispatched"])
+@pytest.mark.parametrize("observed_state", ["running", "completed"])
+@pytest.mark.parametrize("apply", [False, True])
+def test_authoritative_cancellation_is_terminal_during_reconciliation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cancel_kind: str,
+    observed_state: str,
+    apply: bool,
+):
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    root = tmp_path / "hermes"
+    _enable_workspace(monkeypatch, workspace)
+    mission_id = _mission(root) if cancel_kind == "dispatched" else ""
+    task_id = f"delegation-cancel-final-{cancel_kind}-{observed_state}-{apply}"
+    delegation_id = f"dlg-cancel-final-{cancel_kind}-{observed_state}-{str(apply).lower()}"
+    contract = _contract(workspace, task_id=task_id)
+    dispatch_state = (
+        {"success": False, "changed": False, "code": "REJECTED"}
+        if cancel_kind == "reserved"
+        else {"success": True, "changed": True, "backend": "pi_rpc", "state": "running"}
+    )
+    monkeypatch.setattr(
+        delegations.contract_mod,
+        "hermes_contract_dispatch",
+        lambda *args, **kwargs: json.dumps(dispatch_state),
+    )
+    json.loads(delegations.hermes_delegation_dispatch(
+        json.dumps(contract),
+        mission_id=mission_id,
+        delegation_id=delegation_id,
+        confirm=True,
+        dry_run=False,
+        hermes_root=root,
+    ))
+    if cancel_kind == "dispatched":
+        monkeypatch.setattr(
+            delegations.runners,
+            "hermes_runner_cancel",
+            lambda *args, **kwargs: json.dumps(
+                {"success": True, "changed": True, "backend": "pi_rpc", "state": "cancelled"}
+            ),
+        )
+    cancelled = json.loads(delegations.hermes_delegation_cancel(
+        delegation_id,
+        confirm=True,
+        dry_run=False,
+        hermes_root=root,
+    ))["delegation"]
+    assert cancelled["state"] == "cancelled"
+    assert cancelled["cancel_requested"] is True
+
+    meta_path, _, _ = runners._job_paths(task_id, root)
+    runners._atomic_json(meta_path, {
+        "schema_version": runners.SCHEMA_VERSION,
+        "task_id": task_id,
+        "backend": "pi_rpc",
+        "state": observed_state,
+        "outcome": observed_state,
+        "created_at": "2026-08-22T00:00:00+00:00",
+        "started_at": "2026-08-22T00:00:01+00:00",
+        "ended_at": "2026-08-22T00:00:02+00:00" if observed_state == "completed" else "",
+        "error": "",
+    })
+    reconciled = json.loads(delegations.hermes_delegation_reconcile(
+        delegation_id,
+        apply=apply,
+        hermes_root=root,
+    ))
+    assert reconciled["success"] is True
+    assert reconciled["delegation"]["state"] == "cancelled"
+    assert reconciled["delegation"]["cancel_requested"] is True
+    assert reconciled["delegation"]["dispatch_phase"] == cancelled["dispatch_phase"]
+    assert reconciled["delegation"]["terminal_at"] == cancelled["terminal_at"]
+    assert reconciled["delegation"]["outcome"] == "cancelled"
+    assert reconciled["delegation"]["backend_state"] == observed_state
+    if observed_state == "completed":
+        assert reconciled["delegation"]["validation_verdict"] == "SATISFIED"
+    assert reconciled["evidence_ref"] == ""
+    persisted = json.loads(delegations.hermes_delegation_get(delegation_id, hermes_root=root))["delegation"]
+    assert persisted["state"] == "cancelled"
+    assert persisted["cancel_requested"] is True
+    assert persisted["dispatch_phase"] == cancelled["dispatch_phase"]
+    assert persisted["terminal_at"] == cancelled["terminal_at"]
+    assert persisted["outcome"] == "cancelled"
+
+    if mission_id:
+        mission = json.loads(missions.hermes_mission_reconcile(
+            mission_id,
+            confirm=True,
+            dry_run=False,
+            hermes_root=root,
+        ))
+        observed = next(item for item in mission["observed"] if item["ref"] == delegation_id)
+        assert observed["state"] == "cancelled"
+        assert observed["verified"] is False
+        assert mission["status"] not in {"awaiting_approval", "completed"}
+        monkeypatch.setenv(op.OPERATOR_LEVEL_ENV, "owner")
+        monkeypatch.setenv(op.OWNER_ACTIVE_ENV, "1")
+        monkeypatch.setenv(op.OWNER_ACK_ENV, op.OWNER_ACK_REQUIRED_VALUE)
+        approval = json.loads(missions.hermes_mission_approve(
+            mission_id,
+            "approval:cancelled-child",
+            confirm=True,
+            dry_run=False,
+            hermes_root=root,
+        ))
+        assert approval["success"] is False
+
+
 def test_get_returns_bounded_event_history(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     workspace = tmp_path / "ws"
     workspace.mkdir()
