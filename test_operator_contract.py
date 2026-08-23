@@ -12,6 +12,7 @@ rejects a false "done" claim (NOT_SATISFIED / INCONCLUSIVE +
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -89,11 +90,13 @@ def _make_kanban_board(boards_dir: Path, slug: str, runs: list[dict]) -> None:
 def hermes_root(tmp_path: Path, monkeypatch) -> Path:
     """Build a hermetic Hermes root + workspace with observed run sources."""
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
-    op.set_audit_log_override(tmp_path / "audit.jsonl")
     contract_mod.mission._cache_clear()
 
     root = tmp_path / "hermes"
     root.mkdir(parents=True, exist_ok=True)
+    audit_path = root / "logs" / "hermes_gpt_operator_audit.jsonl"
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    op.set_audit_log_override(audit_path)
     (root / "config.yaml").write_text("model: test-model\nprovider: test-provider\n", encoding="utf-8")
 
     ws = tmp_path / "ws"
@@ -206,6 +209,78 @@ def _run_status(contract: dict, root: Path) -> dict:
     out = contract_mod.hermes_contract_status(json.dumps(contract), hermes_root=root)
     assert isinstance(out, str)
     return json.loads(out)
+
+
+def test_validation_manifest_uses_public_validation_algorithm_with_parity(hermes_root: Path):
+    contract = _contract_for_ws(hermes_root.parent / "ws")
+    contract["forbidden_actions"] = [{"action": "publish", "class": "HIGH", "reason": "RAW_REASON_MUST_NOT_PERSIST"}]
+    contract["review_requirements"]["evidence"] = "RAW_REVIEW_BODY_MUST_NOT_PERSIST"
+    canonical, parsed, sha = contract_mod._parse_contract(json.dumps(contract))
+    public = json.loads(contract_mod.hermes_contract_validate(canonical, hermes_root=hermes_root))
+    manifest = contract_mod._validation_manifest(parsed, sha)
+    private = contract_mod._validate_manifest_impl(manifest, None, hermes_root)
+    assert private["contract_sha256"] == public["contract_sha256"] == sha
+    assert private["verdict"] == public["verdict"]
+    assert private["checks"] == public["checks"]
+    encoded = json.dumps(manifest)
+    assert parsed["objective"] not in encoded
+    assert "RAW_REASON_MUST_NOT_PERSIST" not in encoded
+    assert "RAW_REVIEW_BODY_MUST_NOT_PERSIST" not in encoded
+    assert "inputs" not in manifest["context"]
+    assert "constraints" not in manifest["context"]
+
+
+@pytest.mark.parametrize("backend", ["fabric", "auto"])
+def test_validation_manifest_preserves_execution_routing_parity(
+    hermes_root: Path,
+    backend: str,
+):
+    contract = _contract_for_ws(hermes_root.parent / "ws")
+    contract["task_id"] = f"manifest-routing-{backend}"
+    contract["assigned_agent"] = "auto" if backend == "auto" else "fabric-node"
+    contract["execution"] = {
+        "backend": backend,
+        "options": {"preferences": ["remote"]} if backend == "auto" else {"node": "fabric-node"},
+    }
+    contract["forbidden_actions"] = [
+        {"action": "publish", "class": "HIGH", "reason": "must remain forbidden"}
+    ]
+    canonical, parsed, sha = contract_mod._parse_contract(json.dumps(contract))
+    if backend == "auto":
+        journal = hermes_root / "fabric" / "routing-decisions.jsonl"
+        journal.parent.mkdir(parents=True)
+        journal.write_text(json.dumps({
+            "schema": "hermes.fabric-routing-decision/v1",
+            "task_id": parsed["task_id"],
+            "original_contract_sha256": sha,
+            "selected": {"remote": True, "transport_backend": "fabric"},
+        }) + "\n", encoding="utf-8")
+
+    public = json.loads(contract_mod.hermes_contract_validate(canonical, hermes_root=hermes_root))
+    manifest = contract_mod._validation_manifest(parsed, sha)
+    reconstructed, reconstructed_sha = contract_mod._contract_from_validation_manifest(manifest)
+    private = contract_mod._validate_manifest_impl(manifest, None, hermes_root)
+
+    assert reconstructed_sha == sha
+    assert reconstructed["execution"] == {"backend": backend, "options": {}}
+    assert manifest["context"]["execution"] == {"backend": backend}
+    assert private["verdict"] == public["verdict"]
+    assert private["checks"] == public["checks"]
+    forbidden = next(check for check in private["checks"] if check["kind"] == "forbidden")
+    assert forbidden["status"] == "UNVERIFIED"
+    assert "options" not in manifest["context"]["execution"]
+
+
+def test_legacy_validation_manifest_without_execution_lineage_fails_closed(hermes_root: Path):
+    contract = _contract_for_ws(hermes_root.parent / "ws")
+    _canonical, parsed, sha = contract_mod._parse_contract(json.dumps(contract))
+    manifest = contract_mod._validation_manifest(parsed, sha)
+    manifest["schema"] = "hermes.contract-validation-manifest/v1"
+    manifest["context"].pop("execution")
+    encoded = json.dumps(manifest["context"], ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    manifest["context_sha256"] = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    with pytest.raises(ValueError, match="schema"):
+        contract_mod._contract_from_validation_manifest(manifest)
 
 
 def _add_review_evidence(contract: dict, *, reviewer: str = "default") -> None:
@@ -1021,21 +1096,49 @@ def test_validate_does_not_modify_state(hermes_root):
     cache.parent.mkdir(parents=True, exist_ok=True)
     cache.write_text("def cached(): pass\n", encoding="utf-8")
 
+    c = _contract_for_ws(ws, task_id="t-done")
+    _add_review_evidence(c, reviewer="default")
     before = {
         p.relative_to(hermes_root).as_posix(): (p.stat().st_size, p.stat().st_mtime_ns)
         for p in hermes_root.rglob("*")
-        if p.is_file()
+        if p.is_file() and p != op.audit_log_path()
     }
-    c = _contract_for_ws(ws, task_id="t-done")
-    _add_review_evidence(c, reviewer="default")
     out = _run_validate(c, hermes_root)
     assert out["verdict"] == "SATISFIED"
     after = {
         p.relative_to(hermes_root).as_posix(): (p.stat().st_size, p.stat().st_mtime_ns)
         for p in hermes_root.rglob("*")
-        if p.is_file()
+        if p.is_file() and p != op.audit_log_path()
     }
     assert after == before
+
+
+def test_custom_root_audit_evidence_is_isolated(tmp_path: Path):
+    custom = tmp_path / "custom-hermes"
+    other = tmp_path / "other-hermes"
+    for root in (custom, other):
+        (root / "logs").mkdir(parents=True)
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    c = _contract_for_ws(ws, task_id="custom-audit-task")
+    c["forbidden_actions"] = [{"action": "public_publish", "class": "HIGH", "reason": "forbidden"}]
+    c["authorization"]["approved_by"] = c["assigned_profile"]
+    c["authorization"].pop("approval_reference", None)
+    canonical, parsed, sha = contract_mod._parse_contract(json.dumps(c))
+    del canonical
+    custom_records = [
+        {"tool": "hermes_contract_validate", "contract_sha256": sha, "verdict": "SATISFIED", "reviewer": "independent"},
+        {"tool": "public_publish", "task_id": parsed["task_id"], "profile": parsed["assigned_profile"], "forbidden_action": "public_publish"},
+    ]
+    (custom / "logs" / "hermes_gpt_operator_audit.jsonl").write_text(
+        "".join(json.dumps(record) + "\n" for record in custom_records), encoding="utf-8"
+    )
+    (other / "logs" / "hermes_gpt_operator_audit.jsonl").write_text("", encoding="utf-8")
+
+    assert contract_mod._check_review(parsed, sha, custom)["status"] == "PASS"
+    assert contract_mod._check_forbidden(parsed, custom, sha)["status"] == "FAIL"
+    assert contract_mod._check_review(parsed, sha, other)["status"] == "FAIL"
+    assert contract_mod._check_forbidden(parsed, other, sha)["status"] == "PASS"
 
 
 # ---------------------------------------------------------------------------

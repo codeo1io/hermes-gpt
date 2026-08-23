@@ -46,6 +46,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -434,6 +435,108 @@ def _parse_contract(contract_json: str) -> tuple[str, dict[str, Any], str]:
     return canonical, contract, _contract_sha256(canonical)
 
 
+VALIDATION_MANIFEST_SCHEMA = "hermes.contract-validation-manifest/v2"
+
+
+def _validation_manifest(contract: dict[str, Any], contract_sha256: str) -> dict[str, Any]:
+    """Return the prompt-free subset required by the observed-state validator.
+
+    The objective, inputs, constraints, and backend request/response bodies are
+    intentionally excluded.  The returned values are sufficient to run the
+    exact same validation algorithm as ``hermes_contract_validate``.
+    """
+    context = {
+        "task_id": contract["task_id"],
+        "assigned_agent": contract["assigned_agent"],
+        "assigned_profile": contract["assigned_profile"],
+        "allowed_scope": contract["allowed_scope"],
+        "forbidden_actions": [
+            {"action": item["action"], "class": item["class"]}
+            for item in contract["forbidden_actions"]
+        ],
+        "expected_artifacts": contract["expected_artifacts"],
+        "tests": contract["tests"],
+        "review_requirements": {
+            key: value
+            for key, value in contract["review_requirements"].items()
+            if key != "evidence"
+        },
+        "completion_criteria": contract["completion_criteria"],
+        "authorization": contract["authorization"],
+    }
+    context["execution"] = None
+    if isinstance(contract.get("execution"), dict):
+        # Validation needs the canonical backend selector to distinguish local,
+        # explicit Fabric, and auto-routed execution. Backend-specific options
+        # are dispatch inputs and are deliberately not durable validation data.
+        context["execution"] = {"backend": contract["execution"]["backend"]}
+    encoded = json.dumps(context, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    # Durable validation context must never contain a token which our normal
+    # output policy would redact.  Reject instead of silently persisting a
+    # lossy manifest that could later validate different authority.
+    if op.redact_output(encoded) != encoded:
+        raise PermissionError("validation manifest contains secret-like durable values")
+    return {
+        "schema": VALIDATION_MANIFEST_SCHEMA,
+        "contract_sha256": contract_sha256,
+        "context_sha256": hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+        "context": context,
+    }
+
+
+def _contract_from_validation_manifest(manifest: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    if not isinstance(manifest, dict) or manifest.get("schema") != VALIDATION_MANIFEST_SCHEMA:
+        raise ValueError("validation manifest schema is invalid")
+    sha = str(manifest.get("contract_sha256") or "")
+    context_sha = str(manifest.get("context_sha256") or "")
+    context = manifest.get("context")
+    if not re.fullmatch(r"[0-9a-f]{64}", sha) or not re.fullmatch(r"[0-9a-f]{64}", context_sha):
+        raise ValueError("validation manifest digest is invalid")
+    if not isinstance(context, dict):
+        raise ValueError("validation manifest context is invalid")
+    encoded = json.dumps(context, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    if hashlib.sha256(encoded.encode("utf-8")).hexdigest() != context_sha:
+        raise ValueError("validation manifest context digest mismatch")
+    if op.redact_output(encoded) != encoded:
+        raise PermissionError("validation manifest contains secret-like durable values")
+    required = {
+        "task_id", "assigned_agent", "assigned_profile", "allowed_scope",
+        "forbidden_actions", "expected_artifacts", "tests", "review_requirements",
+        "completion_criteria", "authorization", "execution",
+    }
+    if set(context) != required:
+        raise ValueError("validation manifest context fields are invalid")
+    contract = dict(context)
+    execution = context["execution"]
+    if execution is None:
+        contract.pop("execution")
+    elif (
+        not isinstance(execution, dict)
+        or set(execution) != {"backend"}
+        or not isinstance(execution.get("backend"), str)
+    ):
+        raise ValueError("validation manifest execution selector is invalid")
+    else:
+        normalized_execution = op_runners.normalize_execution({
+            "backend": execution["backend"],
+            "options": {},
+        })
+        if normalized_execution is None:
+            raise ValueError("validation manifest execution selector is invalid")
+        contract["execution"] = normalized_execution
+    contract.update({"schema": CONTRACT_SCHEMA, "objective": "", "inputs": [], "constraints": []})
+    return contract, sha
+
+
+def _validate_manifest_impl(
+    manifest: dict[str, Any],
+    runner: Callable[..., tuple[int, str, str]] | None,
+    hermes_root: Path,
+) -> dict[str, Any]:
+    contract, sha = _contract_from_validation_manifest(manifest)
+    return _validate_impl(contract, sha, runner, hermes_root)
+
+
 # ---------------------------------------------------------------------------
 # Surface redaction (D8)
 # ---------------------------------------------------------------------------
@@ -536,11 +639,25 @@ def _observed_runs(task_id: str, hermes_root: Path) -> list[dict[str, Any]]:
     )
 
 
-def _observed_audit(limit: int = _MAX_REVIEW_EVIDENCE_SCAN) -> list[dict[str, Any]]:
+def _observed_audit(
+    hermes_root: Path,
+    limit: int = _MAX_REVIEW_EVIDENCE_SCAN,
+) -> list[dict[str, Any]]:
+    """Read audit evidence only from the selected Hermes root."""
+    log_path = _resolve_root(hermes_root) / "logs" / "hermes_gpt_operator_audit.jsonl"
+    records: list[dict[str, Any]] = []
     try:
-        return op.audit_tail(limit=limit)
-    except Exception:
+        with log_path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(record, dict):
+                    records.append(record)
+    except OSError:
         return []
+    return records[-limit:] if limit > 0 else records
 
 
 # ---------------------------------------------------------------------------
@@ -805,7 +922,7 @@ def _check_review(contract: dict[str, Any], contract_sha256: str, hermes_root: P
         }
 
     # Evidence 1: an audit hermes_contract_validate acceptance by a distinct reviewer.
-    for rec in _observed_audit():
+    for rec in _observed_audit(hermes_root):
         if rec.get("tool") != "hermes_contract_validate":
             continue
         if rec.get("contract_sha256") != contract_sha256:
@@ -938,7 +1055,7 @@ def _check_forbidden(
     # Audit trail scan (D5): scope strictly to this contract's task identity.
     # Profile-only matching allowed an unrelated concurrent contract to fail this
     # one; records without a matching task_id are intentionally ignored.
-    for rec in _observed_audit():
+    for rec in _observed_audit(hermes_root):
         if str(rec.get("task_id") or "") != task_id:
             continue
         profile = str(rec.get("profile") or "")
@@ -1260,7 +1377,7 @@ def _validate_impl(contract: dict[str, Any], sha: str, runner: Callable[..., tup
     evidence: dict[str, Any] = {
         "run": _observed_runs(contract["task_id"], hermes_root)[:5],
         "artifacts": [],
-        "audit_count": len(_observed_audit()),
+        "audit_count": len(_observed_audit(hermes_root)),
     }
     for c in checks:
         if c.get("evidence"):

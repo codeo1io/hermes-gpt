@@ -161,7 +161,7 @@ def _init_db(db: sqlite3.Connection) -> None:
             FOREIGN KEY (mission_id) REFERENCES missions(mission_id) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS idx_missions_status ON missions(status, updated_at);
-        CREATE INDEX IF NOT EXISTS idx_attachments_mission ON attachments(mission_id, kind, state);
+        CREATE INDEX IF NOT EXISTS idx_attachments_mission ON attachments(mission_id, kind,state);
         CREATE INDEX IF NOT EXISTS idx_events_mission ON mission_events(mission_id, seq);
         """
     )
@@ -569,6 +569,8 @@ def hermes_mission_attach(
             raise ValueError("attachment state is invalid")
         if state == "succeeded":
             raise PermissionError("public mission attachment cannot assert succeeded state")
+        if state == "cancelled":
+            raise PermissionError("public mission attachment cannot assert cancelled state")
         evidence_ref = _bounded_text(evidence_ref, "evidence_ref", 256)
         effective_dry = policy.effective_dry_run(dry_run)
         if not effective_dry and not confirm:
@@ -644,6 +646,57 @@ def record_attachment_state(
     except (OSError, sqlite3.Error):
         return False
 
+
+def reserve_delegation_attachment(
+    mission_id: str,
+    delegation_id: str,
+    *,
+    evidence_ref: str,
+    hermes_root: Path | None = None,
+) -> bool:
+    """Private reservation bridge committed before any delegation backend call.
+
+    Repeating the same reservation is idempotent.  Existing lifecycle state is
+    never downgraded, and a terminal Mission cannot acquire new work.
+    """
+    if not REF_RE.fullmatch(delegation_id) or not evidence_ref:
+        return False
+    path = _db_path(hermes_root)
+    if not path.is_file():
+        return False
+    try:
+        with _connect(path, write=True) as db:
+            _begin_write(db)
+            mission = _get_row(db, mission_id)
+            existing = db.execute(
+                "SELECT state,evidence_ref FROM attachments WHERE mission_id=? AND kind='delegation' AND ref=?",
+                (mission_id, delegation_id),
+            ).fetchone()
+            if mission["status"] in TERMINAL_STATUSES and existing is None:
+                db.rollback()
+                return False
+            if existing is not None:
+                if str(existing["evidence_ref"] or "") not in {"", evidence_ref}:
+                    db.rollback()
+                    return False
+                db.commit()
+                return True
+            count = int(db.execute("SELECT COUNT(*) FROM attachments WHERE mission_id=?", (mission_id,)).fetchone()[0])
+            if count >= MAX_ATTACHMENTS:
+                db.rollback()
+                return False
+            now = _now()
+            db.execute(
+                "INSERT INTO attachments(mission_id,kind,ref,relationship,state,evidence_ref,verified,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (mission_id, "delegation", delegation_id, "contains", "pending", evidence_ref[:256], 0, now, now),
+            )
+            db.execute("UPDATE missions SET version=version+1,updated_at=? WHERE mission_id=?", (now, mission_id))
+            _event(db, mission_id, "mission.delegation_reserved", details={"kind": "delegation", "ref": delegation_id})
+            db.commit()
+        return True
+    except (LookupError, OSError, sqlite3.Error):
+        return False
+
 def _workflow_state(root: Path, ref: str) -> str:
     if not WORKFLOW_REF_RE.fullmatch(ref):
         return "unknown"
@@ -664,6 +717,45 @@ def _workflow_state(root: Path, ref: str) -> str:
     }.get(status, "unknown")
 
 
+def _delegation_state(root: Path, mission_id: str, attachment: dict[str, Any]) -> tuple[str, bool, int | None]:
+    """Re-observe one delegation from its authoritative durable lifecycle."""
+    try:
+        import operator_delegations as delegations
+
+        payload = json.loads(delegations.hermes_delegation_reconcile(str(attachment["ref"]), apply=False, hermes_root=root))
+    except (ImportError, KeyError, TypeError, ValueError, json.JSONDecodeError, OSError, sqlite3.Error):
+        return "blocked", False, None
+    row = payload.get("delegation")
+    if not payload.get("success") or not isinstance(row, dict):
+        return "blocked", False, None
+    if str(row.get("mission_id") or "") != mission_id:
+        return "blocked", False, None
+    authority_version = int(row.get("authority_version") or 0)
+    if bool(row.get("cancellation_in_progress")) or (
+        bool(row.get("cancel_requested")) and str(row.get("state") or "") != "cancelled"
+    ):
+        return "blocked", False, authority_version
+    state = {
+        "reserved": "pending",
+        "queued": "pending",
+        "running": "running",
+        "reconciling": "blocked",
+        "succeeded": "succeeded",
+        "failed": "failed",
+        "cancelled": "cancelled",
+    }.get(str(row.get("state") or ""), "blocked")
+    if state != "succeeded":
+        return state, False, authority_version
+    contract_sha = str(row.get("contract_sha256") or "")
+    expected_evidence = f"contract:{contract_sha}" if contract_sha else ""
+    verified = (
+        bool(expected_evidence)
+        and str(row.get("validation_verdict") or "") == "SATISFIED"
+        and str(payload.get("evidence_ref") or "") == expected_evidence
+    )
+    return ("succeeded", True, authority_version) if verified else ("blocked", False, authority_version)
+
+
 def _observe_attachments(root: Path, mission: dict[str, Any]) -> list[dict[str, Any]]:
     observed: list[dict[str, Any]] = []
     for att in mission["attachments"]:
@@ -672,10 +764,43 @@ def _observe_attachments(root: Path, mission: dict[str, Any]) -> list[dict[str, 
         if att["kind"] == "workflow":
             state = _workflow_state(root, str(att["ref"]))
             verified = state == "succeeded"
+        elif att["kind"] == "delegation":
+            state, verified, authority_version = _delegation_state(root, str(mission["mission_id"]), att)
         elif state == "succeeded" and not verified:
             state = "blocked"
-        observed.append({"kind": att["kind"], "ref": att["ref"], "state": state, "verified": verified})
+        item = {"kind": att["kind"], "ref": att["ref"], "state": state, "verified": verified}
+        if att["kind"] == "delegation" and authority_version is not None:
+            item["authority_version"] = authority_version
+        observed.append(item)
     return observed
+
+
+def _completion_guard(root: Path, mission_id: str, observed: list[dict[str, Any]]):
+    import operator_delegations as delegations
+
+    snapshots = {
+        str(item["ref"]): int(item["authority_version"])
+        for item in observed
+        if item["kind"] == "delegation" and "authority_version" in item
+    }
+    delegation_count = sum(1 for item in observed if item["kind"] == "delegation")
+    if len(snapshots) != delegation_count:
+        raise ValueError("delegation authority snapshot is incomplete")
+    return delegations.mission_completion_guard(mission_id, snapshots, hermes_root=root)
+
+
+def _cancellation_guard(root: Path, mission_id: str, observed: list[dict[str, Any]]):
+    import operator_delegations as delegations
+
+    snapshots = {
+        str(item["ref"]): int(item["authority_version"])
+        for item in observed
+        if item["kind"] == "delegation" and "authority_version" in item
+    }
+    delegation_count = sum(1 for item in observed if item["kind"] == "delegation")
+    if len(snapshots) != delegation_count:
+        raise ValueError("delegation cancellation authority snapshot is incomplete")
+    return delegations.mission_cancellation_guard(mission_id, snapshots, hermes_root=root)
 
 
 def _desired_mission_status(mission: dict[str, Any], observed: list[dict[str, Any]]) -> str:
@@ -717,13 +842,47 @@ def hermes_mission_reconcile(
             desired = _desired_mission_status(mission, observed)
             return json.dumps({"success": True, "schema_version": SCHEMA_VERSION, "tool": "hermes_mission_reconcile", "mission_id": mission_id, "status": mission["status"], "desired_status": desired, "observed": observed, "changed": False, "dry_run": True})
 
+        # Completion is linearized against delegation cancellation authority.
+        # Observe without holding either write lock, then hold the short-lived
+        # delegation guard while CAS-checking and committing the Mission row.
+        with _connect(path, write=False) as db:
+            completion_mission = _row_to_mission(db, _get_row(db, mission_id))
+        completion_observed = _observe_attachments(root, completion_mission)
+        if (
+            completion_mission["status"] not in TERMINAL_STATUSES
+            and _desired_mission_status(completion_mission, completion_observed) == "completed"
+        ):
+            live_notice: dict[str, Any] | None = None
+            with _completion_guard(root, mission_id, completion_observed), _connect(path, write=True) as db:
+                _begin_write(db)
+                current_row = _get_row(db, mission_id)
+                if int(current_row["version"]) != int(completion_mission["version"]):
+                    raise ValueError("Mission authority changed after child observation")
+                current = str(current_row["status"])
+                now = _now()
+                for item in completion_observed:
+                    db.execute("UPDATE attachments SET state=?,verified=?,updated_at=? WHERE mission_id=? AND kind=? AND ref=?", (item["state"], 1 if item["verified"] else 0, now, mission_id, item["kind"], item["ref"]))
+                db.execute("UPDATE missions SET status='completed',version=version+1,updated_at=? WHERE mission_id=?", (now, mission_id))
+                live_notice = _event(db, mission_id, "mission.reconciled", from_status=current, to_status="completed", details={"observed": completion_observed})
+                db.commit()
+            _publish_live_event(live_notice, hermes_root)
+            _audit("hermes_mission_reconcile", policy, dry_run=False, success=True, changed=True, mission_id=mission_id, summary=f"mission reconciled {completion_mission['status']}->completed")
+            return json.dumps({"success": True, "schema_version": SCHEMA_VERSION, "tool": "hermes_mission_reconcile", "mission_id": mission_id, "status": "completed", "observed": completion_observed, "changed": True})
+
+        # Observe potentially slow external attachment stores without holding
+        # the Mission write lock, then commit through the Mission version CAS.
+        mission = completion_mission
+        observed = completion_observed
+        current = str(mission["status"])
+        desired = _desired_mission_status(mission, observed)
         live_notice: dict[str, Any] | None = None
         with _connect(path, write=True) as db:
             _begin_write(db)
-            mission = _row_to_mission(db, _get_row(db, mission_id))
-            current = str(mission["status"])
-            observed = _observe_attachments(root, mission)
-            desired = _desired_mission_status(mission, observed)
+            current_row = _get_row(db, mission_id)
+            if int(current_row["version"]) != int(mission["version"]):
+                raise ValueError("Mission authority changed after child observation")
+            if desired == "completed":
+                raise ValueError("Mission child observation changed during completion; retry reconciliation")
             original = {(a["kind"], a["ref"]): (a["state"], bool(a.get("verified"))) for a in mission["attachments"]}
             attachment_changed = any(original.get((item["kind"], item["ref"])) != (item["state"], bool(item["verified"])) for item in observed)
             status_changed = desired != current
@@ -765,12 +924,18 @@ def hermes_mission_transition(
             raise PermissionError("direct mission transition requires confirm=true")
         path = _db_path(hermes_root)
 
-        def validate(mission: dict[str, Any]) -> tuple[str, bool]:
+        def validate(mission: dict[str, Any], observed: list[dict[str, Any]] | None = None) -> tuple[str, bool]:
             current = str(mission["status"])
             if current in TERMINAL_STATUSES:
                 raise ValueError("terminal mission status cannot transition")
             if status == current:
                 return current, False
+            if status == "cancelled":
+                if observed is None:
+                    observed = _observe_attachments(_root(hermes_root), mission)
+                active = [a for a in observed if a["kind"] == "delegation" and a["state"] in {"pending", "running", "blocked"}]
+                if active:
+                    raise ValueError("mission cancellation requires all delegation children to be terminal")
             allowed = MISSION_TRANSITIONS.get(current, set())
             if status != "completed" and status not in allowed:
                 raise ValueError(f"mission transition {current}->{status} is not allowed")
@@ -787,6 +952,47 @@ def hermes_mission_transition(
                 mission = _row_to_mission(db, _get_row(db, mission_id))
             current, would_change = validate(mission)
             return json.dumps({"success": True, "schema_version": SCHEMA_VERSION, "tool": "hermes_mission_transition", "mission_id": mission_id, "from_status": current, "to_status": status, "changed": False, "would_change": would_change, "dry_run": True})
+        if status == "completed":
+            root = _root(hermes_root)
+            with _connect(path, write=False) as db:
+                mission = _row_to_mission(db, _get_row(db, mission_id))
+            current, changed = validate(mission)
+            observed = _observe_attachments(root, mission)
+            if _desired_mission_status(mission, observed) != "completed":
+                raise ValueError("mission children do not justify completion")
+            live_notice: dict[str, Any] | None = None
+            with _completion_guard(root, mission_id, observed), _connect(path, write=True) as db:
+                _begin_write(db)
+                current_row = _get_row(db, mission_id)
+                if int(current_row["version"]) != int(mission["version"]):
+                    raise ValueError("Mission authority changed after child observation")
+                now = _now()
+                db.execute("UPDATE missions SET status='completed',version=version+1,updated_at=? WHERE mission_id=?", (now, mission_id))
+                live_notice = _event(db, mission_id, "mission.transition", from_status=current, to_status="completed", reason=reason)
+                db.commit()
+            _publish_live_event(live_notice, hermes_root)
+            _audit("hermes_mission_transition", policy, dry_run=False, success=True, changed=changed, mission_id=mission_id, summary=f"mission {current}->completed")
+            return json.dumps({"success": True, "schema_version": SCHEMA_VERSION, "tool": "hermes_mission_transition", "mission_id": mission_id, "from_status": current, "to_status": "completed", "changed": changed})
+        if status == "cancelled":
+            root = _root(hermes_root)
+            with _connect(path, write=False) as db:
+                mission = _row_to_mission(db, _get_row(db, mission_id))
+            observed = _observe_attachments(root, mission)
+            current, changed = validate(mission, observed)
+            live_notice: dict[str, Any] | None = None
+            with _cancellation_guard(root, mission_id, observed), _connect(path, write=True) as db:
+                _begin_write(db)
+                current_row = _get_row(db, mission_id)
+                if int(current_row["version"]) != int(mission["version"]):
+                    raise ValueError("Mission authority changed after child cancellation observation")
+                if changed:
+                    now = _now()
+                    db.execute("UPDATE missions SET status='cancelled',version=version+1,updated_at=? WHERE mission_id=?", (now, mission_id))
+                    live_notice = _event(db, mission_id, "mission.transition", from_status=current, to_status="cancelled", reason=reason)
+                db.commit()
+            _publish_live_event(live_notice, hermes_root)
+            _audit("hermes_mission_transition", policy, dry_run=False, success=True, changed=changed, mission_id=mission_id, summary=f"mission {current}->cancelled")
+            return json.dumps({"success": True, "schema_version": SCHEMA_VERSION, "tool": "hermes_mission_transition", "mission_id": mission_id, "from_status": current, "to_status": "cancelled", "changed": changed})
         live_notice: dict[str, Any] | None = None
         with _connect(path, write=True) as db:
             _begin_write(db)
@@ -821,7 +1027,7 @@ def hermes_mission_approve(
 
         root = _root(hermes_root)
 
-        def validate(mission: dict[str, Any]) -> None:
+        def validate(mission: dict[str, Any]) -> list[dict[str, Any]]:
             if mission["status"] != "awaiting_approval":
                 raise ValueError("mission must be awaiting_approval before Owner approval")
             observed = _observe_attachments(root, mission)
@@ -829,6 +1035,7 @@ def hermes_mission_approve(
             invalid = [a for a in observed if a["state"] not in {"succeeded", "cancelled"} or (a["state"] == "succeeded" and not bool(a.get("verified")))]
             if invalid or not succeeded:
                 raise ValueError("mission children are not currently terminal with at least one verified success")
+            return observed
 
         approval = {"approved": True, "approved_by": "owner", "approval_reference": approval_reference, "approved_at": _now()}
         target = "completed"
@@ -837,11 +1044,15 @@ def hermes_mission_approve(
                 mission = _row_to_mission(db, _get_row(db, mission_id))
             validate(mission)
             return json.dumps({"success": True, "schema_version": SCHEMA_VERSION, "tool": "hermes_mission_approve", "mission_id": mission_id, "status": target, "approval": approval, "changed": False, "dry_run": True})
-        with _connect(path, write=True) as db:
-            _begin_write(db)
+        with _connect(path, write=False) as db:
             mission = _row_to_mission(db, _get_row(db, mission_id))
-            validate(mission)
-            current = str(mission["status"])
+        observed = validate(mission)
+        with _completion_guard(root, mission_id, observed), _connect(path, write=True) as db:
+            _begin_write(db)
+            current_row = _get_row(db, mission_id)
+            if int(current_row["version"]) != int(mission["version"]):
+                raise ValueError("Mission authority changed after child observation")
+            current = str(current_row["status"])
             now = _now()
             db.execute("UPDATE missions SET status=?,approval_json=?,version=version+1,updated_at=? WHERE mission_id=?", (target, json.dumps(approval, sort_keys=True), now, mission_id))
             live_notice = _event(db, mission_id, "mission.approved", from_status=current, to_status=target, details={"approval_reference": approval_reference})

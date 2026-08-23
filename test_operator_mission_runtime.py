@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -305,6 +306,77 @@ def test_noop_reconcile_does_not_append_events(hermes_root: Path):
     assert after == before
 
 
+def test_noncompletion_reconcile_observes_outside_mission_write_lock(
+    hermes_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    assert _j(mission.hermes_mission_create(_spec(), confirm=True, dry_run=False, hermes_root=hermes_root))["success"]
+    assert _j(mission.hermes_mission_attach("msn-test", "workflow", "sw-child", state="pending", confirm=True, dry_run=False, hermes_root=hermes_root))["success"]
+    entered = threading.Event()
+    release = threading.Event()
+    original_observe = mission._observe_attachments
+
+    def paused_observe(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return original_observe(*args, **kwargs)
+
+    monkeypatch.setattr(mission, "_observe_attachments", paused_observe)
+    reconciled: list[dict] = []
+    thread = threading.Thread(target=lambda: reconciled.append(_j(mission.hermes_mission_reconcile(
+        "msn-test", confirm=True, dry_run=False, hermes_root=hermes_root,
+    ))))
+    thread.start()
+    assert entered.wait(5)
+    # This write must not wait behind attachment observation.
+    updated = _j(mission.hermes_mission_update(
+        "msn-test", json.dumps({"title": "Concurrent update"}),
+        confirm=True, dry_run=False, hermes_root=hermes_root,
+    ))
+    assert updated["success"] is True
+    release.set()
+    thread.join(5)
+    assert not thread.is_alive()
+    assert reconciled[0]["success"] is False
+
+
+def test_parent_cancellation_observes_outside_mission_write_lock(
+    hermes_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    assert _j(mission.hermes_mission_create(_spec(), confirm=True, dry_run=False, hermes_root=hermes_root))["success"]
+    assert _j(mission.hermes_mission_attach(
+        "msn-test", "workflow", "sw-child", state="pending",
+        confirm=True, dry_run=False, hermes_root=hermes_root,
+    ))["success"]
+    entered = threading.Event()
+    release = threading.Event()
+    original_observe = mission._observe_attachments
+
+    def paused_observe(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return original_observe(*args, **kwargs)
+
+    monkeypatch.setattr(mission, "_observe_attachments", paused_observe)
+    cancelled: list[dict] = []
+    thread = threading.Thread(target=lambda: cancelled.append(_j(mission.hermes_mission_transition(
+        "msn-test", "cancelled", confirm=True, dry_run=False, hermes_root=hermes_root,
+    ))))
+    thread.start()
+    assert entered.wait(5)
+    updated = _j(mission.hermes_mission_update(
+        "msn-test", json.dumps({"title": "Concurrent cancellation update"}),
+        confirm=True, dry_run=False, hermes_root=hermes_root,
+    ))
+    assert updated["success"] is True
+    release.set()
+    thread.join(5)
+    assert not thread.is_alive()
+    assert cancelled[0]["success"] is False
+    assert _j(mission.hermes_mission_get("msn-test", hermes_root=hermes_root))["status"] != "cancelled"
+
+
 def test_acceptance_and_owner_profile_freeze_after_work_attached(hermes_root: Path):
     assert _j(mission.hermes_mission_create(_spec(), confirm=True, dry_run=False, hermes_root=hermes_root))["success"]
     assert _j(mission.hermes_mission_attach("msn-test", "delegation", "dlg-1", state="pending", confirm=True, dry_run=False, hermes_root=hermes_root))["success"]
@@ -318,3 +390,19 @@ def test_acceptance_and_owner_profile_freeze_after_work_attached(hermes_root: Pa
         )
     )
     assert denied["success"] is False
+
+
+@pytest.mark.parametrize("kind", sorted(mission.ATTACHMENT_KINDS))
+def test_public_attach_cannot_claim_cancellation_for_any_kind(hermes_root: Path, kind: str):
+    assert _j(mission.hermes_mission_create(_spec(), confirm=True, dry_run=False, hermes_root=hermes_root))["success"]
+    ref = "sw-cancelled" if kind == "workflow" else "cancelled-ref"
+    out = _j(mission.hermes_mission_attach("msn-test", kind, ref, state="cancelled", confirm=True, dry_run=False, hermes_root=hermes_root))
+    assert not out["success"]
+
+
+def test_parent_cancellation_blocked_by_reserved_delegation(hermes_root: Path):
+    assert _j(mission.hermes_mission_create(_spec(), confirm=True, dry_run=False, hermes_root=hermes_root))["success"]
+    assert mission.reserve_delegation_attachment("msn-test", "dlg-reserved", evidence_ref="contract:" + "a" * 64, hermes_root=hermes_root)
+    out = _j(mission.hermes_mission_transition("msn-test", "cancelled", confirm=True, dry_run=False, hermes_root=hermes_root))
+    assert not out["success"]
+    assert _j(mission.hermes_mission_get("msn-test", hermes_root=hermes_root))["status"] != "cancelled"
