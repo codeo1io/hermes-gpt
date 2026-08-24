@@ -1,4 +1,4 @@
-"""Temporary CI forge for issue #57. It deletes itself before review."""
+"""Temporary CI forge for issue #57. It deletes source helpers before review."""
 
 from __future__ import annotations
 
@@ -26,21 +26,11 @@ supervisor_test.write_text(
     encoding="utf-8",
 )
 
-# Remove the temporary forge job by structural boundaries rather than by an
-# exact block string. The workflow changed while the forge was being hardened,
-# and matching the whole temporary block made cleanup unnecessarily brittle.
-ci_path = ROOT / ".github" / "workflows" / "ci.yml"
-ci = ci_path.read_text(encoding="utf-8")
-start_marker = "  issue57-forge:\n"
-end_marker = "  test:\n"
-if ci.count(start_marker) != 1 or ci.count(end_marker) != 1:
-    raise SystemExit("temporary forge job boundaries drifted")
-start = ci.index(start_marker)
-end = ci.index(end_marker, start)
-ci_path.write_text(ci[:start] + ci[end:], encoding="utf-8")
-
+# GitHub's Actions token may write repository contents but is not authorized to
+# create/update workflow files. Leave both temporary workflow files untouched
+# in this commit; the authenticated GitHub connector removes them immediately
+# after this source commit lands.
 for relative in (
-    ".github/workflows/issue57-integrate.yml",
     "test_000_issue57_integrate.py",
     "tools/issue57_fix.py",
     "tools/issue57_forge.py",
@@ -80,4 +70,4 @@ subprocess.run(
     check=True,
 )
 subprocess.run(["git", "push", "origin", f"HEAD:{BRANCH}"], cwd=ROOT, check=True)
-print("issue #57 transformed tree committed and temporary forge removed")
+print("issue #57 transformed source tree committed; workflow cleanup remains")
