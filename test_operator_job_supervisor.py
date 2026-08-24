@@ -61,17 +61,44 @@ def test_detached_worker_terminal_state_survives_launcher_exit(tmp_path):
         hermes_root=tmp_path,
     )
 
-    launcher = (
-        "import os, subprocess, sys; "
-        "root=sys.argv[1]; job=sys.argv[2]; "
-        "code='import sys,time; from pathlib import Path; import operator_job_supervisor as j; "
-        "root=Path(sys.argv[1]); job=sys.argv[2]; j.mark_running(job, os.getpid(), hermes_root=root); "
-        "time.sleep(0.25); j.terminalize(job, \'completed\', returncode=0, summary=\'done\', hermes_root=root)'; "
-        "subprocess.Popen([sys.executable, '-c', 'import os; '+code, root, job], "
-        "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, "
-        "start_new_session=True); os._exit(0)"
+    worker_path = tmp_path / "detached_worker.py"
+    worker_path.write_text(
+        """import os
+import sys
+import time
+from pathlib import Path
+
+import operator_job_supervisor as jobs
+
+root = Path(sys.argv[1])
+job_id = sys.argv[2]
+jobs.mark_running(job_id, os.getpid(), hermes_root=root)
+time.sleep(0.25)
+jobs.terminalize(job_id, "completed", returncode=0, summary="done", hermes_root=root)
+""",
+        encoding="utf-8",
     )
-    parent = subprocess.Popen([sys.executable, "-c", launcher, str(tmp_path), job_id])
+    launcher_path = tmp_path / "launcher.py"
+    launcher_path.write_text(
+        """import os
+import subprocess
+import sys
+
+subprocess.Popen(
+    [sys.executable, sys.argv[1], sys.argv[2], sys.argv[3]],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    start_new_session=True,
+)
+os._exit(0)
+""",
+        encoding="utf-8",
+    )
+
+    parent = subprocess.Popen(
+        [sys.executable, str(launcher_path), str(worker_path), str(tmp_path), job_id]
+    )
     assert parent.wait(timeout=5) == 0
 
     deadline = time.monotonic() + 5
