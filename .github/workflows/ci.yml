@@ -9,18 +9,16 @@ on:
 jobs:
   issue57-forge:
     if: ${{ github.event_name == 'pull_request' && github.head_ref == 'feat/issue-57-durable-job-supervisor' }}
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Forge guarded issue 57 transformed tree
+      - name: Forge and commit guarded issue 57 tree
         run: python tools/issue57_forge.py
-      - uses: actions/upload-artifact@v4
-        with:
-          name: issue57-transformed-tree
-          path: issue57-transformed.tar.gz
 
   test:
     strategy:
