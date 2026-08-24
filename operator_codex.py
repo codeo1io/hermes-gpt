@@ -10,11 +10,13 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 from datetime import datetime, timezone, timedelta
 from typing import Any
 from uuid import uuid4
 
+import operator_job_supervisor as job_supervisor
 import operator_policy as op
 
 ENABLE_CODEX_RUNNER_ENV = "HERMES_GPT_ENABLE_CODEX_RUNNER"
@@ -28,7 +30,6 @@ MAX_TIMEOUT = 3600
 _MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 _SHA_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
 _lock = threading.RLock()
-_processes: dict[str, subprocess.Popen[str]] = {}
 RETENTION_DAYS = 30
 
 
@@ -44,6 +45,22 @@ def _root(hermes_root: Path | None = None) -> Path:
 def _paths(job_id: str, hermes_root: Path | None = None) -> tuple[Path, Path]:
     root = _root(hermes_root)
     return root / f"{job_id}.json", root / f"{job_id}.jsonl"
+
+
+def _request_path(job_id: str, hermes_root: Path | None = None) -> Path:
+    return _root(hermes_root) / f"{job_id}.request.json"
+
+
+def _save_request(job_id: str, value: dict[str, Any], hermes_root: Path | None = None) -> None:
+    path = _request_path(job_id, hermes_root)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temp = path.with_suffix(path.suffix + ".tmp")
+    temp.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
+    try:
+        temp.chmod(0o600)
+    except OSError:
+        pass
+    temp.replace(path)
 
 
 def _safe_error(code: str, message: str, action: str) -> dict[str, Any]:
@@ -279,45 +296,49 @@ def _start(prompt: str, workdir: str, sandbox: str, model: str | None, ignore_us
     if dry_run:
         return _redact(plan)
     job_id = uuid4().hex
-    meta = {**plan, "job_id": job_id, "status": "starting", "created_at": _now(), "started_at": None,
+    meta = {**plan, "job_id": job_id, "status": "queued", "created_at": _now(), "started_at": None,
             "ended_at": None, "pid": None, "return_code": None, "thread_id": None, "cancel_requested": False}
     meta.pop("argv", None)
     path, output = _paths(job_id, hermes_root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    out_handle = open(output, "w", encoding="utf-8")
+    _save(meta, hermes_root)
+    _save_request(job_id, {"argv": built, "workdir": str(resolved), "timeout": timeout}, hermes_root)
+    job_supervisor.register_job(
+        job_id,
+        backend="codex",
+        workspace=resolved,
+        log_path=output,
+        source_record=path,
+        hermes_root=hermes_root,
+    )
     try:
-        proc = subprocess.Popen(built, cwd=resolved, stdout=out_handle, stderr=subprocess.STDOUT, text=True, shell=False,
-                                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
-                                start_new_session=os.name != "nt")
+        proc = subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "--worker", job_id, "--root", str(_root(hermes_root))],
+            cwd=resolved,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            shell=False,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+            start_new_session=os.name != "nt",
+        )
     except (OSError, ValueError) as exc:
-        out_handle.close()
+        try:
+            _request_path(job_id, hermes_root).unlink()
+        except OSError:
+            pass
+        meta.update({"status": "failed", "ended_at": _now()})
+        _save(meta, hermes_root)
+        job_supervisor.terminalize(job_id, "failed", summary=op.redact_output(str(exc)), hermes_root=hermes_root)
         return _safe_error("CODEX_START_FAILED", op.redact_output(str(exc)), "Check Codex CLI installation, authentication, and model configuration.")
     meta.update({"status": "running", "started_at": _now(), "pid": proc.pid})
     _save(meta, hermes_root)
-    with _lock:
-        _processes[job_id] = proc
-    threading.Thread(target=_watch, args=(job_id, proc, out_handle, timeout, hermes_root), daemon=True).start()
+    job_supervisor.mark_running(job_id, proc.pid, hermes_root=hermes_root)
     op.audit_record(tool="hermes_codex_review_start" if review else "hermes_codex_start", level=checked[0].level,
                     apply_mode=checked[0].apply_mode, dry_run=False, success=True, changed=True, job_id=job_id,
                     path=str(resolved), prompt=prompt, extra={"mode": meta["mode"], "sandbox": sandbox,
                     "execution_mode": execution_mode, "model": model or ""})
     return _redact({"success": True, "dry_run": False, "job_id": job_id, "status": "running", "execution_mode": execution_mode})
-
-
-def _watch(job_id: str, proc: subprocess.Popen[str], handle: Any, timeout: int, hermes_root: Path | None) -> None:
-    try:
-        proc.wait(timeout=timeout)
-        status = "completed" if proc.returncode == 0 else "failed"
-    except subprocess.TimeoutExpired:
-        _terminate(proc)
-        status = "timed_out"
-    finally:
-        handle.close()
-    with _lock:
-        _processes.pop(job_id, None)
-    meta = _load(job_id, hermes_root) or {"job_id": job_id}
-    meta.update({"status": "cancelled" if meta.get("cancel_requested") else status, "return_code": proc.poll(), "ended_at": _now()})
-    _save(meta, hermes_root)
 
 
 def hermes_codex_start(prompt: str, workdir: str, sandbox: str = "read-only", model: str | None = None,
@@ -350,6 +371,7 @@ def hermes_codex_job_status(job_id: str, hermes_root: Path | None = None) -> dic
 
 
 def hermes_codex_job_result(job_id: str, max_chars: int = MAX_RESULT_CHARS, hermes_root: Path | None = None) -> dict[str, Any]:
+    _reconcile(hermes_root)
     meta = _load(job_id, hermes_root)
     if not meta:
         return _safe_error("JOB_NOT_FOUND", "Codex job was not found.", "Check the job ID with hermes_codex_jobs.")
@@ -393,22 +415,98 @@ def _terminate(proc: subprocess.Popen[str]) -> None:
         proc.kill()
 
 
+def _worker(job_id: str, jobs_root: Path) -> int:
+    hermes_root = jobs_root.parent
+    request_path = jobs_root / f"{job_id}.request.json"
+    meta = _load(job_id, hermes_root) or {"job_id": job_id}
+    try:
+        request = json.loads(request_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        meta.update({"status": "failed", "ended_at": _now(), "return_code": None})
+        _save(meta, hermes_root)
+        try:
+            job_supervisor.terminalize(job_id, "failed", summary="Codex worker request missing", hermes_root=hermes_root)
+        except FileNotFoundError:
+            pass
+        return 2
+    try:
+        request_path.unlink()
+    except OSError:
+        pass
+    argv = request.get("argv")
+    workdir = request.get("workdir")
+    if not isinstance(argv, list) or not argv or not all(isinstance(item, str) for item in argv) or not isinstance(workdir, str):
+        meta.update({"status": "failed", "ended_at": _now(), "return_code": None})
+        _save(meta, hermes_root)
+        job_supervisor.terminalize(job_id, "failed", summary="Codex worker request invalid", hermes_root=hermes_root)
+        return 2
+    timeout = max(MIN_TIMEOUT, min(int(request.get("timeout") or 900), MAX_TIMEOUT))
+    try:
+        job_supervisor.mark_running(job_id, os.getpid(), hermes_root=hermes_root)
+    except FileNotFoundError:
+        pass
+    _, output = _paths(job_id, hermes_root)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    status = "failed"
+    return_code: int | None = None
+    try:
+        with output.open("w", encoding="utf-8") as out_handle:
+            proc = subprocess.Popen(
+                argv,
+                cwd=Path(workdir).expanduser().resolve(),
+                stdout=out_handle,
+                stderr=subprocess.STDOUT,
+                text=True,
+                shell=False,
+            )
+            try:
+                proc.wait(timeout=timeout)
+                return_code = proc.returncode
+                status = "completed" if proc.returncode == 0 else "failed"
+            except subprocess.TimeoutExpired:
+                _terminate(proc)
+                return_code = proc.poll()
+                status = "timed_out"
+    except Exception as exc:  # noqa: BLE001
+        status = "failed"
+        return_code = None
+        meta["worker_error"] = op.redact_output(str(exc))[:500]
+    canonical = job_supervisor.terminalize(
+        job_id,
+        status,
+        returncode=return_code,
+        summary=meta.get("worker_error") or "",
+        hermes_root=hermes_root,
+    )
+    meta = _load(job_id, hermes_root) or meta
+    meta.update(
+        {
+            "status": canonical.get("status", status),
+            "return_code": return_code,
+            "ended_at": canonical.get("ended_at") or _now(),
+            "cancel_requested": bool(canonical.get("cancel_requested")),
+        }
+    )
+    _save(meta, hermes_root)
+    return int(return_code or 0) if status == "completed" else 1
+
+
 def _reconcile(hermes_root: Path | None = None) -> None:
-    """Conservatively reconcile persisted jobs without trusting reused PIDs."""
+    """Reconcile persisted Codex metadata from the durable job supervisor."""
     root = _root(hermes_root)
     if not root.exists():
         return
     cutoff = datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)
-    with _lock:
-        owned = set(_processes)
     for path in root.glob("*.json"):
+        if path.name.endswith(".request.json"):
+            continue
         try:
             meta = json.loads(path.read_text(encoding="utf-8"))
             created = datetime.fromisoformat(str(meta.get("created_at", "")).replace("Z", "+00:00"))
         except (OSError, ValueError, TypeError):
             continue
         job_id = str(meta.get("job_id", ""))
-        if created < cutoff and meta.get("status") != "running":
+        if created < cutoff and meta.get("status") not in {"queued", "starting", "running"}:
             try:
                 path.unlink()
                 _, output = _paths(job_id, hermes_root)
@@ -416,10 +514,22 @@ def _reconcile(hermes_root: Path | None = None) -> None:
             except OSError:
                 pass
             continue
-        if meta.get("status") == "running" and job_id not in owned:
-            # A numeric PID alone is insufficient evidence after restart; it
-            # may have been recycled. Never terminate or signal it.
-            meta.update({"status": "orphaned", "ended_at": _now(), "reconciliation": "server restarted; PID ownership could not be proven"})
+        if meta.get("status") in {"queued", "starting", "running"}:
+            observed = job_supervisor.get_job(job_id, hermes_root=hermes_root, reconcile=True)
+            if not observed:
+                continue
+            observed_status = str(observed.get("status") or "")
+            if observed_status in job_supervisor.TERMINAL_STATES:
+                meta.update(
+                    {
+                        "status": observed_status,
+                        "return_code": observed.get("returncode"),
+                        "ended_at": observed.get("ended_at") or _now(),
+                        "cancel_requested": bool(observed.get("cancel_requested")),
+                    }
+                )
+            elif observed.get("reconciliation"):
+                meta["reconciliation"] = observed["reconciliation"]
             _save(meta, hermes_root)
 
 
@@ -433,11 +543,32 @@ def hermes_codex_cancel(job_id: str, confirm: bool = False, dry_run: bool = True
         return checked
     if dry_run:
         return {"success": True, "dry_run": True, "job_id": job_id, "would_cancel": meta.get("status") == "running"}
-    with _lock:
-        proc = _processes.get(job_id)
-    if not proc or proc.poll() is not None:
-        return _safe_error("JOB_NOT_RUNNING", "Codex job is not running in this server process.", "Refresh job status; orphaned jobs are not terminated by PID alone.")
     meta["cancel_requested"] = True
     _save(meta, hermes_root)
-    _terminate(proc)
-    return {"success": True, "dry_run": False, "job_id": job_id, "status": "cancelling"}
+    result = job_supervisor.request_cancel(job_id, hermes_root=hermes_root)
+    if not result.get("success"):
+        return _safe_error(
+            str(result.get("code") or "JOB_CANCEL_FAILED"),
+            str(result.get("safe_message") or "Codex job process could not be safely cancelled."),
+            "Refresh durable job status and retry only if process identity can be verified.",
+        )
+    refreshed = _load(job_id, hermes_root) or meta
+    refreshed.update({"status": result.get("status") or "cancelled", "ended_at": _now(), "cancel_requested": True})
+    _save(refreshed, hermes_root)
+    return {"success": True, "dry_run": False, "job_id": job_id, "status": refreshed["status"], "changed": result.get("changed", True)}
+
+
+def _main(argv: list[str]) -> int:
+    if len(argv) >= 3 and argv[1] == "--worker":
+        job_id = argv[2]
+        if not re.fullmatch(r"[0-9a-f]{32}", job_id or ""):
+            return 2
+        jobs_root = _root()
+        if len(argv) >= 5 and argv[3] == "--root":
+            jobs_root = Path(argv[4]).expanduser().resolve()
+        return _worker(job_id, jobs_root)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main(sys.argv))

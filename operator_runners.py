@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 import operator_fleet as op_fleet
+import operator_job_supervisor as job_supervisor
 import operator_policy as op
 import runner_confinement as confinement
 
@@ -724,7 +725,7 @@ class _LocalProcessBackend:
             return {"success": False, "code": "CONFIRMATION_REQUIRED", "backend": self.name, "safe_message": "local runner dispatch requires confirm=true"}
 
         task_id = contract["task_id"]
-        meta_path, request_path, _ = _job_paths(task_id, hermes_root)
+        meta_path, request_path, log_path = _job_paths(task_id, hermes_root)
         if meta_path.exists():
             return {"success": False, "code": "RUNNER_JOB_EXISTS", "backend": self.name, "safe_message": f"runner job {task_id!r} already exists"}
         request = {
@@ -749,6 +750,15 @@ class _LocalProcessBackend:
             "error": "",
         }
         _atomic_json(meta_path, meta)
+        job_supervisor.register_job(
+            task_id,
+            backend=self.name,
+            workspace=workspace,
+            log_path=log_path,
+            source_record=meta_path,
+            cancel_path=_cancel_path(task_id, hermes_root),
+            hermes_root=hermes_root,
+        )
         try:
             proc = _popen_process_group(
                 [sys.executable, str(Path(__file__).resolve()), "--worker", task_id, "--root", str(_root(hermes_root))],
@@ -775,6 +785,12 @@ class _LocalProcessBackend:
                 "error": _bounded_text(f"runner spawn failed: {exc}", 300),
             })
             _atomic_json(meta_path, meta)
+            job_supervisor.terminalize(
+                task_id,
+                "failed",
+                summary=meta["error"],
+                hermes_root=hermes_root,
+            )
             return {
                 "success": False,
                 "code": "RUNNER_SPAWN_FAILED",
@@ -784,7 +800,9 @@ class _LocalProcessBackend:
             }
         # The worker owns durable state transitions. Avoid a parent-side write
         # after spawn: a fast worker could otherwise complete and then be
-        # overwritten back to "running" by the parent.
+        # overwritten back to "running" by the parent. The shared supervisor
+        # records the detached worker identity so a later server can verify it.
+        job_supervisor.mark_running(task_id, proc.pid, hermes_root=hermes_root)
         return {"success": True, "changed": True, "dry_run": False, "backend": self.name, "task_id": task_id, "state": "queued", "pid": proc.pid}
 
     def observed_runs(self, task_id: str, *, hermes_root: Path | None = None) -> list[dict[str, Any]]:
@@ -812,9 +830,15 @@ class _LocalProcessBackend:
         if meta.get("state") in _TERMINAL_STATES:
             return {"success": True, "changed": False, "backend": self.name, "state": meta.get("state")}
         _atomic_json(_cancel_path(task_id, hermes_root), {"task_id": task_id, "requested_at": _now()})
-        pid = meta.get("pid")
-        if isinstance(pid, int) and pid > 1:
-            _terminate_process_tree(pid)
+        cancelled = job_supervisor.request_cancel(task_id, hermes_root=hermes_root)
+        if not cancelled.get("success"):
+            return {
+                "success": False,
+                "changed": False,
+                "code": cancelled.get("code") or "RUNNER_CANCEL_FAILED",
+                "backend": self.name,
+                "safe_message": cancelled.get("safe_message") or "runner process could not be safely cancelled",
+            }
         meta["state"] = "cancelled"
         meta["outcome"] = "cancelled"
         meta["ended_at"] = _now()
@@ -1506,6 +1530,16 @@ def _worker(task_id: str, jobs_root: Path) -> int:
                 cancel_path.unlink()
             except OSError:
                 pass
+        try:
+            job_supervisor.terminalize(
+                task_id,
+                "cancelled" if cancelled else state,
+                returncode=rc,
+                summary=error,
+                hermes_root=jobs_root.parent,
+            )
+        except FileNotFoundError:
+            pass
 
     try:
         backend = get_backend(backend_name)
@@ -1514,6 +1548,10 @@ def _worker(task_id: str, jobs_root: Path) -> int:
             raise RuntimeError(f"{backend_name} executable not found")
         meta.update({"state": "running", "started_at": meta.get("started_at") or _now(), "pid": os.getpid()})
         _atomic_json(meta_path, meta)
+        try:
+            job_supervisor.mark_running(task_id, os.getpid(), hermes_root=jobs_root.parent)
+        except FileNotFoundError:
+            pass
         if (jobs_root / f"{task_id}.cancel.json").exists():
             _terminalize(meta, state="cancelled")
             return 0

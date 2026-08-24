@@ -158,3 +158,45 @@ def test_wait_timeout_returns_running_state(monkeypatch, tmp_path):
     payload = jobs.wait_payload("task-running", wait_seconds=0, hermes_root=tmp_path)
     assert payload["job"]["status"] == "running"
     assert payload["wait"]["timed_out"] is True
+
+
+def test_windows_cancel_uses_taskkill_only_after_identity_verification(monkeypatch, tmp_path):
+    jobs.register_job(
+        "task-win-cancel",
+        backend="pi_rpc",
+        workspace=tmp_path,
+        log_path=tmp_path / "runner-jobs" / "task-win-cancel.jsonl",
+        source_record=tmp_path / "runner-jobs" / "task-win-cancel.json",
+        hermes_root=tmp_path,
+    )
+    record_path = tmp_path / "job-supervisor" / "task-win-cancel.json"
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    record.update(
+        {
+            "status": "running",
+            "pid": 4343,
+            "process_identity": {
+                "platform": "windows-cim",
+                "start_token": "20260824010101.000000+000",
+                "cmdline_sha256": "c" * 64,
+            },
+        }
+    )
+    jobs._atomic_json(record_path, record)
+    monkeypatch.setattr(jobs, "IS_WINDOWS", True)
+    monkeypatch.setattr(jobs, "verify_process", lambda pid, expected: True)
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return jobs.subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(jobs.subprocess, "run", fake_run)
+    result = jobs.request_cancel("task-win-cancel", hermes_root=tmp_path)
+
+    assert result["success"] is True
+    assert result["status"] == "cancelled"
+    assert calls == [["taskkill", "/PID", "4343", "/T", "/F"]]
+    stored = jobs.get_job("task-win-cancel", hermes_root=tmp_path, reconcile=False)
+    assert stored is not None
+    assert stored["status"] == "cancelled"

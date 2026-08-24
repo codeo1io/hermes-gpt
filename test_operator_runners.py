@@ -550,7 +550,7 @@ def test_runner_cancel_enforces_job_workspace_scope(tmp_path: Path, monkeypatch:
     assert payload["code"] == "RUNNER_CANCEL_ERROR"
 
 
-def test_runner_cancel_routes_pid_to_tree_cleanup_and_terminalizes_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_runner_cancel_refuses_unverified_legacy_pid(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     ws = tmp_path / "ws"
     root = tmp_path / "hermes"
     ws.mkdir()
@@ -585,20 +585,18 @@ def test_runner_cancel_routes_pid_to_tree_cleanup_and_terminalizes_job(tmp_path:
         )
     )
 
-    assert payload["success"] is True
-    assert payload["state"] == "cancelled"
-    assert terminated == [(4242, 5.0)]
+    assert payload["success"] is False
+    assert payload["code"] == "JOB_PROCESS_UNVERIFIABLE"
+    assert terminated == []
     stored = json.loads(meta_path.read_text(encoding="utf-8"))
-    assert stored["state"] == "cancelled"
-    assert stored["outcome"] == "cancelled"
-    assert stored["ended_at"]
+    assert stored["state"] == "running"
+    assert stored["outcome"] == "running"
 
-
-def test_windows_backend_cancel_uses_taskkill_tree_and_marks_cancelled(
+def test_backend_cancel_uses_shared_supervisor_and_marks_source_cancelled(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    task_id = "runner-cancel-windows"
+    task_id = "runner-cancel-supervised"
     meta_path = tmp_path / "job.json"
     request_path = tmp_path / "request.json"
     log_path = tmp_path / "events.jsonl"
@@ -613,12 +611,6 @@ def test_windows_backend_cancel_uses_taskkill_tree_and_marks_cancelled(
         "pid": 4343,
         "ended_at": None,
     })
-    taskkill_calls = []
-
-    def _run(argv, **kwargs):
-        taskkill_calls.append(argv)
-        return runners.subprocess.CompletedProcess(argv, 0)
-
     monkeypatch.setattr(
         runners,
         "_job_paths",
@@ -629,19 +621,26 @@ def test_windows_backend_cancel_uses_taskkill_tree_and_marks_cancelled(
         "_cancel_path",
         lambda task_id, hermes_root=None: cancel_path,
     )
-    monkeypatch.setattr(runners.os, "name", "nt")
-    monkeypatch.setattr(runners.subprocess, "run", _run)
+    calls = []
+    monkeypatch.setattr(
+        runners.job_supervisor,
+        "request_cancel",
+        lambda task_id, hermes_root=None: calls.append((task_id, hermes_root)) or {
+            "success": True,
+            "changed": True,
+            "status": "cancelled",
+        },
+    )
 
     result = runners.PiRpcBackend().cancel(task_id, hermes_root=tmp_path)
 
     assert result["success"] is True
     assert result["state"] == "cancelled"
-    assert taskkill_calls == [["taskkill", "/PID", "4343", "/T", "/F"]]
+    assert calls == [(task_id, tmp_path)]
     stored = json.loads(meta_path.read_text(encoding="utf-8"))
     assert stored["state"] == "cancelled"
     assert stored["outcome"] == "cancelled"
     assert stored["ended_at"]
-
 
 # ---------------------------------------------------------------------------
 # PR #18 correctness regression tests

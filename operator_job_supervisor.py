@@ -30,6 +30,7 @@ MAX_LOG_LINES = 100
 MAX_LOG_BYTES = 64 * 1024
 MAX_LOG_LINE_CHARS = 2_000
 TERMINAL_STATES = frozenset({"completed", "failed", "cancelled", "timed_out"})
+IS_WINDOWS = os.name == "nt"
 _JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 
 
@@ -106,7 +107,7 @@ def _record_lock(job_id: str, hermes_root: Path | None = None) -> Iterator[None]
             path.chmod(0o600)
         except OSError:
             pass
-        if os.name == "nt":
+        if IS_WINDOWS:
             import msvcrt
 
             handle.seek(0, os.SEEK_END)
@@ -254,12 +255,13 @@ def process_identity(pid: int) -> dict[str, str] | None:
     """Return a PID-reuse-resistant identity, or None when it cannot be proven."""
     if not isinstance(pid, int) or pid <= 1:
         return None
-    if os.name == "nt":
+    if IS_WINDOWS:
         return _windows_identity(pid)
+    # On Linux procfs is authoritative for process existence and identity.
+    # If /proc/<pid> vanished, do not fall through to an external ``ps`` probe;
+    # that only creates a race and makes tests that stub Popen affect identity.
     if Path("/proc").is_dir():
-        identity = _procfs_identity(pid)
-        if identity is not None:
-            return identity
+        return _procfs_identity(pid)
     return _ps_identity(pid)
 
 
@@ -283,7 +285,7 @@ def verify_process(pid: int, expected: dict[str, Any] | None) -> bool | None:
 def _pid_exists(pid: int) -> bool | None:
     if not isinstance(pid, int) or pid <= 1:
         return False
-    if os.name == "nt":
+    if IS_WINDOWS:
         # Without a verified CIM identity Windows cannot distinguish a dead PID
         # from unavailable identity tooling. Preserve uncertainty.
         return True if process_identity(pid) is not None else None
@@ -532,7 +534,7 @@ def request_cancel(job_id: str, *, hermes_root: Path | None = None) -> dict[str,
             _atomic_json(linked_cancel, marker)
 
     # Signal outside the record lock so another server can observe cancellation.
-    if os.name == "nt":
+    if IS_WINDOWS:
         try:
             completed = subprocess.run(
                 ["taskkill", "/PID", str(pid), "/T", "/F"],
