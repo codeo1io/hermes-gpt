@@ -498,6 +498,10 @@ def request_cancel(job_id: str, *, hermes_root: Path | None = None) -> dict[str,
     record = _load_json(record_path) or _import_legacy(job_id, hermes_root)
     if not record:
         return {"success": False, "code": "JOB_NOT_FOUND", "job_id": job_id}
+
+    linked_cancel: Path | None = None
+    signalled = False
+    process_gone_after_intent = False
     with _record_lock(job_id, hermes_root):
         record = _load_json(record_path)
         if not record:
@@ -525,44 +529,115 @@ def request_cancel(job_id: str, *, hermes_root: Path | None = None) -> dict[str,
                 "job_id": job_id,
                 "safe_message": "job process identity could not be verified; no process was signalled",
             }
+
         record["cancel_requested"] = True
         _atomic_json(record_path, record)
         marker = {"job_id": job_id, "requested_at": _now()}
-        _atomic_json(_cancel_path(job_id, hermes_root), marker)
+        cancel_marker = _cancel_path(job_id, hermes_root)
+        _atomic_json(cancel_marker, marker)
         linked_cancel = _resolve_confined(record.get("cancel_path"), hermes_root)
         if linked_cancel is not None:
             _atomic_json(linked_cancel, marker)
 
-    # Signal outside the record lock so another server can observe cancellation.
-    if IS_WINDOWS:
-        try:
-            completed = subprocess.run(
-                ["taskkill", "/PID", str(pid), "/T", "/F"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=5,
-                check=False,
-            )
-            signalled = completed.returncode == 0
-        except (OSError, subprocess.TimeoutExpired):
-            signalled = False
-    else:
-        try:
-            os.killpg(pid, signal.SIGTERM)
-            signalled = True
-        except (ProcessLookupError, PermissionError, OSError):
-            signalled = False
-        if signalled:
-            deadline = time.monotonic() + 3.0
-            while time.monotonic() < deadline:
-                if verify_process(pid, expected) is not True:
-                    break
-                time.sleep(0.05)
-            if verify_process(pid, expected) is True:
+        # Re-verify after the durable intent is published and immediately before
+        # signalling. Holding the job lock prevents a competing finalizer from
+        # racing this identity check into a stale process-control decision.
+        verified = verify_process(pid, expected)
+        if verified is not True:
+            record["cancel_requested"] = False
+            record["process_verification"] = "mismatch" if verified is False else "unavailable"
+            _atomic_json(record_path, record)
+            for marker_path in (cancel_marker, linked_cancel):
+                if marker_path is None:
+                    continue
                 try:
-                    os.killpg(pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError, OSError):
+                    marker_path.unlink()
+                except OSError:
                     pass
+            return {
+                "success": False,
+                "changed": False,
+                "code": "JOB_PROCESS_UNVERIFIABLE",
+                "job_id": job_id,
+                "safe_message": "job process identity changed before cancellation; no process was signalled",
+            }
+
+        # Deliver the initial signal while the identity-protecting lock is still
+        # held. This closes the server/server race between verification and the
+        # first process-control action.
+        if IS_WINDOWS:
+            try:
+                completed = subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=5,
+                    check=False,
+                )
+                signalled = completed.returncode == 0
+            except (OSError, subprocess.TimeoutExpired):
+                signalled = False
+        else:
+            try:
+                os.killpg(pid, signal.SIGTERM)
+                signalled = True
+            except (ProcessLookupError, PermissionError, OSError):
+                signalled = False
+
+        if not signalled:
+            still_same = verify_process(pid, expected)
+            process_gone_after_intent = still_same is False or (
+                still_same is None and _pid_exists(pid) is False
+            )
+            if not process_gone_after_intent:
+                record["cancel_requested"] = False
+                _atomic_json(record_path, record)
+                for marker_path in (cancel_marker, linked_cancel):
+                    if marker_path is None:
+                        continue
+                    try:
+                        marker_path.unlink()
+                    except OSError:
+                        pass
+                return {
+                    "success": False,
+                    "changed": False,
+                    "code": "JOB_CANCEL_SIGNAL_FAILED",
+                    "job_id": job_id,
+                    "status": record.get("status"),
+                    "safe_message": "verified job process could not be signalled; cancellation was not published",
+                }
+
+    if signalled and not IS_WINDOWS:
+        deadline = time.monotonic() + 3.0
+        current_verification = verify_process(pid, expected)
+        while time.monotonic() < deadline and current_verification is True:
+            time.sleep(0.05)
+            current_verification = verify_process(pid, expected)
+        if current_verification is True:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+                hard_kill_sent = True
+            except (ProcessLookupError, PermissionError, OSError):
+                hard_kill_sent = False
+            if not hard_kill_sent and verify_process(pid, expected) is True:
+                return {
+                    "success": False,
+                    "changed": True,
+                    "code": "JOB_CANCEL_UNCONFIRMED",
+                    "job_id": job_id,
+                    "status": "running",
+                    "safe_message": "cancellation was requested but the verified job process is still running",
+                }
+        elif current_verification is None and _pid_exists(pid) is not False:
+            return {
+                "success": False,
+                "changed": True,
+                "code": "JOB_CANCEL_UNCONFIRMED",
+                "job_id": job_id,
+                "status": "running",
+                "safe_message": "cancellation was requested but process exit could not be confirmed",
+            }
 
     terminal = terminalize(job_id, "cancelled", hermes_root=hermes_root)
     return {
@@ -571,6 +646,7 @@ def request_cancel(job_id: str, *, hermes_root: Path | None = None) -> dict[str,
         "job_id": job_id,
         "status": terminal.get("status"),
         "signalled": signalled,
+        "process_gone_after_intent": process_gone_after_intent,
     }
 
 
