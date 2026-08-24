@@ -183,6 +183,9 @@ def test_windows_cancel_uses_taskkill_only_after_identity_verification(monkeypat
         }
     )
     jobs._atomic_json(record_path, record)
+    # Exercise the Windows taskkill branch on a Linux CI host without also
+    # swapping the host's file-lock implementation to msvcrt.
+    monkeypatch.setattr(jobs, "_record_lock", lambda *args, **kwargs: jobs.contextlib.nullcontext())
     monkeypatch.setattr(jobs, "IS_WINDOWS", True)
     monkeypatch.setattr(jobs, "verify_process", lambda pid, expected: True)
     calls = []
