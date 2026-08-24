@@ -18,6 +18,14 @@ if str(ROOT) not in sys.path:
 runpy.run_path(str(ROOT / "test_000_issue57_integrate.py"), run_name="issue57_integration_helper")
 runpy.run_path(str(ROOT / "tools" / "issue57_fix.py"), run_name="issue57_followup_helper")
 
+# The follow-up helper appends regression coverage. Normalize the generated
+# test file to exactly one final newline before the whitespace gate.
+supervisor_test = ROOT / "test_operator_job_supervisor.py"
+supervisor_test.write_text(
+    supervisor_test.read_text(encoding="utf-8").rstrip() + "\n",
+    encoding="utf-8",
+)
+
 # Remove the temporary forge job by structural boundaries rather than by an
 # exact block string. The workflow changed while the forge was being hardened,
 # and matching the whole temporary block made cleanup unnecessarily brittle.
