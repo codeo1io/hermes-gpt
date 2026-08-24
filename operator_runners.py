@@ -829,21 +829,29 @@ class _LocalProcessBackend:
             return {"success": False, "code": "RUNNER_JOB_NOT_FOUND", "backend": self.name}
         if meta.get("state") in _TERMINAL_STATES:
             return {"success": True, "changed": False, "backend": self.name, "state": meta.get("state")}
-        _atomic_json(_cancel_path(task_id, hermes_root), {"task_id": task_id, "requested_at": _now()})
         cancelled = job_supervisor.request_cancel(task_id, hermes_root=hermes_root)
         if not cancelled.get("success"):
             return {
                 "success": False,
-                "changed": False,
+                "changed": bool(cancelled.get("changed")),
                 "code": cancelled.get("code") or "RUNNER_CANCEL_FAILED",
                 "backend": self.name,
                 "safe_message": cancelled.get("safe_message") or "runner process could not be safely cancelled",
             }
-        meta["state"] = "cancelled"
-        meta["outcome"] = "cancelled"
-        meta["ended_at"] = _now()
-        _atomic_json(meta_path, meta)
-        return {"success": True, "changed": True, "backend": self.name, "state": "cancelled"}
+        state = str(cancelled.get("status") or meta.get("state") or "unknown")
+        changed = bool(cancelled.get("changed"))
+        if state in _TERMINAL_STATES:
+            # The shared supervisor is the cancellation authority. Mirror its
+            # terminal truth into the legacy runner record without inventing a
+            # cancellation when a concurrent worker already completed/failed.
+            refreshed = _load_json(meta_path) or meta
+            refreshed["state"] = state
+            refreshed["outcome"] = state
+            if state == "cancelled":
+                refreshed["error"] = ""
+            refreshed["ended_at"] = refreshed.get("ended_at") or _now()
+            _atomic_json(meta_path, refreshed)
+        return {"success": True, "changed": changed, "backend": self.name, "state": state}
 
 
 @dataclass
