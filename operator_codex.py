@@ -331,8 +331,9 @@ def _start(prompt: str, workdir: str, sandbox: str, model: str | None, ignore_us
         _save(meta, hermes_root)
         job_supervisor.terminalize(job_id, "failed", summary=op.redact_output(str(exc)), hermes_root=hermes_root)
         return _safe_error("CODEX_START_FAILED", op.redact_output(str(exc)), "Check Codex CLI installation, authentication, and model configuration.")
-    meta.update({"status": "running", "started_at": _now(), "pid": proc.pid})
-    _save(meta, hermes_root)
+    # The detached worker owns durable Codex metadata transitions. The parent
+    # records only the canonical process identity so a fast worker cannot finish
+    # and then be overwritten back to running by this MCP server process.
     job_supervisor.mark_running(job_id, proc.pid, hermes_root=hermes_root)
     op.audit_record(tool="hermes_codex_review_start" if review else "hermes_codex_start", level=checked[0].level,
                     apply_mode=checked[0].apply_mode, dry_run=False, success=True, changed=True, job_id=job_id,
@@ -404,13 +405,24 @@ def hermes_codex_job_result(job_id: str, max_chars: int = MAX_RESULT_CHARS, herm
 
 
 def _terminate(proc: subprocess.Popen[str]) -> None:
+    if os.name == "nt":
+        try:
+            completed = subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                check=False,
+            )
+            if completed.returncode == 0:
+                return
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        proc.kill()
+        return
     try:
-        if os.name == "nt":
-            proc.send_signal(signal.CTRL_BREAK_EVENT)
-            proc.wait(timeout=3)
-        else:
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-            proc.wait(timeout=3)
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        proc.wait(timeout=3)
     except Exception:
         proc.kill()
 
@@ -441,6 +453,8 @@ def _worker(job_id: str, jobs_root: Path) -> int:
         job_supervisor.terminalize(job_id, "failed", summary="Codex worker request invalid", hermes_root=hermes_root)
         return 2
     timeout = max(MIN_TIMEOUT, min(int(request.get("timeout") or 900), MAX_TIMEOUT))
+    meta.update({"status": "running", "started_at": meta.get("started_at") or _now(), "pid": os.getpid()})
+    _save(meta, hermes_root)
     try:
         job_supervisor.mark_running(job_id, os.getpid(), hermes_root=hermes_root)
     except FileNotFoundError:
@@ -543,8 +557,6 @@ def hermes_codex_cancel(job_id: str, confirm: bool = False, dry_run: bool = True
         return checked
     if dry_run:
         return {"success": True, "dry_run": True, "job_id": job_id, "would_cancel": meta.get("status") == "running"}
-    meta["cancel_requested"] = True
-    _save(meta, hermes_root)
     result = job_supervisor.request_cancel(job_id, hermes_root=hermes_root)
     if not result.get("success"):
         return _safe_error(
@@ -553,9 +565,24 @@ def hermes_codex_cancel(job_id: str, confirm: bool = False, dry_run: bool = True
             "Refresh durable job status and retry only if process identity can be verified.",
         )
     refreshed = _load(job_id, hermes_root) or meta
-    refreshed.update({"status": result.get("status") or "cancelled", "ended_at": _now(), "cancel_requested": True})
+    if result.get("changed"):
+        refreshed.update(
+            {
+                "status": result.get("status") or "cancelled",
+                "ended_at": _now(),
+                "cancel_requested": True,
+            }
+        )
+    elif result.get("status"):
+        refreshed["status"] = result["status"]
     _save(refreshed, hermes_root)
-    return {"success": True, "dry_run": False, "job_id": job_id, "status": refreshed["status"], "changed": result.get("changed", True)}
+    return {
+        "success": True,
+        "dry_run": False,
+        "job_id": job_id,
+        "status": refreshed.get("status"),
+        "changed": bool(result.get("changed")),
+    }
 
 
 def _main(argv: list[str]) -> int:
