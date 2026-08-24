@@ -153,6 +153,90 @@ def test_pid_reuse_mismatch_never_signals(monkeypatch, tmp_path):
     assert observed["process_verification"] == "mismatch"
 
 
+def test_cancel_reverifies_identity_immediately_before_signal(monkeypatch, tmp_path):
+    job_id = "task-cancel-race"
+    jobs.register_job(
+        job_id,
+        backend="pi_rpc",
+        workspace=tmp_path,
+        log_path=tmp_path / "runner-jobs" / f"{job_id}.jsonl",
+        source_record=tmp_path / "runner-jobs" / f"{job_id}.json",
+        hermes_root=tmp_path,
+    )
+    record_path = tmp_path / "job-supervisor" / f"{job_id}.json"
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    record.update(
+        {
+            "status": "running",
+            "pid": 5151,
+            "process_identity": {
+                "platform": "procfs",
+                "start_token": "222",
+                "cmdline_sha256": "d" * 64,
+            },
+        }
+    )
+    jobs._atomic_json(record_path, record)
+
+    checks = iter([True, False])
+    monkeypatch.setattr(jobs, "verify_process", lambda pid, expected: next(checks))
+    signalled = []
+    monkeypatch.setattr(jobs.os, "killpg", lambda *args: signalled.append(args))
+
+    result = jobs.request_cancel(job_id, hermes_root=tmp_path)
+
+    assert result["success"] is False
+    assert result["code"] == "JOB_PROCESS_UNVERIFIABLE"
+    assert signalled == []
+    stored = jobs.get_job(job_id, hermes_root=tmp_path, reconcile=False)
+    assert stored is not None
+    assert stored["status"] == "running"
+    assert stored["cancel_requested"] is False
+    assert not (tmp_path / "job-supervisor" / f"{job_id}.cancel.json").exists()
+
+
+def test_cancel_signal_failure_never_publishes_cancelled(monkeypatch, tmp_path):
+    job_id = "task-cancel-fail"
+    jobs.register_job(
+        job_id,
+        backend="pi_rpc",
+        workspace=tmp_path,
+        log_path=tmp_path / "runner-jobs" / f"{job_id}.jsonl",
+        source_record=tmp_path / "runner-jobs" / f"{job_id}.json",
+        hermes_root=tmp_path,
+    )
+    record_path = tmp_path / "job-supervisor" / f"{job_id}.json"
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    record.update(
+        {
+            "status": "running",
+            "pid": 6161,
+            "process_identity": {
+                "platform": "procfs",
+                "start_token": "333",
+                "cmdline_sha256": "e" * 64,
+            },
+        }
+    )
+    jobs._atomic_json(record_path, record)
+
+    monkeypatch.setattr(jobs, "verify_process", lambda pid, expected: True)
+
+    def refuse_signal(*args, **kwargs):
+        raise PermissionError("no signal permission")
+
+    monkeypatch.setattr(jobs.os, "killpg", refuse_signal)
+    result = jobs.request_cancel(job_id, hermes_root=tmp_path)
+
+    assert result["success"] is False
+    assert result["code"] == "JOB_CANCEL_SIGNAL_FAILED"
+    stored = jobs.get_job(job_id, hermes_root=tmp_path, reconcile=False)
+    assert stored is not None
+    assert stored["status"] == "running"
+    assert stored["cancel_requested"] is False
+    assert not (tmp_path / "job-supervisor" / f"{job_id}.cancel.json").exists()
+
+
 def test_log_cursor_has_no_duplicates_or_skips(tmp_path):
     log_path = tmp_path / "runner-jobs" / "task-cursor.jsonl"
     log_path.parent.mkdir(parents=True)
