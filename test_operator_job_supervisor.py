@@ -1,5 +1,7 @@
 import json
 import os
+import subprocess
+import sys
 import threading
 import time
 
@@ -43,6 +45,47 @@ def test_terminalization_is_atomic_and_idempotent(tmp_path):
     assert final["status"] == "completed"
     assert final["finalization_version"] == 1
     assert all(item["status"] == "completed" for item in results)
+
+
+def test_detached_worker_terminal_state_survives_launcher_exit(tmp_path):
+    """Acceptance: a server-like launcher may die while a detached worker finishes."""
+    job_id = "restart-acceptance"
+    log_path = tmp_path / "runner-jobs" / f"{job_id}.jsonl"
+    source_path = tmp_path / "runner-jobs" / f"{job_id}.json"
+    jobs.register_job(
+        job_id,
+        backend="acceptance",
+        workspace=tmp_path,
+        log_path=log_path,
+        source_record=source_path,
+        hermes_root=tmp_path,
+    )
+
+    launcher = (
+        "import os, subprocess, sys; "
+        "root=sys.argv[1]; job=sys.argv[2]; "
+        "code='import sys,time; from pathlib import Path; import operator_job_supervisor as j; "
+        "root=Path(sys.argv[1]); job=sys.argv[2]; j.mark_running(job, os.getpid(), hermes_root=root); "
+        "time.sleep(0.25); j.terminalize(job, \'completed\', returncode=0, summary=\'done\', hermes_root=root)'; "
+        "subprocess.Popen([sys.executable, '-c', 'import os; '+code, root, job], "
+        "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, "
+        "start_new_session=True); os._exit(0)"
+    )
+    parent = subprocess.Popen([sys.executable, "-c", launcher, str(tmp_path), job_id])
+    assert parent.wait(timeout=5) == 0
+
+    deadline = time.monotonic() + 5
+    observed = None
+    while time.monotonic() < deadline:
+        observed = jobs.get_job(job_id, hermes_root=tmp_path, reconcile=False)
+        if observed and observed.get("status") == "completed":
+            break
+        time.sleep(0.05)
+
+    assert observed is not None
+    assert observed["status"] == "completed"
+    assert observed["returncode"] == 0
+    assert observed["result_summary"] == "done"
 
 
 def test_pid_reuse_mismatch_never_signals(monkeypatch, tmp_path):
