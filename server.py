@@ -35,6 +35,7 @@ import operator_mission as op_mission
 import operator_mission_runtime as op_mission_runtime
 import operator_contract as op_contract
 import operator_delegations as op_delegations
+import operator_job_supervisor as op_jobs
 import operator_runners as op_runners
 import operator_review as op_review
 import operator_events as op_events
@@ -1980,6 +1981,35 @@ def hermes_codex_cancel(job_id: str, confirm: bool = False, dry_run: bool = True
     return op_codex.hermes_codex_cancel(job_id, confirm, dry_run, _default_hermes_root())
 
 
+# --- Durable background-job lifecycle ------------------------------------
+
+
+def hermes_job_status(job_id: str, cursor: int = 0, max_lines: int = 50) -> str:
+    """Read durable runner-neutral job state and a cursor-based log tail."""
+    return op_jobs.hermes_job_status(
+        job_id,
+        cursor=cursor,
+        max_lines=max_lines,
+        hermes_root=_default_hermes_root(),
+    )
+
+
+def hermes_job_wait(
+    job_id: str,
+    cursor: int = 0,
+    wait_seconds: int = op_jobs.MAX_WAIT_SECONDS,
+    max_lines: int = 50,
+) -> str:
+    """Long-poll durable job state for up to 120 seconds and return early on terminal state."""
+    return op_jobs.hermes_job_wait(
+        job_id,
+        cursor=cursor,
+        wait_seconds=wait_seconds,
+        max_lines=max_lines,
+        hermes_root=_default_hermes_root(),
+    )
+
+
 # --- Mission Control (v0.6 M0, read-only) --------------------------------
 
 
@@ -2733,6 +2763,25 @@ def register_tools(server: FastMCP) -> None:
         hermes_runner_cancel,
     ):
         server.add_tool(_runner_tool, meta=tool_meta())
+
+    # Runner-neutral durable job status. The wait tool carries the polling
+    # contract so chat clients can make one bounded decisive call per turn.
+    server.add_tool(
+        hermes_job_status,
+        meta=tool_meta(),
+        annotations=ToolAnnotations(
+            title="Read durable background-job status and log cursor",
+            readOnlyHint=True,
+        ),
+    )
+    server.add_tool(
+        hermes_job_wait,
+        meta=tool_meta(),
+        annotations=ToolAnnotations(
+            title="Wait up to 120 seconds for a background job to finish",
+            readOnlyHint=True,
+        ),
+    )
 
     # Unified delegation lifecycle (v0.9): normalized durable lineage over
     # runner/Fabric execution. Get/list are read-only; dispatch/cancel/reconcile
