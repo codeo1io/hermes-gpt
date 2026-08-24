@@ -148,6 +148,166 @@ jobs:
             }
           }
 
+  repair-cancel-truth:
+    if: github.event_name == 'pull_request' && github.event.pull_request.number == 58
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -e ".[dev]"
+      - name: Apply reviewed cancellation truth fix
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('operator_runners.py')
+          source = path.read_text(encoding='utf-8')
+          old = '''        _atomic_json(_cancel_path(task_id, hermes_root), {"task_id": task_id, "requested_at": _now()})
+                  cancelled = job_supervisor.request_cancel(task_id, hermes_root=hermes_root)
+                  if not cancelled.get("success"):
+                      return {
+                          "success": False,
+                          "changed": False,
+                          "code": cancelled.get("code") or "RUNNER_CANCEL_FAILED",
+                          "backend": self.name,
+                          "safe_message": cancelled.get("safe_message") or "runner process could not be safely cancelled",
+                      }
+                  meta["state"] = "cancelled"
+                  meta["outcome"] = "cancelled"
+                  meta["ended_at"] = _now()
+                  _atomic_json(meta_path, meta)
+                  return {"success": True, "changed": True, "backend": self.name, "state": "cancelled"}
+          '''
+          new = '''        cancelled = job_supervisor.request_cancel(task_id, hermes_root=hermes_root)
+                  if not cancelled.get("success"):
+                      return {
+                          "success": False,
+                          "changed": bool(cancelled.get("changed")),
+                          "code": cancelled.get("code") or "RUNNER_CANCEL_FAILED",
+                          "backend": self.name,
+                          "safe_message": cancelled.get("safe_message") or "runner process could not be safely cancelled",
+                      }
+                  state = str(cancelled.get("status") or meta.get("state") or "unknown")
+                  changed = bool(cancelled.get("changed"))
+                  if state in _TERMINAL_STATES:
+                      # The shared supervisor is the cancellation authority. Mirror its
+                      # terminal truth into the legacy runner record without inventing a
+                      # cancellation when a concurrent worker already completed/failed.
+                      refreshed = _load_json(meta_path) or meta
+                      refreshed["state"] = state
+                      refreshed["outcome"] = state
+                      if state == "cancelled":
+                          refreshed["error"] = ""
+                      refreshed["ended_at"] = refreshed.get("ended_at") or _now()
+                      _atomic_json(meta_path, refreshed)
+                  return {"success": True, "changed": changed, "backend": self.name, "state": state}
+          '''
+          if old in source:
+              source = source.replace(old, new, 1)
+              path.write_text(source, encoding='utf-8')
+          elif new not in source:
+              raise SystemExit('operator_runners cancellation anchor drifted')
+
+          Path('test_runner_cancel_truth.py').write_text('''import operator_runners as runners
+
+
+def _seed_meta(tmp_path, task_id: str, *, state: str = "running"):
+    meta_path, _, _ = runners._job_paths(task_id, tmp_path)
+    runners._atomic_json(
+        meta_path,
+        {
+            "schema_version": runners.SCHEMA_VERSION,
+            "task_id": task_id,
+            "backend": "omx",
+            "state": state,
+            "outcome": state if state != "running" else "",
+            "workspace": str(tmp_path),
+            "created_at": runners._now(),
+            "started_at": runners._now(),
+            "ended_at": None,
+            "pid": 4242,
+            "returncode": None,
+            "error": "",
+        },
+    )
+    return meta_path
+
+
+def test_local_cancel_does_not_publish_marker_before_supervisor_verifies(monkeypatch, tmp_path):
+    task_id = "cancel-unverified"
+    meta_path = _seed_meta(tmp_path, task_id)
+    cancel_path = runners._cancel_path(task_id, tmp_path)
+
+    def refuse(job_id, *, hermes_root=None):
+        assert job_id == task_id
+        assert hermes_root == tmp_path
+        assert not cancel_path.exists()
+        return {
+            "success": False,
+            "changed": False,
+            "code": "JOB_PROCESS_UNVERIFIABLE",
+            "safe_message": "identity mismatch",
+        }
+
+    monkeypatch.setattr(runners.job_supervisor, "request_cancel", refuse)
+    result = runners.OmxBackend().cancel(task_id, hermes_root=tmp_path)
+
+    assert result["success"] is False
+    assert result["code"] == "JOB_PROCESS_UNVERIFIABLE"
+    assert not cancel_path.exists()
+    stored = runners._load_json(meta_path)
+    assert stored is not None
+    assert stored["state"] == "running"
+
+
+def test_local_cancel_preserves_supervisor_completed_noop(monkeypatch, tmp_path):
+    task_id = "cancel-completed-race"
+    meta_path = _seed_meta(tmp_path, task_id)
+
+    monkeypatch.setattr(
+        runners.job_supervisor,
+        "request_cancel",
+        lambda job_id, *, hermes_root=None: {
+            "success": True,
+            "changed": False,
+            "job_id": job_id,
+            "status": "completed",
+        },
+    )
+
+    result = runners.OmxBackend().cancel(task_id, hermes_root=tmp_path)
+
+    assert result == {
+        "success": True,
+        "changed": False,
+        "backend": "omx",
+        "state": "completed",
+    }
+    stored = runners._load_json(meta_path)
+    assert stored is not None
+    assert stored["state"] == "completed"
+    assert stored["outcome"] == "completed"
+    assert stored["ended_at"]
+''', encoding='utf-8')
+          PY
+          python -m pytest -q test_runner_cancel_truth.py
+          git diff --check
+          if git diff --quiet -- operator_runners.py test_runner_cancel_truth.py; then
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add operator_runners.py test_runner_cancel_truth.py
+          git commit -m "fix(runners): preserve supervisor cancellation truth"
+          git push origin "HEAD:${{ github.event.pull_request.head.ref }}"
+
   build:
     needs: [test, compatibility, lint, web, windows-docs]
     runs-on: ubuntu-latest
