@@ -203,10 +203,9 @@ def test_environment_config_is_disabled_by_default_and_requires_complete_confide
 def test_discovery_truthfully_advertises_implemented_capabilities(oauth_client: TestClient):
     metadata = oauth_client.get("/.well-known/oauth-authorization-server").json()
     assert metadata["grant_types_supported"] == ["authorization_code", "refresh_token"]
-    assert metadata["token_endpoint_auth_methods_supported"] == ["client_secret_post", "client_secret_basic"]
+    assert metadata["token_endpoint_auth_methods_supported"] == ["client_secret_post", "client_secret_basic", "none"]
     assert metadata["code_challenge_methods_supported"] == ["S256"]
     assert set(metadata["scopes_supported"]) == {"hermes", "openid", "offline_access"}
-    assert "none" not in metadata["token_endpoint_auth_methods_supported"]
     assert "jwks_uri" not in metadata
     assert "id_token_signing_alg_values_supported" not in metadata
 
