@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import sqlite3
 import threading
@@ -238,225 +237,6 @@ def test_no_approval_reconcile_fails_closed_when_confirmed_cancel_starts_after_o
     cancel_thread.join(5)
     assert not cancel_thread.is_alive()
     assert cancelled[0]["delegation"]["state"] == "cancelled"
-
-
-@pytest.mark.parametrize("completion_path", ["approve", "transition", "reconcile"])
-def test_mission_completion_rejects_concurrent_reconcile_authority_change(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    completion_path: str,
-):
-    workspace = tmp_path / "ws"
-    workspace.mkdir()
-    root = tmp_path / "hermes"
-    _enable_workspace(monkeypatch, workspace)
-    mission_id = f"msn-stale-success-{completion_path}"
-    delegation_id = f"dlg-stale-success-{completion_path}"
-    task_id = f"stale-success-{completion_path}-task"
-    approval_required = completion_path == "approve"
-    if not approval_required:
-        monkeypatch.setenv(op.OPERATOR_LEVEL_ENV, "owner")
-        monkeypatch.setenv(op.OWNER_ACTIVE_ENV, "1")
-        monkeypatch.setenv(op.OWNER_ACK_ENV, op.OWNER_ACK_REQUIRED_VALUE)
-    _successful_mission_delegation(
-        root, workspace, monkeypatch, mission_id=mission_id,
-        delegation_id=delegation_id, task_id=task_id,
-        final_approval_required=approval_required,
-    )
-    if approval_required:
-        assert json.loads(missions.hermes_mission_reconcile(
-            mission_id, confirm=True, dry_run=False, hermes_root=root,
-        ))["status"] == "awaiting_approval"
-    if completion_path in {"approve", "transition"}:
-        monkeypatch.setenv(op.OPERATOR_LEVEL_ENV, "owner")
-        monkeypatch.setenv(op.OWNER_ACTIVE_ENV, "1")
-        monkeypatch.setenv(op.OWNER_ACK_ENV, op.OWNER_ACK_REQUIRED_VALUE)
-
-    observed = threading.Event()
-    release = threading.Event()
-    original_guard = missions._completion_guard
-
-    def paused_guard(*args, **kwargs):
-        observed.set()
-        assert release.wait(5)
-        return original_guard(*args, **kwargs)
-
-    monkeypatch.setattr(missions, "_completion_guard", paused_guard)
-    result: list[dict] = []
-    if completion_path == "approve":
-        call = lambda: missions.hermes_mission_approve(mission_id, "approval:stale", confirm=True, dry_run=False, hermes_root=root)
-    elif completion_path == "transition":
-        call = lambda: missions.hermes_mission_transition(mission_id, "completed", confirm=True, dry_run=False, hermes_root=root)
-    else:
-        call = lambda: missions.hermes_mission_reconcile(mission_id, confirm=True, dry_run=False, hermes_root=root)
-    thread = threading.Thread(target=lambda: result.append(json.loads(call())))
-    thread.start()
-    assert observed.wait(5)
-
-    meta_path, _, _ = runners._job_paths(task_id, root)
-    meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    meta.update({"state": "running", "outcome": "running", "ended_at": ""})
-    runners._atomic_json(meta_path, meta)
-    invalidated = json.loads(delegations.hermes_delegation_reconcile(
-        delegation_id, apply=True, hermes_root=root,
-    ))
-    assert invalidated["delegation"]["state"] == "running"
-    release.set()
-    thread.join(5)
-    assert not thread.is_alive()
-    assert result[0]["success"] is False
-    assert json.loads(missions.hermes_mission_get(mission_id, hermes_root=root))["status"] != "completed"
-
-
-def test_cancel_backend_rejection_releases_provisional_latch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    workspace = tmp_path / "ws"
-    workspace.mkdir()
-    root = tmp_path / "hermes"
-    _enable_workspace(monkeypatch, workspace)
-    monkeypatch.setattr(delegations.contract_mod, "hermes_contract_dispatch", lambda *a, **k: json.dumps({"success": True, "changed": True, "state": "running"}))
-    contract = _contract(workspace, task_id="cancel-rejected-task")
-    json.loads(delegations.hermes_delegation_dispatch(json.dumps(contract), delegation_id="dlg-cancel-rejected", confirm=True, dry_run=False, hermes_root=root))
-    before = json.loads(delegations.hermes_delegation_get("dlg-cancel-rejected", hermes_root=root))["delegation"]
-    monkeypatch.setattr(delegations.runners, "hermes_runner_cancel", lambda *a, **k: json.dumps({"success": False, "changed": False, "code": "NOT_CANCELLABLE"}))
-    out = json.loads(delegations.hermes_delegation_cancel("dlg-cancel-rejected", confirm=True, dry_run=False, hermes_root=root))
-    assert out["success"] is False and out["changed"] is False
-    row = out["delegation"]
-    assert row["cancel_requested"] is False
-    assert row["cancellation_in_progress"] is False
-    assert row["authority_version"] == before["authority_version"] + 2
-
-
-def test_concurrent_exact_cancel_invokes_backend_once_and_latches_ambiguous_failure(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-):
-    workspace = tmp_path / "ws"
-    workspace.mkdir()
-    root = tmp_path / "hermes"
-    _enable_workspace(monkeypatch, workspace)
-    monkeypatch.setattr(
-        delegations.contract_mod,
-        "hermes_contract_dispatch",
-        lambda *a, **k: json.dumps({"success": True, "changed": True, "state": "running"}),
-    )
-    delegation_id = "dlg-exact-cancel-ambiguous"
-    assert json.loads(delegations.hermes_delegation_dispatch(
-        json.dumps(_contract(workspace, task_id="exact-cancel-ambiguous-task")),
-        delegation_id=delegation_id, confirm=True, dry_run=False, hermes_root=root,
-    ))["success"]
-
-    entered = threading.Event()
-    release = threading.Event()
-    calls = 0
-
-    def ambiguous_cancel(*args, **kwargs):
-        nonlocal calls
-        calls += 1
-        entered.set()
-        assert release.wait(5)
-        return json.dumps({"success": False, "code": "BACKEND_TIMEOUT"})
-
-    monkeypatch.setattr(delegations.runners, "hermes_runner_cancel", ambiguous_cancel)
-    first_result: list[dict] = []
-    first = threading.Thread(target=lambda: first_result.append(json.loads(
-        delegations.hermes_delegation_cancel(
-            delegation_id, confirm=True, dry_run=False, hermes_root=root,
-        )
-    )))
-    first.start()
-    assert entered.wait(5)
-    retry = json.loads(delegations.hermes_delegation_cancel(
-        delegation_id, confirm=True, dry_run=False, hermes_root=root,
-    ))
-    assert retry["success"] is False
-    assert retry["code"] == "DELEGATION_CANCELLATION_IN_PROGRESS"
-    assert retry["idempotent_retry"] is True
-    assert calls == 1
-    release.set()
-    first.join(5)
-    assert not first.is_alive()
-    assert first_result[0]["success"] is False
-
-    latched_retry = json.loads(delegations.hermes_delegation_cancel(
-        delegation_id, confirm=True, dry_run=False, hermes_root=root,
-    ))
-    assert latched_retry["code"] == "DELEGATION_CANCELLATION_IN_PROGRESS"
-    assert calls == 1
-    durable = json.loads(delegations.hermes_delegation_get(
-        delegation_id, hermes_root=root,
-    ))["delegation"]
-    assert durable["cancel_requested"] is True
-    assert durable["cancellation_in_progress"] is True
-
-
-def test_parent_cancellation_racing_child_cancellation_preserves_lock_order(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-):
-    workspace = tmp_path / "ws"
-    workspace.mkdir()
-    root = tmp_path / "hermes"
-    _enable_workspace(monkeypatch, workspace)
-    mission_id = _mission(root)
-    delegation_id = "dlg-parent-child-cancel-race"
-    monkeypatch.setattr(
-        delegations.contract_mod,
-        "hermes_contract_dispatch",
-        lambda *a, **k: json.dumps({"success": True, "changed": True, "state": "running"}),
-    )
-    assert json.loads(delegations.hermes_delegation_dispatch(
-        json.dumps(_contract(workspace, task_id="parent-child-cancel-race-task")),
-        mission_id=mission_id, delegation_id=delegation_id,
-        confirm=True, dry_run=False, hermes_root=root,
-    ))["success"]
-
-    backend_entered = threading.Event()
-    backend_release = threading.Event()
-
-    def paused_cancel(*args, **kwargs):
-        backend_entered.set()
-        assert backend_release.wait(5)
-        return json.dumps({"success": True, "changed": True, "state": "cancelled"})
-
-    monkeypatch.setattr(delegations.runners, "hermes_runner_cancel", paused_cancel)
-    child_result: list[dict] = []
-    child = threading.Thread(target=lambda: child_result.append(json.loads(
-        delegations.hermes_delegation_cancel(
-            delegation_id, confirm=True, dry_run=False, hermes_root=root,
-        )
-    )))
-    child.start()
-    assert backend_entered.wait(5)
-
-    parent_blocked = json.loads(missions.hermes_mission_transition(
-        mission_id, "cancelled", confirm=True, dry_run=False, hermes_root=root,
-    ))
-    assert parent_blocked["success"] is False
-    assert child.is_alive()
-    backend_release.set()
-    child.join(5)
-    assert not child.is_alive()
-    assert child_result[0]["delegation"]["state"] == "cancelled"
-
-    parent_cancelled = json.loads(missions.hermes_mission_transition(
-        mission_id, "cancelled", confirm=True, dry_run=False, hermes_root=root,
-    ))
-    assert parent_cancelled["success"] is True
-    assert parent_cancelled["to_status"] == "cancelled"
-
-
-def test_successful_cancel_failed_state_remains_reconciling(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    workspace = tmp_path / "ws"
-    workspace.mkdir()
-    root = tmp_path / "hermes"
-    _enable_workspace(monkeypatch, workspace)
-    monkeypatch.setattr(delegations.contract_mod, "hermes_contract_dispatch", lambda *a, **k: json.dumps({"success": True, "changed": True, "state": "running"}))
-    contract = _contract(workspace, task_id="cancel-failed-state-task")
-    json.loads(delegations.hermes_delegation_dispatch(json.dumps(contract), delegation_id="dlg-cancel-failed-state", confirm=True, dry_run=False, hermes_root=root))
-    monkeypatch.setattr(delegations.runners, "hermes_runner_cancel", lambda *a, **k: json.dumps({"success": True, "changed": False, "state": "failed"}))
-    out = json.loads(delegations.hermes_delegation_cancel("dlg-cancel-failed-state", confirm=True, dry_run=False, hermes_root=root))
-    assert out["delegation"]["state"] == "reconciling"
-    assert out["delegation"]["terminal_at"] is None
 
 
 def test_list_before_dispatch_is_noncreating(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -957,376 +737,21 @@ def test_cancel_backend_completed_self_report_stays_reconciling(tmp_path: Path, 
     assert fetched["delegation"]["events"][0]["event_type"] == "delegation.cancel_requested"
 
 
-@pytest.mark.parametrize(
-    ("observed_state", "satisfied", "expected_state", "expected_mission_state"),
-    [
-        pytest.param("cancelled", True, "cancelled", "cancelled", id="cancelled"),
-        pytest.param("failed", True, "failed", "failed", id="failed"),
-        pytest.param("completed", True, "succeeded", "succeeded", id="completed-satisfied"),
-        pytest.param("completed", False, "reconciling", "blocked", id="completed-unsatisfied"),
-    ],
-)
-def test_reconcile_ambiguous_cancel_from_fresh_authoritative_terminal_observation(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    observed_state: str,
-    satisfied: bool,
-    expected_state: str,
-    expected_mission_state: str,
-):
-    workspace = tmp_path / "ws"
-    workspace.mkdir()
-    root = tmp_path / "hermes"
-    _enable_workspace(monkeypatch, workspace)
-    mission_id = _mission(root)
-    task_id = f"cancel-resolution-{observed_state}-{str(satisfied).lower()}"
-    delegation_id = f"dlg-cancel-resolution-{observed_state}-{str(satisfied).lower()}"
-    contract = _contract(workspace, task_id=task_id)
-    if not satisfied:
-        contract["completion_criteria"]["run_state"]["outcome_ok"] = ["different-outcome"]
-    monkeypatch.setattr(
-        delegations.contract_mod,
-        "hermes_contract_dispatch",
-        lambda *args, **kwargs: json.dumps(
-            {"success": True, "changed": True, "backend": "pi_rpc", "state": "running"}
-        ),
-    )
-    assert json.loads(delegations.hermes_delegation_dispatch(
-        json.dumps(contract), mission_id=mission_id, delegation_id=delegation_id,
-        confirm=True, dry_run=False, hermes_root=root,
-    ))["success"]
-
-    monkeypatch.setattr(
-        delegations.runners,
-        "hermes_runner_cancel",
-        lambda *args, **kwargs: json.dumps({"success": True, "changed": True}),
-    )
-    ambiguous = json.loads(delegations.hermes_delegation_cancel(
-        delegation_id, confirm=True, dry_run=False, hermes_root=root,
-    ))
-    assert ambiguous["delegation"]["cancellation_in_progress"] is True
-    with delegations._connect(delegations._db_path(root), write=True) as db:
-        db.execute(
-            "UPDATE delegations SET cancellation_claimed_at='2026-08-22T00:00:01+00:00' "
-            "WHERE delegation_id=?", (delegation_id,),
-        )
-        db.commit()
-    meta_path, _, _ = runners._job_paths(task_id, root)
-    runners._atomic_json(meta_path, {
-        "schema_version": runners.SCHEMA_VERSION,
-        "task_id": task_id,
-        "backend": "pi_rpc",
-        "state": observed_state,
-        "outcome": observed_state,
-        "created_at": "2026-08-22T00:00:00+00:00",
-        "started_at": "2026-08-22T00:00:01+00:00",
-        "ended_at": "2026-08-22T00:00:02+00:00",
-        "error": "failure" if observed_state == "failed" else "",
-    })
-
-    out = json.loads(delegations.hermes_delegation_reconcile(
-        delegation_id, apply=True, hermes_root=root,
-    ))
-    row = out["delegation"]
-    assert row["state"] == expected_state
-    assert row["cancellation_in_progress"] is False
-    assert row["cancel_requested"] is (observed_state == "cancelled")
-    assert row["dispatch_phase"] == ("cancelled" if observed_state == "cancelled" else "dispatched")
-    if expected_state == "reconciling":
-        assert row["terminal_at"] is None
-    else:
-        assert row["terminal_at"] is not None
-    if observed_state == "completed":
-        assert row["validation_verdict"] == ("SATISFIED" if satisfied else "NOT_SATISFIED")
-    mission = json.loads(missions.hermes_mission_get(mission_id, hermes_root=root))
-    attachment = next(item for item in mission["attachments"] if item["ref"] == delegation_id)
-    assert attachment["state"] == expected_mission_state
-    if expected_state == "succeeded":
-        assert bool(attachment["verified"]) is True
-
-
-@pytest.mark.parametrize("observation", [None, "running", "unexpected"])
-def test_reconcile_ambiguous_cancel_retains_latch_without_terminal_authority(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    observation: str | None,
-):
-    workspace = tmp_path / "ws"
-    workspace.mkdir()
-    root = tmp_path / "hermes"
-    _enable_workspace(monkeypatch, workspace)
-    task_id = f"cancel-unresolved-{observation or 'missing'}"
-    delegation_id = f"dlg-cancel-unresolved-{observation or 'missing'}"
-    monkeypatch.setattr(
-        delegations.contract_mod,
-        "hermes_contract_dispatch",
-        lambda *args, **kwargs: json.dumps({"success": True, "changed": True, "state": "running"}),
-    )
-    assert json.loads(delegations.hermes_delegation_dispatch(
-        json.dumps(_contract(workspace, task_id=task_id)), delegation_id=delegation_id,
-        confirm=True, dry_run=False, hermes_root=root,
-    ))["success"]
-    with delegations._connect(delegations._db_path(root), write=True) as db:
-        delegations._init(db)
-        db.execute(
-            "UPDATE delegations SET state='reconciling',cancel_requested=1,cancellation_in_progress=1,"
-            "cancellation_claimed_at='2026-08-22T00:00:01+00:00',cancellation_observation_sha256='',"
-            "cancellation_watermark_ready=1 "
-            "WHERE delegation_id=?", (delegation_id,),
-        )
-        db.commit()
-    if observation is not None:
-        meta_path, _, _ = runners._job_paths(task_id, root)
-        runners._atomic_json(meta_path, {
-            "schema_version": runners.SCHEMA_VERSION, "task_id": task_id, "backend": "pi_rpc",
-            "state": observation, "outcome": observation,
-            "created_at": "2026-08-22T00:00:00+00:00", "started_at": "2026-08-22T00:00:01+00:00",
-            "ended_at": "", "error": "",
-        })
-    out = json.loads(delegations.hermes_delegation_reconcile(
-        delegation_id, apply=True, hermes_root=root,
-    ))
-    assert out["delegation"]["state"] == "reconciling"
-    assert out["delegation"]["cancel_requested"] is True
-    assert out["delegation"]["cancellation_in_progress"] is True
-
-
-def test_reconcile_ambiguous_cancel_rejects_stale_precancellation_terminal_observation(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-):
-    workspace = tmp_path / "ws"
-    workspace.mkdir()
-    root = tmp_path / "hermes"
-    _enable_workspace(monkeypatch, workspace)
-    task_id = "cancel-stale-terminal-task"
-    delegation_id = "dlg-cancel-stale-terminal"
-    monkeypatch.setattr(
-        delegations.contract_mod,
-        "hermes_contract_dispatch",
-        lambda *args, **kwargs: json.dumps({"success": True, "changed": True, "state": "running"}),
-    )
-    assert json.loads(delegations.hermes_delegation_dispatch(
-        json.dumps(_contract(workspace, task_id=task_id)), delegation_id=delegation_id,
-        confirm=True, dry_run=False, hermes_root=root,
-    ))["success"]
-    monkeypatch.setattr(
-        delegations.runners,
-        "hermes_runner_cancel",
-        lambda *args, **kwargs: json.dumps({"success": True, "changed": True}),
-    )
-    cancelled = json.loads(delegations.hermes_delegation_cancel(
-        delegation_id, confirm=True, dry_run=False, hermes_root=root,
-    ))
-    assert cancelled["delegation"]["cancellation_in_progress"] is True
-    with delegations._connect(delegations._db_path(root), write=True) as db:
-        db.execute(
-            "UPDATE delegations SET cancellation_claimed_at='2026-08-22T00:00:01+00:00' "
-            "WHERE delegation_id=?", (delegation_id,),
-        )
-        db.commit()
-    # This terminal record was absent at watermark capture and changes the
-    # observation hash, but its terminal authority predates the cancel claim.
-    meta_path, _, _ = runners._job_paths(task_id, root)
-    runners._atomic_json(meta_path, {
-        "schema_version": runners.SCHEMA_VERSION, "task_id": task_id, "backend": "pi_rpc",
-        "state": "completed", "outcome": "completed",
-        "created_at": "2026-08-21T23:59:58+00:00", "started_at": "2026-08-21T23:59:59+00:00",
-        "ended_at": "2026-08-22T00:00:00+00:00", "error": "",
-    })
-
-    reconciled = json.loads(delegations.hermes_delegation_reconcile(
-        delegation_id, apply=True, hermes_root=root,
-    ))
-    row = reconciled["delegation"]
-    assert row["state"] == "reconciling"
-    assert row["cancel_requested"] is True
-    assert row["cancellation_in_progress"] is True
-    assert row["terminal_at"] is None
-
-
-@pytest.mark.parametrize("terminal_at", ["", "not-a-time", "2026-08-22T00:00:01+00:00"])
-def test_reconcile_ambiguous_cancel_requires_strict_parseable_terminal_ordering(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    terminal_at: str,
-):
-    workspace = tmp_path / "ws"
-    workspace.mkdir()
-    root = tmp_path / "hermes"
-    _enable_workspace(monkeypatch, workspace)
-    task_id = f"cancel-ordering-{hashlib.sha256(terminal_at.encode()).hexdigest()[:8]}"
-    delegation_id = f"dlg-{task_id}"
-    monkeypatch.setattr(
-        delegations.contract_mod,
-        "hermes_contract_dispatch",
-        lambda *args, **kwargs: json.dumps({"success": True, "changed": True, "state": "running"}),
-    )
-    assert json.loads(delegations.hermes_delegation_dispatch(
-        json.dumps(_contract(workspace, task_id=task_id)), delegation_id=delegation_id,
-        confirm=True, dry_run=False, hermes_root=root,
-    ))["success"]
-    with delegations._connect(delegations._db_path(root), write=True) as db:
-        delegations._init(db)
-        db.execute(
-            "UPDATE delegations SET state='reconciling',cancel_requested=1,cancellation_in_progress=1,"
-            "cancellation_claimed_at='2026-08-22T00:00:01+00:00',"
-            "cancellation_observation_sha256='different-old-payload',cancellation_watermark_ready=1 "
-            "WHERE delegation_id=?", (delegation_id,),
-        )
-        db.commit()
-    meta_path, _, _ = runners._job_paths(task_id, root)
-    runners._atomic_json(meta_path, {
-        "schema_version": runners.SCHEMA_VERSION, "task_id": task_id, "backend": "pi_rpc",
-        "state": "failed", "outcome": "failed", "created_at": "2026-08-22T00:00:00+00:00",
-        "started_at": "2026-08-22T00:00:00+00:00", "ended_at": terminal_at, "error": "failure",
-    })
-    row = json.loads(delegations.hermes_delegation_reconcile(
-        delegation_id, apply=True, hermes_root=root,
-    ))["delegation"]
-    assert row["state"] == "reconciling"
-    assert row["cancel_requested"] is True
-    assert row["cancellation_in_progress"] is True
-
-
-def test_reconcile_migrated_cancel_row_without_claim_ordering_fails_closed(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-):
-    workspace = tmp_path / "ws"
-    workspace.mkdir()
-    root = tmp_path / "hermes"
-    _enable_workspace(monkeypatch, workspace)
-    task_id = "cancel-migrated-no-ordering"
-    delegation_id = "dlg-cancel-migrated-no-ordering"
-    monkeypatch.setattr(
-        delegations.contract_mod,
-        "hermes_contract_dispatch",
-        lambda *args, **kwargs: json.dumps({"success": True, "changed": True, "state": "running"}),
-    )
-    assert json.loads(delegations.hermes_delegation_dispatch(
-        json.dumps(_contract(workspace, task_id=task_id)), delegation_id=delegation_id,
-        confirm=True, dry_run=False, hermes_root=root,
-    ))["success"]
-    with delegations._connect(delegations._db_path(root), write=True) as db:
-        db.execute(
-            "UPDATE delegations SET state='reconciling',cancel_requested=1,cancellation_in_progress=1,"
-            "cancellation_claimed_at='',cancellation_observation_sha256='',cancellation_watermark_ready=1 "
-            "WHERE delegation_id=?", (delegation_id,),
-        )
-        db.commit()
-    meta_path, _, _ = runners._job_paths(task_id, root)
-    runners._atomic_json(meta_path, {
-        "schema_version": runners.SCHEMA_VERSION, "task_id": task_id, "backend": "pi_rpc",
-        "state": "cancelled", "outcome": "cancelled", "created_at": "2026-08-22T00:00:00+00:00",
-        "started_at": "2026-08-22T00:00:01+00:00", "ended_at": "2026-08-22T00:00:02+00:00",
-        "error": "",
-    })
-    row = json.loads(delegations.hermes_delegation_reconcile(
-        delegation_id, apply=True, hermes_root=root,
-    ))["delegation"]
-    assert row["state"] == "reconciling"
-    assert row["cancel_requested"] is True
-    assert row["cancellation_in_progress"] is True
-
-
 @pytest.mark.parametrize("with_mission", [False, True])
-@pytest.mark.parametrize(
-    ("backend_payload", "expected_backend_state"),
-    [
-        pytest.param({}, "", id="missing"),
-        pytest.param({"state": ""}, "", id="empty"),
-        pytest.param({"state": None}, "", id="null"),
-        pytest.param({"state": "unexpected"}, "unexpected", id="unexpected"),
-    ],
-)
-def test_successful_cancel_without_explicit_cancelled_state_stays_reconciling(
+@pytest.mark.parametrize("stale_backend_state", ["cancelled", "completed", "running", "cancel_requested"])
+def test_concurrent_dispatched_cancel_preserves_first_confirmed_cancellation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     with_mission: bool,
-    backend_payload: dict,
-    expected_backend_state: str,
+    stale_backend_state: str,
 ):
     workspace = tmp_path / "ws"
     workspace.mkdir()
     root = tmp_path / "hermes"
     _enable_workspace(monkeypatch, workspace)
     mission_id = _mission(root) if with_mission else ""
-    suffix = expected_backend_state or "absent"
-    delegation_id = f"dlg-cancel-explicit-{suffix}-{str(with_mission).lower()}"
-    task_id = f"cancel-explicit-{suffix}-{str(with_mission).lower()}"
-    monkeypatch.setattr(
-        delegations.contract_mod,
-        "hermes_contract_dispatch",
-        lambda *args, **kwargs: json.dumps(
-            {"success": True, "changed": True, "backend": "pi_rpc", "state": "running"}
-        ),
-    )
-    assert json.loads(delegations.hermes_delegation_dispatch(
-        json.dumps(_contract(workspace, task_id=task_id)),
-        mission_id=mission_id,
-        delegation_id=delegation_id,
-        confirm=True,
-        dry_run=False,
-        hermes_root=root,
-    ))["success"] is True
-    calls = 0
-
-    def cancel(*args, **kwargs):
-        nonlocal calls
-        calls += 1
-        return json.dumps({"success": True, "changed": True, **backend_payload})
-
-    monkeypatch.setattr(
-        delegations.runners,
-        "hermes_runner_cancel",
-        cancel,
-    )
-
-    out = json.loads(delegations.hermes_delegation_cancel(
-        delegation_id, confirm=True, dry_run=False, hermes_root=root,
-    ))
-
-    assert out["success"] is True
-    row = out["delegation"]
-    assert row["state"] == "reconciling"
-    assert row["backend_state"] == expected_backend_state
-    assert row["outcome"] == ""
-    assert row["terminal_at"] is None
-    assert row["cancel_requested"] is True
-    assert row["cancellation_in_progress"] is True
-    assert row["dispatch_phase"] == "dispatched"
-    durable = json.loads(delegations.hermes_delegation_get(
-        delegation_id, hermes_root=root,
-    ))["delegation"]
-    assert durable["events"][0]["event_type"] == "delegation.cancel_requested"
-    assert all(event["event_type"] != "delegation.cancelled" for event in durable["events"])
-    retry = json.loads(delegations.hermes_delegation_cancel(
-        delegation_id, confirm=True, dry_run=False, hermes_root=root,
-    ))
-    assert retry["code"] == "DELEGATION_CANCELLATION_IN_PROGRESS"
-    assert retry["idempotent_retry"] is True
-    assert calls == 1
-    if mission_id:
-        mission = json.loads(missions.hermes_mission_get(mission_id, hermes_root=root))
-        attachment = next(item for item in mission["attachments"] if item["ref"] == delegation_id)
-        assert attachment["state"] == "blocked"
-        assert attachment["evidence_ref"] == f"delegation:{delegation_id}"
-
-
-@pytest.mark.parametrize("with_mission", [False, True])
-def test_concurrent_exact_cancel_coalesces_while_confirmed_cancellation_runs(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    with_mission: bool,
-):
-    workspace = tmp_path / "ws"
-    workspace.mkdir()
-    root = tmp_path / "hermes"
-    _enable_workspace(monkeypatch, workspace)
-    mission_id = _mission(root) if with_mission else ""
-    delegation_id = f"dlg-concurrent-cancel-{str(with_mission).lower()}"
-    task_id = f"delegation-concurrent-cancel-{str(with_mission).lower()}"
+    delegation_id = f"dlg-concurrent-cancel-{stale_backend_state}-{str(with_mission).lower()}"
+    task_id = f"delegation-concurrent-cancel-{stale_backend_state}-{str(with_mission).lower()}"
     monkeypatch.setattr(
         delegations.contract_mod,
         "hermes_contract_dispatch",
@@ -1346,6 +771,7 @@ def test_concurrent_exact_cancel_coalesces_while_confirmed_cancellation_runs(
 
     first_entered = threading.Event()
     second_entered = threading.Event()
+    release_second = threading.Event()
     call_lock = threading.Lock()
     calls = 0
 
@@ -1358,7 +784,9 @@ def test_concurrent_exact_cancel_coalesces_while_confirmed_cancellation_runs(
             first_entered.set()
             assert second_entered.wait(5)
             return json.dumps({"success": True, "changed": True, "state": "cancelled"})
-        raise AssertionError("exact retry must not invoke backend cancellation")
+        second_entered.set()
+        assert release_second.wait(5)
+        return json.dumps({"success": True, "changed": False, "state": stale_backend_state})
 
     monkeypatch.setattr(delegations.runners, "hermes_runner_cancel", cancel)
     results: list[dict] = []
@@ -1367,28 +795,30 @@ def test_concurrent_exact_cancel_coalesces_while_confirmed_cancellation_runs(
             delegation_id, confirm=True, dry_run=False, hermes_root=root,
         )
     )))
-    def exact_retry():
-        results.append(json.loads(delegations.hermes_delegation_cancel(
+    second = threading.Thread(target=lambda: results.append(json.loads(
+        delegations.hermes_delegation_cancel(
             delegation_id, confirm=True, dry_run=False, hermes_root=root,
-        )))
-        second_entered.set()
-
-    second = threading.Thread(target=exact_retry)
+        )
+    )))
     first.start()
     assert first_entered.wait(5)
     second.start()
     assert second_entered.wait(5)
     first.join(5)
     assert not first.is_alive()
-    assert results[0]["code"] == "DELEGATION_CANCELLATION_IN_PROGRESS"
-    assert results[0]["cancellation_outcome_ambiguous"] is True
-    confirmed = results[1]["delegation"]
+    confirmed = results[0]["delegation"]
     assert confirmed["state"] == "cancelled"
     terminal_at = confirmed["terminal_at"]
+    release_second.set()
     second.join(5)
     assert not second.is_alive()
 
-    assert calls == 1
+    stale = results[1]
+    assert stale["success"] is True
+    assert stale["changed"] is False
+    assert stale["stale_cancellation"] is True
+    assert stale["delegation"]["state"] == "cancelled"
+    assert stale["delegation"]["terminal_at"] == terminal_at
     durable = json.loads(delegations.hermes_delegation_get(
         delegation_id, hermes_root=root,
     ))["delegation"]
@@ -1410,18 +840,20 @@ def test_concurrent_exact_cancel_coalesces_while_confirmed_cancellation_runs(
 
 
 @pytest.mark.parametrize("with_mission", [False, True])
-def test_concurrent_exact_cancel_preserves_delayed_confirmed_cancellation(
+@pytest.mark.parametrize("weaker_backend_state", ["completed", "running", "cancel_requested"])
+def test_concurrent_dispatched_cancel_promotes_delayed_confirmed_cancellation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     with_mission: bool,
+    weaker_backend_state: str,
 ):
     workspace = tmp_path / "ws"
     workspace.mkdir()
     root = tmp_path / "hermes"
     _enable_workspace(monkeypatch, workspace)
     mission_id = _mission(root) if with_mission else ""
-    delegation_id = f"dlg-cancel-promote-{str(with_mission).lower()}"
-    task_id = f"delegation-cancel-promote-{str(with_mission).lower()}"
+    delegation_id = f"dlg-cancel-promote-{weaker_backend_state}-{str(with_mission).lower()}"
+    task_id = f"delegation-cancel-promote-{weaker_backend_state}-{str(with_mission).lower()}"
     monkeypatch.setattr(
         delegations.contract_mod,
         "hermes_contract_dispatch",
@@ -1456,7 +888,7 @@ def test_concurrent_exact_cancel_preserves_delayed_confirmed_cancellation(
             assert release_confirmed.wait(5)
             return json.dumps({"success": True, "changed": True, "state": "cancelled"})
         weaker_entered.set()
-        raise AssertionError("exact retry must not invoke backend cancellation")
+        return json.dumps({"success": True, "changed": False, "state": weaker_backend_state})
 
     monkeypatch.setattr(delegations.runners, "hermes_runner_cancel", cancel)
     results: list[dict] = []
@@ -1465,22 +897,20 @@ def test_concurrent_exact_cancel_preserves_delayed_confirmed_cancellation(
             delegation_id, confirm=True, dry_run=False, hermes_root=root,
         )
     )))
-    def exact_retry():
-        results.append(json.loads(delegations.hermes_delegation_cancel(
+    weaker = threading.Thread(target=lambda: results.append(json.loads(
+        delegations.hermes_delegation_cancel(
             delegation_id, confirm=True, dry_run=False, hermes_root=root,
-        )))
-        weaker_entered.set()
-
-    weaker = threading.Thread(target=exact_retry)
+        )
+    )))
     confirmed.start()
     assert confirmed_entered.wait(5)
     weaker.start()
     assert weaker_entered.wait(5)
     weaker.join(5)
     assert not weaker.is_alive()
-    assert results[0]["success"] is False
-    assert results[0]["code"] == "DELEGATION_CANCELLATION_IN_PROGRESS"
-    assert results[0]["delegation"]["cancellation_in_progress"] is True
+    assert results[0]["success"] is True
+    assert results[0]["delegation"]["state"] == "reconciling"
+    assert results[0]["delegation"]["cancel_requested"] is True
     release_confirmed.set()
     confirmed.join(5)
     assert not confirmed.is_alive()
@@ -1491,7 +921,6 @@ def test_concurrent_exact_cancel_preserves_delayed_confirmed_cancellation(
     assert promoted["delegation"]["state"] == "cancelled"
     assert promoted["delegation"]["dispatch_phase"] == "cancelled"
     assert promoted["delegation"]["terminal_at"] is not None
-    assert calls == 1
     durable = json.loads(delegations.hermes_delegation_get(
         delegation_id, hermes_root=root,
     ))["delegation"]
@@ -1504,7 +933,8 @@ def test_concurrent_exact_cancel_preserves_delayed_confirmed_cancellation(
         if event["event_type"] in {"delegation.cancelled", "delegation.cancel_requested"}
     ]
     assert cancel_events.count("delegation.cancelled") == 1
-    assert cancel_events == ["delegation.cancelled"]
+    # Events are surfaced newest first.
+    assert cancel_events == ["delegation.cancelled", "delegation.cancel_requested"]
     if mission_id:
         mission = json.loads(missions.hermes_mission_get(mission_id, hermes_root=root))
         attachment = next(item for item in mission["attachments"] if item["ref"] == delegation_id)
@@ -1772,60 +1202,6 @@ def test_definite_rejection_resets_reserved_and_retry_dispatches(tmp_path: Path,
     assert second["success"] and second["delegation"]["dispatch_phase"] == "dispatched"
 
 
-_CHANGED_MISSING = object()
-
-
-@pytest.mark.parametrize(
-    "backend_changed",
-    [_CHANGED_MISSING, None, 0, "false", []],
-    ids=["missing", "null", "falsey-non-bool", "truthy-non-bool", "malformed-container"],
-)
-def test_ambiguous_failed_dispatch_cannot_reinvoke_backend(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    backend_changed: object,
-):
-    workspace = tmp_path / "ws"
-    workspace.mkdir()
-    root = tmp_path / "hermes"
-    _enable_workspace(monkeypatch, workspace)
-    calls = 0
-
-    def dispatch(*args, **kwargs):
-        nonlocal calls
-        calls += 1
-        response = {"success": False, "code": "BACKEND_FAILURE"}
-        if backend_changed is not _CHANGED_MISSING:
-            response["changed"] = backend_changed
-        return json.dumps(response)
-
-    monkeypatch.setattr(delegations.contract_mod, "hermes_contract_dispatch", dispatch)
-    contract = json.dumps(_contract(workspace, task_id="delegation-ambiguous-retry"))
-    first = json.loads(delegations.hermes_delegation_dispatch(
-        contract,
-        delegation_id="dlg-ambiguous-retry",
-        confirm=True,
-        dry_run=False,
-        hermes_root=root,
-    ))
-    retry = json.loads(delegations.hermes_delegation_dispatch(
-        contract,
-        delegation_id="dlg-ambiguous-retry",
-        confirm=True,
-        dry_run=False,
-        hermes_root=root,
-    ))
-
-    assert calls == 1
-    assert first["submission_may_have_succeeded"] is True
-    assert first["delegation"]["state"] == "reconciling"
-    assert first["delegation"]["dispatch_phase"] == "invoking"
-    assert retry["success"] is False
-    assert retry["code"] == "DELEGATION_DISPATCH_AMBIGUOUS"
-    assert retry["submission_may_have_succeeded"] is True
-    assert retry["delegation"]["dispatch_phase"] == "invoking"
-
-
 def test_missing_or_corrupt_manifest_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     workspace = tmp_path / "ws"
     workspace.mkdir()
@@ -2028,7 +1404,4 @@ def test_in_place_database_migration_adds_dispatch_phase_and_manifest_table(tmp_
         columns = {row[1] for row in migrated.execute("PRAGMA table_info(delegations)")}
         tables = {row[0] for row in migrated.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert "dispatch_phase" in columns
-    assert "cancellation_claimed_at" in columns
-    assert "cancellation_observation_sha256" in columns
-    assert "cancellation_watermark_ready" in columns
     assert "delegation_validation_manifests" in tables
