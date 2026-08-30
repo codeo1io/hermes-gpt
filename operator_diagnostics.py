@@ -258,11 +258,33 @@ def _check_gateway_status(profile_home: Path) -> dict[str, Any]:
     heartbeat_path = _ticker_heartbeat_path(profile_home)
 
     pid: int | None = None
+    pid_source: str | None = None
     if pid_path.exists():
         try:
             pid = int(pid_path.read_text(encoding="utf-8").strip())
+            pid_source = "gateway.pid"
         except (OSError, ValueError):
             pid = None
+            pid_source = None
+
+    # Current Hermes gateways persist their authoritative runtime PID in
+    # gateway_state.json. Keep the legacy gateway.pid path for compatibility,
+    # but fall back to the state file when the legacy PID file is absent.
+    # The PID is still verified below with _is_process_alive(), so a stale state
+    # file can never produce GATEWAY_OK by itself.
+    if pid is None:
+        state_path = _gateway_state_path(profile_home)
+        if state_path.exists():
+            try:
+                with open(state_path, "r", encoding="utf-8") as fh:
+                    gateway_state = json.load(fh)
+                state_pid = gateway_state.get("pid")
+                if isinstance(state_pid, int) and state_pid > 0:
+                    pid = state_pid
+                    pid_source = "gateway_state.json"
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                pid = None
+                pid_source = None
 
     running = _is_process_alive(pid) if pid is not None else False
 
@@ -291,7 +313,7 @@ def _check_gateway_status(profile_home: Path) -> dict[str, Any]:
             code="GATEWAY_DEAD_PID",
             message=f"Gateway PID file exists ({pid}) but the process is not alive.",
             suggested_action="Run hermes_operator_recover with apply=true to restart the gateway.",
-            extra={"pid": pid, "running": False},
+            extra={"pid": pid, "running": False, "pid_source": pid_source},
         )
 
     # A heartbeat alone is not proof that the gateway is alive. Stale state files
@@ -317,7 +339,7 @@ def _check_gateway_status(profile_home: Path) -> dict[str, Any]:
             extra={"heartbeat_mtime": heartbeat_mtime, "stale_seconds": _STALE_HEARTBEAT_SECONDS},
         )
 
-    extra = {"pid": pid, "running": running}
+    extra = {"pid": pid, "running": running, "pid_source": pid_source}
     if heartbeat_mtime is not None:
         extra["heartbeat_mtime"] = heartbeat_mtime
     extra.update(_gateway_state_summary(profile_home))

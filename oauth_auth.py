@@ -18,7 +18,7 @@ from starlette.responses import JSONResponse, RedirectResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 AUTH_CODE_TTL_SECONDS = 300
-ACCESS_TOKEN_TTL_SECONDS = 3600
+ACCESS_TOKEN_TTL_SECONDS = 30 * 24 * 3600
 REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60
 MAX_AUTH_CODES = 1024
 MAX_ACCESS_TOKENS = 4096
@@ -123,6 +123,19 @@ class OAuthConfig:
                 or redirect.password is not None
             ):
                 raise ValueError("OAuth redirect URIs must be absolute HTTPS URLs without userinfo or fragments.")
+            if redirect_uri.endswith("*"):
+                prefix = redirect_uri[:-1]
+                if not prefix:
+                    raise ValueError("OAuth redirect URI wildcard must follow a non-empty prefix.")
+                prefix_parsed = urllib.parse.urlparse(prefix)
+                if (
+                    prefix_parsed.scheme != "https"
+                    or not prefix_parsed.netloc
+                    or not prefix_parsed.hostname
+                ):
+                    raise ValueError("OAuth redirect URI wildcard prefix must be an HTTPS origin/prefix.")
+                if "*" in prefix:
+                    raise ValueError("Only a single trailing wildcard is allowed in OAuth redirect URIs.")
         if not self.scope.strip() or len(self.scope.split()) != 1:
             raise ValueError("OAuth scope must be one non-empty scope token.")
         object.__setattr__(self, "issuer", issuer)
@@ -539,7 +552,7 @@ def authorization_metadata(_request: Request, state: OAuthState) -> JSONResponse
             "token_endpoint": f"{issuer}/oauth/token",
             "response_types_supported": ["code"],
             "grant_types_supported": ["authorization_code", "refresh_token"],
-            "token_endpoint_auth_methods_supported": ["client_secret_post", "client_secret_basic"],
+            "token_endpoint_auth_methods_supported": ["client_secret_post", "client_secret_basic", "none"],
             "code_challenge_methods_supported": ["S256"],
             "scopes_supported": list(state.config.supported_scopes),
         }
@@ -564,13 +577,24 @@ def _redirect_response(redirect_uri: str, values: list[tuple[str, str]]) -> Redi
     return RedirectResponse(location, status_code=302)
 
 
+def _redirect_uri_allowed(redirect_uri: str, config: OAuthConfig) -> bool:
+    """Exact match, or prefix match against an entry ending in ``*``."""
+    for allowed in config.redirect_uris:
+        if allowed.endswith("*"):
+            if redirect_uri.startswith(allowed[:-1]):
+                return True
+        elif redirect_uri == allowed:
+            return True
+    return False
+
+
 def authorize(request: Request, state: OAuthState) -> JSONResponse | RedirectResponse:
     params = request.query_params
     client_id = params.get("client_id", "")
     redirect_uri = params.get("redirect_uri", "")
     if client_id != state.config.client_id:
         return _error_response(OAuthError("invalid_client", "Unknown OAuth client.", status_code=401))
-    if redirect_uri not in state.config.redirect_uris:
+    if not _redirect_uri_allowed(redirect_uri, state.config):
         return _error_response(OAuthError("invalid_request", "redirect_uri is not registered."))
     try:
         if params.get("response_type", "") != "code":
@@ -626,6 +650,15 @@ def _authenticate_client(request: Request, form: dict[str, list[str]], state: OA
     client_id, client_secret = _client_credentials(request, form)
     if not hmac.compare_digest(client_id, state.config.client_id):
         raise OAuthError("invalid_client", "Invalid OAuth client credentials.", status_code=401)
+    grant_type = _form_value(form, "grant_type")
+    # Public PKCE clients (e.g. ChatGPT connectors) send no client_secret.
+    # Allow secretless auth for authorization_code with a code_verifier, or
+    # refresh_token grants; everything else still requires the secret.
+    if not client_secret and (
+        grant_type == "refresh_token"
+        or (grant_type == "authorization_code" and _form_value(form, "code_verifier"))
+    ):
+        return client_id
     if not hmac.compare_digest(client_secret, state.config.client_secret):
         raise OAuthError("invalid_client", "Invalid OAuth client credentials.", status_code=401)
     return client_id
