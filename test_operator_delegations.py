@@ -995,13 +995,19 @@ def test_reconcile_ambiguous_cancel_from_fresh_authoritative_terminal_observatio
         confirm=True, dry_run=False, hermes_root=root,
     ))["success"]
 
+    monkeypatch.setattr(
+        delegations.runners,
+        "hermes_runner_cancel",
+        lambda *args, **kwargs: json.dumps({"success": True, "changed": True}),
+    )
+    ambiguous = json.loads(delegations.hermes_delegation_cancel(
+        delegation_id, confirm=True, dry_run=False, hermes_root=root,
+    ))
+    assert ambiguous["delegation"]["cancellation_in_progress"] is True
     with delegations._connect(delegations._db_path(root), write=True) as db:
-        delegations._init(db)
         db.execute(
-            "UPDATE delegations SET state='reconciling',backend_state='ambiguous',outcome='',"
-            "cancel_requested=1,cancellation_in_progress=1,authority_version=authority_version+1 "
-            "WHERE delegation_id=?",
-            (delegation_id,),
+            "UPDATE delegations SET cancellation_claimed_at='2026-08-22T00:00:01+00:00' "
+            "WHERE delegation_id=?", (delegation_id,),
         )
         db.commit()
     meta_path, _, _ = runners._job_paths(task_id, root)
@@ -1122,13 +1128,14 @@ def test_successful_cancel_without_explicit_cancelled_state_stays_reconciling(
         dry_run=False,
         hermes_root=root,
     ))["success"] is True
-    monkeypatch.setattr(
-        delegations.runners,
-        "hermes_runner_cancel",
-        lambda *args, **kwargs: json.dumps(
-            {"success": True, "changed": True, **backend_payload}
-        ),
-    )
+    calls = 0
+
+    def cancel(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return json.dumps({"success": True, "changed": True, **backend_payload})
+
+    monkeypatch.setattr(delegations.runners, "hermes_runner_cancel", cancel)
 
     out = json.loads(delegations.hermes_delegation_cancel(
         delegation_id, confirm=True, dry_run=False, hermes_root=root,
@@ -1141,13 +1148,19 @@ def test_successful_cancel_without_explicit_cancelled_state_stays_reconciling(
     assert row["outcome"] == ""
     assert row["terminal_at"] is None
     assert row["cancel_requested"] is True
-    assert row["cancellation_in_progress"] is False
+    assert row["cancellation_in_progress"] is True
     assert row["dispatch_phase"] == "dispatched"
     durable = json.loads(delegations.hermes_delegation_get(
         delegation_id, hermes_root=root,
     ))["delegation"]
     assert durable["events"][0]["event_type"] == "delegation.cancel_requested"
     assert all(event["event_type"] != "delegation.cancelled" for event in durable["events"])
+    retry = json.loads(delegations.hermes_delegation_cancel(
+        delegation_id, confirm=True, dry_run=False, hermes_root=root,
+    ))
+    assert retry["code"] == "DELEGATION_CANCELLATION_IN_PROGRESS"
+    assert retry["idempotent_retry"] is True
+    assert calls == 1
     if mission_id:
         mission = json.loads(missions.hermes_mission_get(mission_id, hermes_root=root))
         attachment = next(item for item in mission["attachments"] if item["ref"] == delegation_id)

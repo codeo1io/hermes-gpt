@@ -2080,6 +2080,16 @@ class FabricCoordinator:
         node_name, remote_backend, logical_workspace, remote_options, evidence_policy = _fabric_options(
             contract
         )
+        # Fabric v1 cannot prove non-empty forbidden-action checks remotely;
+        # reject such contracts at the boundary before any remote dispatch.
+        forbidden = contract.get("forbidden_actions", [])
+        if isinstance(forbidden, list) and len(forbidden) > 32:
+            raise FabricError("FABRIC_SCHEMA_INVALID", "contract forbidden_actions must be a bounded list")
+        if forbidden:
+            raise FabricError(
+                "FABRIC_EVIDENCE_POLICY_INVALID",
+                "verified Fabric cannot prove non-empty forbidden-action checks",
+            )
         node = self._node(node_name)
         if contract.get("assigned_agent") != node.name:
             raise FabricError(
@@ -2090,7 +2100,7 @@ class FabricCoordinator:
         if contract.get("assigned_profile") not in allowed_profiles:
             raise FabricError(
                 "FABRIC_AUTHORITY_DENIED",
-                "contract assigned_profile is outside its allowed_scope.profiles",
+                "assigned profile is outside the Work Contract profile scope",
             )
         if not set(allowed_profiles) <= set(node.allowed_profiles):
             raise FabricError(

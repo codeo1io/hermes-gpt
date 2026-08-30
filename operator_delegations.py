@@ -91,6 +91,9 @@ def _init(db: sqlite3.Connection) -> None:
             cancel_requested INTEGER NOT NULL DEFAULT 0,
             authority_version INTEGER NOT NULL DEFAULT 1,
             cancellation_in_progress INTEGER NOT NULL DEFAULT 0,
+            cancellation_claimed_at TEXT NOT NULL DEFAULT '',
+            cancellation_observation_sha256 TEXT NOT NULL DEFAULT '',
+            cancellation_watermark_ready INTEGER NOT NULL DEFAULT 0,
             dispatch_phase TEXT NOT NULL DEFAULT 'dispatched',
             created_at TEXT NOT NULL,
             dispatched_at TEXT NOT NULL,
@@ -129,6 +132,12 @@ def _init(db: sqlite3.Connection) -> None:
         db.execute("ALTER TABLE delegations ADD COLUMN authority_version INTEGER NOT NULL DEFAULT 1")
     if "cancellation_in_progress" not in columns:
         db.execute("ALTER TABLE delegations ADD COLUMN cancellation_in_progress INTEGER NOT NULL DEFAULT 0")
+    if "cancellation_claimed_at" not in columns:
+        db.execute("ALTER TABLE delegations ADD COLUMN cancellation_claimed_at TEXT NOT NULL DEFAULT ''")
+    if "cancellation_observation_sha256" not in columns:
+        db.execute("ALTER TABLE delegations ADD COLUMN cancellation_observation_sha256 TEXT NOT NULL DEFAULT ''")
+    if "cancellation_watermark_ready" not in columns:
+        db.execute("ALTER TABLE delegations ADD COLUMN cancellation_watermark_ready INTEGER NOT NULL DEFAULT 0")
     db.commit()
 
 
@@ -186,6 +195,7 @@ def _surface(row: sqlite3.Row | dict[str, Any], *, events: list[dict[str, Any]] 
     value["backend_ref"] = backend_ref if isinstance(backend_ref, dict) else {}
     value["cancel_requested"] = bool(value.get("cancel_requested"))
     value["cancellation_in_progress"] = bool(value.get("cancellation_in_progress"))
+    value["cancellation_watermark_ready"] = bool(value.get("cancellation_watermark_ready"))
     if events is not None:
         value["events"] = events
     return value
@@ -351,6 +361,41 @@ def mission_completion_guard(
             db.commit()
 
 
+@contextmanager
+def mission_cancellation_guard(
+    mission_id: str,
+    snapshots: dict[str, int],
+    *,
+    hermes_root: Path | None = None,
+):
+    """Linearize parent cancellation against terminal delegation authority."""
+    if not snapshots:
+        yield
+        return
+    path = _db_path(hermes_root)
+    with _connect(path, write=True) as db:
+        _init(db)
+        db.execute("BEGIN IMMEDIATE")
+        for delegation_id, authority_version in snapshots.items():
+            row = dict(_get_row(db, delegation_id))
+            terminal_cancel = row.get("state") == "cancelled" and bool(row.get("cancel_requested"))
+            if (
+                row.get("mission_id") != mission_id
+                or int(row.get("authority_version") or 0) != int(authority_version)
+                or row.get("state") not in TERMINAL_STATES
+                or bool(row.get("cancellation_in_progress"))
+                or (bool(row.get("cancel_requested")) and not terminal_cancel)
+            ):
+                raise ValueError("delegation authority changed after Mission cancellation observation")
+        try:
+            yield
+        except BaseException:
+            db.rollback()
+            raise
+        else:
+            db.commit()
+
+
 def _mission_sync_failure(
     operation: str,
     row: dict[str, Any],
@@ -370,6 +415,21 @@ def _mission_sync_failure(
     if extra:
         payload.update(extra)
     return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def _cancellation_in_progress(row: dict[str, Any]) -> str:
+    return json.dumps({
+        "success": False,
+        "schema_version": SCHEMA_VERSION,
+        "code": "DELEGATION_CANCELLATION_IN_PROGRESS",
+        "safe_message": "Cancellation is already in progress for this exact delegation lineage; its backend outcome is not yet authoritative.",
+        "changed": False,
+        "cancellation_in_progress": True,
+        "cancellation_outcome_ambiguous": True,
+        "idempotent_retry": True,
+        "delegation": _surface(row),
+        "suggested_action": "Reconcile the durable delegation; do not invoke backend cancellation again while cancellation_in_progress is set.",
+    }, ensure_ascii=False, indent=2)
 
 
 def _dispatch_in_progress(row: dict[str, Any], *, never_submitted: bool = False) -> str:
@@ -477,6 +537,46 @@ def _latest_observation(task_id: str, hermes_root: Path) -> dict[str, Any] | Non
         return (bool(ended), max(ended, started), ended, started, created)
 
     return max(runs, key=key)
+
+
+def _observation_sha256(observed: dict[str, Any] | None) -> str:
+    if observed is None:
+        return ""
+    encoded = json.dumps(observed, sort_keys=True, default=str, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def _observation_is_fresh_for_cancellation(stored: dict[str, Any], observed: dict[str, Any] | None) -> bool:
+    if observed is None or not bool(stored.get("cancellation_watermark_ready")):
+        return False
+
+    def ordered_time(value: Any) -> datetime | None:
+        if not isinstance(value, str) or not value.strip():
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            return None
+        return parsed.astimezone(timezone.utc)
+
+    claimed_at = ordered_time(stored.get("cancellation_claimed_at"))
+    if claimed_at is None:
+        return False
+    # Only backend terminal timestamps are ordering authority. created/started,
+    # generic updated/observed times, and payload/hash changes can describe when
+    # a record became visible without proving that terminality followed the
+    # cancellation attempt. Supported sources currently normalize to ended_at or
+    # completed_at; the additional names preserve the same terminal-only rule for
+    # backends that expose an equivalent field directly.
+    terminal_times = [
+        parsed
+        for key in ("ended_at", "completed_at", "finished_at", "terminal_at")
+        if (parsed := ordered_time(observed.get(key))) is not None
+    ]
+    terminal_at = max(terminal_times) if terminal_times else None
+    return terminal_at is not None and terminal_at > claimed_at
 
 
 def _manifest_row(db: sqlite3.Connection, delegation_id: str) -> dict[str, Any]:
@@ -688,16 +788,6 @@ def hermes_delegation_dispatch(
                 if existing["state"] == "cancelled":
                     db.commit()
                     return _dispatch_cancelled(existing)
-                if _invocation_unreached_backend(existing, root):
-                    # Crash-window recovery: authoritative backend observation
-                    # proves the stale invoking claim never reached a backend,
-                    # so the reservation can safely be redispatched.
-                    db.execute(
-                        "UPDATE delegations SET dispatch_phase='reserved',updated_at=? WHERE delegation_id=? AND dispatch_phase='invoking' AND state='reserved'",
-                        (_now(), delegation_id),
-                    )
-                    _event(db, delegation_id, "delegation.invocation_recovered", from_state="reserved", to_state="reserved")
-                    existing = dict(_get_row(db, delegation_id))
                 if existing["dispatch_phase"] != "reserved":
                     db.commit()
                     if existing["dispatch_phase"] == "invoking":
@@ -755,7 +845,12 @@ def hermes_delegation_dispatch(
         dispatch = json.loads(contract_mod.hermes_contract_dispatch(
             canonical, confirm=confirm, dry_run=False, timeout=timeout, hermes_root=root,
         ))
-        ambiguous = bool(dispatch.get("submission_may_have_succeeded") or (dispatch.get("changed") and not dispatch.get("success")))
+        # Fail closed (fc8a1b3): a failed dispatch whose `changed` is anything
+        # other than an explicit False is ambiguous — a malformed/missing
+        # container must never license a backend re-invocation.
+        ambiguous = bool(dispatch.get("submission_may_have_succeeded")) or (
+            not dispatch.get("success") and dispatch.get("changed") is not False
+        )
         if not dispatch.get("success") and not ambiguous:
             with _connect(path, write=True) as db:
                 _init(db)
@@ -822,6 +917,9 @@ def hermes_delegation_dispatch(
             "success": True,
             "schema_version": SCHEMA_VERSION,
             "changed": True,
+            # Ambiguous backends self-reported failure but cannot prove the
+            # submission did not land; callers must reconcile (fc8a1b3).
+            **({"submission_may_have_succeeded": True} if ambiguous else {}),
             "delegation": _surface(row),
             "mission_linked": bool(mission_id),
             "dispatch": dispatch,
@@ -945,18 +1043,10 @@ def hermes_delegation_reconcile(
             manifest = contract_mod._validation_manifest(contract, sha)
         else:
             with _connect(path, write=False) as db:
-                manifest = _manifest_row_or_none(db, delegation_id)
-        legacy_lineage = manifest is None
-        if legacy_lineage:
-            # Grandfathered pre-0.9-delegation.2 lineage: no durable validation
-            # manifest exists and the immutable Work Contract cannot be
-            # re-derived from stored lineage. Remain observable and cancellable
-            # in a bounded legacy mode that can never verify success; a
-            # re-dispatch that reproduces the contract backfills the manifest.
-            manifest_contract, manifest_sha = {"task_id": stored["task_id"]}, stored["contract_sha256"]
-        else:
-            manifest_contract, manifest_sha = contract_mod._contract_from_validation_manifest(manifest)
-        if not legacy_lineage and (
+                manifest = _manifest_row(db, delegation_id)
+        legacy_lineage = False
+        manifest_contract, manifest_sha = contract_mod._contract_from_validation_manifest(manifest)
+        if (
             manifest_sha != stored["contract_sha256"] or manifest_contract["task_id"] != stored["task_id"]
         ):
             raise ValueError("delegation validation manifest does not match lineage")
@@ -984,21 +1074,40 @@ def hermes_delegation_reconcile(
             verdict = _validation_verdict_cached(manifest, observed, root)
 
         # Product invariant: a confirmed cancellation is monotonic against all
-        # later non-terminal backend observations, but later authoritative
-        # backend evidence of success combined with a currently SATISFIED
-        # immutable Work Contract reopens the outcome.
-        later_verified_success = (
-            observed is not None and observed_desired == "succeeded" and verdict == "SATISFIED"
-        )
+        # later backend observations — including later verified success. A
+        # completed-and-SATISFIED record after cancellation does not reopen
+        # the outcome; cancellation authority is terminal (5c67834).
         authoritative_cancel = (
             stored["state"] == "cancelled"
             and bool(stored.get("cancel_requested"))
-            and not later_verified_success
         )
         desired = observed_desired
+        resolved_cancel_requested = bool(stored.get("cancel_requested"))
+        resolved_cancellation_in_progress = bool(stored.get("cancellation_in_progress"))
+        dispatch_phase = str(stored.get("dispatch_phase") or "dispatched")
         if authoritative_cancel:
             desired = "cancelled"
             outcome = stored.get("outcome") or "cancelled"
+            resolved_cancellation_in_progress = False
+            dispatch_phase = "cancelled"
+        elif (
+            (bool(stored.get("cancel_requested")) or bool(stored.get("cancellation_in_progress")))
+            and observed_desired in TERMINAL_STATES
+            and _observation_is_fresh_for_cancellation(stored, observed)
+        ):
+            # A fresh terminal backend observation resolves an ambiguous cancel.
+            # Cancellation is durable only when the backend explicitly reports
+            # it; other terminal states return to the normal contract path.
+            resolved_cancellation_in_progress = False
+            if observed_desired == "cancelled":
+                desired = "cancelled"
+                outcome = "cancelled"
+                resolved_cancel_requested = True
+                dispatch_phase = "cancelled"
+            else:
+                resolved_cancel_requested = False
+                if observed_desired == "succeeded" and verdict != "SATISFIED":
+                    desired = "reconciling"
         elif bool(stored.get("cancel_requested")) or bool(stored.get("cancellation_in_progress")):
             desired = "reconciling"
             outcome = ""
@@ -1009,7 +1118,11 @@ def hermes_delegation_reconcile(
         changed = (
             desired != stored["state"]
             or _bounded(backend_state, 128) != stored["backend_state"]
+            or _bounded(outcome, 128) != stored.get("outcome", "")
             or verdict != stored.get("validation_verdict", "")
+            or resolved_cancel_requested != bool(stored.get("cancel_requested"))
+            or resolved_cancellation_in_progress != bool(stored.get("cancellation_in_progress"))
+            or dispatch_phase != stored.get("dispatch_phase")
         )
         changed = changed or stale_invocation
         preview = dict(stored)
@@ -1018,6 +1131,9 @@ def hermes_delegation_reconcile(
             "backend_state": _bounded(backend_state, 128),
             "outcome": _bounded(outcome, 128),
             "validation_verdict": _bounded(verdict, 64),
+            "cancel_requested": resolved_cancel_requested,
+            "cancellation_in_progress": resolved_cancellation_in_progress,
+            "dispatch_phase": dispatch_phase,
         })
         if stale_invocation:
             preview["dispatch_phase"] = "reserved"
@@ -1074,8 +1190,12 @@ def hermes_delegation_reconcile(
                 _event(db, delegation_id, "delegation.invocation_recovered", from_state="reserved", to_state="reserved")
             else:
                 db.execute(
-                    "UPDATE delegations SET state=?,backend_state=?,outcome=?,validation_verdict=?,updated_at=?,terminal_at=? WHERE delegation_id=?",
-                    (desired, _bounded(backend_state, 128), _bounded(outcome, 128), _bounded(verdict, 64), now, terminal_at, delegation_id),
+                    "UPDATE delegations SET state=?,backend_state=?,outcome=?,validation_verdict=?,"
+                    "cancel_requested=?,cancellation_in_progress=?,cancellation_observation_sha256='',cancellation_watermark_ready=0,"
+                    "dispatch_phase=?,updated_at=?,terminal_at=? WHERE delegation_id=?",
+                    (desired, _bounded(backend_state, 128), _bounded(outcome, 128), _bounded(verdict, 64),
+                     1 if resolved_cancel_requested else 0, 1 if resolved_cancellation_in_progress else 0,
+                     dispatch_phase, now, terminal_at, delegation_id),
                 )
             if changed:
                 _event(db, delegation_id, "delegation.reconciled", from_state=stored["state"], to_state=desired, backend_state=backend_state, observed=observed)
@@ -1170,6 +1290,7 @@ def hermes_delegation_cancel(
             _audit(tool="hermes_delegation_cancel", policy=policy, dry_run=False, success=True, changed=True, delegation_id=delegation_id, task_id=row["task_id"], backend=row["backend"])
             return json.dumps({"success": True, "schema_version": SCHEMA_VERSION, "changed": True, "delegation": _surface(row)}, ensure_ascii=False, indent=2)
         effective_dry = policy.effective_dry_run(dry_run)
+        prior_cancel_requested = bool(stored.get("cancel_requested"))
         if not effective_dry and not confirm:
             return json.dumps({"success": False, "schema_version": SCHEMA_VERSION, "code": "CONFIRMATION_REQUIRED", "safe_message": "delegation cancellation requires confirm=true", "changed": False, "delegation_id": delegation_id}, ensure_ascii=False, indent=2)
         if not effective_dry:
@@ -1177,6 +1298,7 @@ def hermes_delegation_cancel(
                 _init(db)
                 db.execute("BEGIN IMMEDIATE")
                 current = dict(_get_row(db, delegation_id))
+                prior_cancel_requested = bool(current.get("cancel_requested"))
                 if current["state"] in TERMINAL_STATES:
                     db.commit()
                     return json.dumps({"success": True, "schema_version": SCHEMA_VERSION, "changed": False, "delegation": _surface(current)}, ensure_ascii=False, indent=2)
@@ -1185,10 +1307,12 @@ def hermes_delegation_cancel(
                     if not mission.get("success") or mission.get("status") == "completed":
                         db.commit()
                         raise ValueError("completed Mission delegation cancellation authority is closed")
+                claimed_at = _now()
                 changed = db.execute(
-                    "UPDATE delegations SET cancel_requested=1,cancellation_in_progress=1,authority_version=authority_version+1,updated_at=? "
+                    "UPDATE delegations SET cancel_requested=1,cancellation_in_progress=1,cancellation_claimed_at=?,"
+                    "cancellation_observation_sha256='',cancellation_watermark_ready=0,authority_version=authority_version+1,updated_at=? "
                     "WHERE delegation_id=? AND state NOT IN ('succeeded','failed','cancelled') AND cancellation_in_progress=0",
-                    (_now(), delegation_id),
+                    (claimed_at, claimed_at, delegation_id),
                 ).rowcount
                 if changed != 1:
                     row = dict(_get_row(db, delegation_id))
@@ -1205,6 +1329,24 @@ def hermes_delegation_cancel(
                 else:
                     db.commit()
                     stored = dict(_get_row(db, delegation_id))
+        # Watermark the pre-cancel observation so reconcile can distinguish a
+        # terminal backend record that POSTDATES the cancellation attempt from
+        # stale pre-cancel terminality (5c67834 cancellation ordering rule).
+        watermark = _observation_sha256(_latest_observation(stored["task_id"], root))
+        with _connect(path, write=True) as db:
+            _init(db)
+            db.execute("BEGIN IMMEDIATE")
+            changed = db.execute(
+                "UPDATE delegations SET cancellation_observation_sha256=?,cancellation_watermark_ready=1,updated_at=? "
+                "WHERE delegation_id=? AND cancellation_in_progress=1 AND authority_version=? "
+                "AND cancellation_claimed_at=? AND cancellation_watermark_ready=0",
+                (watermark, _now(), delegation_id, stored["authority_version"], stored["cancellation_claimed_at"]),
+            ).rowcount
+            current = dict(_get_row(db, delegation_id))
+            db.commit()
+        if changed != 1:
+            return _cancellation_in_progress(current) if current.get("cancellation_in_progress") else _dispatched_cancel_cas_lost(current, {})
+        stored = current
         result = json.loads(runners.hermes_runner_cancel(
             stored["task_id"],
             backend=stored["backend"],
@@ -1215,11 +1357,40 @@ def hermes_delegation_cancel(
         if effective_dry:
             return json.dumps({"success": bool(result.get("success")), "schema_version": SCHEMA_VERSION, "changed": False, "dry_run": True, "delegation_id": delegation_id, "cancel": result}, ensure_ascii=False, indent=2)
         if not result.get("success"):
+            # A backend's explicit unchanged rejection proves that this call had
+            # no side effect, so release our provisional cancellation latch.  A
+            # missing/true ``changed`` value is ambiguous and must stay latched
+            # until reconciliation establishes authority.
+            if result.get("changed") is False:
+                with _connect(path, write=True) as db:
+                    _init(db)
+                    db.execute("BEGIN IMMEDIATE")
+                    current = dict(_get_row(db, delegation_id))
+                    authority_fields = (
+                        "schema", "mission_id", "task_id", "contract_sha256", "backend",
+                        "state", "backend_state", "outcome", "validation_verdict",
+                        "cancel_requested", "cancellation_in_progress", "authority_version",
+                        "cancellation_claimed_at", "cancellation_observation_sha256", "cancellation_watermark_ready",
+                        "dispatch_phase", "dispatched_at", "updated_at", "terminal_at",
+                    )
+                    if all(current.get(key) == stored.get(key) for key in authority_fields):
+                        db.execute(
+                            "UPDATE delegations SET cancel_requested=?,cancellation_in_progress=0,"
+                            "authority_version=authority_version+1,updated_at=? WHERE delegation_id=?",
+                            (1 if prior_cancel_requested else 0, _now(), delegation_id),
+                        )
+                    db.commit()
+                    current = dict(_get_row(db, delegation_id))
+                return json.dumps({"success": False, "schema_version": SCHEMA_VERSION, "changed": False, "delegation_id": delegation_id, "delegation": _surface(current), "cancel": result}, ensure_ascii=False, indent=2)
             return json.dumps({"success": False, "schema_version": SCHEMA_VERSION, "changed": False, "delegation_id": delegation_id, "cancel": result}, ensure_ascii=False, indent=2)
         now = _now()
-        backend_state = str(result.get("state") or "cancelled")
-        normalized = _normalize_state(backend_state)
-        desired = normalized if normalized in {"cancelled", "failed"} else "reconciling"
+        backend_state = str(result.get("state") or "").strip()
+        normalized_backend_state = backend_state.lower().replace("-", "_")
+        # Cancellation finality requires an explicit cancelled/canceled backend
+        # confirmation. Every other response — including a reported "failed"
+        # state or a missing state field — remains reconciling until normal
+        # authoritative observation establishes the terminal execution result.
+        desired = "cancelled" if normalized_backend_state in {"cancelled", "canceled"} else "reconciling"
         outcome = desired if desired in TERMINAL_STATES else ""
         event_type = "delegation.cancelled" if desired == "cancelled" else "delegation.cancel_requested"
         with _connect(path, write=True) as db:
@@ -1274,8 +1445,8 @@ def hermes_delegation_cancel(
             else:
                 dispatch_phase = "cancelled" if desired == "cancelled" else stored.get("dispatch_phase", "dispatched")
                 db.execute(
-                    "UPDATE delegations SET state=?,backend_state=?,outcome=?,cancel_requested=1,cancellation_in_progress=0,dispatch_phase=?,updated_at=?,terminal_at=? WHERE delegation_id=?",
-                    (desired, _bounded(backend_state, 128), outcome, dispatch_phase, now, now if desired in TERMINAL_STATES else None, delegation_id),
+                    "UPDATE delegations SET state=?,backend_state=?,outcome=?,cancel_requested=1,cancellation_in_progress=?,dispatch_phase=?,updated_at=?,terminal_at=? WHERE delegation_id=?",
+                    (desired, _bounded(backend_state, 128), outcome, 0 if desired == "cancelled" else 1, dispatch_phase, now, now if desired in TERMINAL_STATES else None, delegation_id),
                 )
                 _event(db, delegation_id, event_type, from_state=stored["state"], to_state=desired, backend_state=backend_state)
             db.commit()
