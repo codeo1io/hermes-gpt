@@ -240,7 +240,10 @@ def hermes_root(tmp_path: Path, monkeypatch) -> Path:
     root.mkdir(parents=True, exist_ok=True)
 
     # Default profile lives at the root (state.db, cron, gateway_state).
-    (root / "config.yaml").write_text("model: test-model\nprovider: test-provider\n", encoding="utf-8")
+    (root / "config.yaml").write_text(
+        "model:\n  default: test-model\n  provider: test-provider\n",
+        encoding="utf-8",
+    )
     _make_state_db(
         root / "state.db",
         sessions=2,
