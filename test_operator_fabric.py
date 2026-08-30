@@ -300,7 +300,7 @@ def test_coordinator_rejects_profile_outside_contract_scope_on_dry_run(tmp_path,
         coord.dispatch(value, dry_run=True, confirm=False, timeout=10)
 
     assert exc.value.code == "FABRIC_AUTHORITY_DENIED"
-    assert "allowed_scope.profiles" in str(exc.value)
+    assert "Work Contract profile scope" in str(exc.value)
 
 
 def test_peer_rejects_envelope_profile_outside_preserved_scope(tmp_path, monkeypatch):
@@ -359,25 +359,17 @@ def test_remote_forbidden_actions_are_preserved_and_admitted(tmp_path, monkeypat
     assert local["forbidden_actions"] == value["forbidden_actions"]
 
     coord = coordinator(tmp_path, svc)
-    result = coord.dispatch(value, dry_run=False, confirm=True, timeout=10)
-    assert result["success"] is True
-    assert counter["count"] == 1
-    observed.append(
-        {
-            "status": "completed",
-            "outcome": "completed",
-            "started_at": "2026-08-21T17:00:00Z",
-            "ended_at": "2026-08-21T17:01:00Z",
-            "error": "",
-        }
-    )
-    coord.poll(result["attempt_id"], reconcile=True)
-    admitted = coord.collect(result["attempt_id"])["evidence"]
-    check = admitted["forbidden_check"]
-    assert check["provenance"] == "managed_peer_audit"
-    assert check["policy_sha256"] == fabric.sha256_json(value["forbidden_actions"])
-    assert check["status"] == "PASS"
-    assert check["signals"] == []
+    # Upstream fail-closed rule (5c67834): forbidden-action contracts are
+    # rejected at the boundary, so no remote dispatch ever happens.
+    try:
+        coord.dispatch(value, dry_run=False, confirm=True, timeout=10)
+        raised = False
+    except fabric.FabricError as exc:
+        raised = True
+        assert exc.code == "FABRIC_EVIDENCE_POLICY_INVALID"
+    assert raised
+    assert counter["count"] == 0
+    assert observed == []
 
 
 def test_remote_forbidden_violation_is_admitted_as_fail(tmp_path, monkeypatch):
@@ -388,51 +380,16 @@ def test_remote_forbidden_violation_is_admitted_as_fail(tmp_path, monkeypatch):
         {"action": "public_publish", "reason": "must remain private", "class": "HIGH"}
     ]
     coord = coordinator(tmp_path, svc)
-    result = coord.dispatch(value, dry_run=False, confirm=True, timeout=10)
-    assert result["success"] is True
-
-    fabric.op.set_audit_log_override(tmp_path / "audit.jsonl")
+    # Upstream fail-closed rule (5c67834): Fabric cannot prove non-empty
+    # forbidden-action checks, so the contract never reaches remote dispatch.
     try:
-        fabric.op.audit_record(
-            tool="public_publish",
-            level="workspace",
-            apply_mode="direct",
-            dry_run=False,
-            success=True,
-            profile="default",
-            summary="public_publish attempted by remote runner",
-            extra={"task_id": result["attempt_id"], "forbidden_action": "public_publish"},
-        )
-        # A later flood of benign records for the same task must not push the
-        # violation out of the evidence scan and turn FAIL into a false PASS.
-        for index in range(1_005):
-            fabric.op.audit_record(
-                tool="benign_read",
-                level="read_only",
-                apply_mode="direct",
-                dry_run=False,
-                success=True,
-                profile="default",
-                summary=f"benign same-task audit record {index}",
-                extra={"task_id": result["attempt_id"]},
-            )
-        observed.append(
-            {
-                "status": "completed",
-                "outcome": "completed",
-                "started_at": "2026-08-21T17:00:00Z",
-                "ended_at": "2026-08-21T17:01:00Z",
-                "error": "",
-            }
-        )
-        coord.poll(result["attempt_id"], reconcile=True)
-        check = coord.collect(result["attempt_id"])["evidence"]["forbidden_check"]
-    finally:
-        fabric.op.set_audit_log_override(None)
-
-    assert check["status"] == "FAIL"
-    assert check["signals"][0]["action"] == "public_publish"
-    assert check["signals"][0]["class"] == "HIGH"
+        coord.dispatch(value, dry_run=False, confirm=True, timeout=10)
+        raised = False
+    except fabric.FabricError as exc:
+        raised = True
+        assert exc.code == "FABRIC_EVIDENCE_POLICY_INVALID"
+    assert raised
+    assert observed == []
 
 
 def test_coordinator_rejects_forbidden_evidence_policy_tamper(tmp_path, monkeypatch):
@@ -464,12 +421,15 @@ def test_coordinator_rejects_forbidden_evidence_policy_tamper(tmp_path, monkeypa
         return remote_task_id, response
 
     coord = coordinator(tmp_path, svc, rpc=tampering_rpc)
-    result = coord.dispatch(value, dry_run=False, confirm=True, timeout=10)
-    coord.poll(result["attempt_id"], reconcile=True)
-    with pytest.raises(fabric.FabricError) as exc:
-        coord.collect(result["attempt_id"])
-    assert exc.value.code == "FABRIC_EVIDENCE_LINEAGE_MISMATCH"
-
+    # Upstream fail-closed rule (5c67834): forbidden-action contracts are
+    # rejected at the boundary, so tampered evidence can never be admitted.
+    try:
+        coord.dispatch(value, dry_run=False, confirm=True, timeout=10)
+        raised = False
+    except fabric.FabricError as exc:
+        raised = True
+        assert exc.code == "FABRIC_EVIDENCE_POLICY_INVALID"
+    assert raised
 
 
 def test_prestart_policy_drift_blocks_runner(tmp_path, monkeypatch):

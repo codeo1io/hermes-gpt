@@ -2081,9 +2081,11 @@ class FabricCoordinator:
             contract
         )
         # Fabric v1 cannot prove non-empty forbidden-action checks remotely;
-        # reject such contracts at the boundary before any remote dispatch.
+        # reject such contracts at the boundary before any remote dispatch
+        # (upstream 5c67834 / 59b8e0f semantics — peer-evidence admission for
+        # forbidden checks was superseded by this fail-closed rule).
         forbidden = contract.get("forbidden_actions", [])
-        if isinstance(forbidden, list) and len(forbidden) > 32:
+        if not isinstance(forbidden, list) or len(forbidden) > 32:
             raise FabricError("FABRIC_SCHEMA_INVALID", "contract forbidden_actions must be a bounded list")
         if forbidden:
             raise FabricError(
