@@ -174,6 +174,56 @@ def test_doctor_uses_live_pid_from_gateway_state_when_legacy_pid_missing(
     assert check["running"] is True
 
 
+def test_doctor_parses_json_gateway_pid_object(
+    hermes_root, clean_env, audit_override
+):
+    # Current gateways write a JSON object into gateway.pid; a bare-int parse
+    # raises ValueError and every gateway must not be reported dead.
+    (hermes_root / "cron" / "ticker_heartbeat").write_text("ok", encoding="utf-8")
+    (hermes_root / "gateway.pid").write_text(
+        json.dumps(
+            {
+                "pid": os.getpid(),
+                "kind": "hermes-gateway",
+                "gateway_state": "running",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    check = od._check_gateway_status(hermes_root)
+
+    assert check["status"] == "PASS"
+    assert check["code"] == "GATEWAY_OK"
+    assert check["pid"] == os.getpid()
+    assert check["pid_source"] == "gateway.pid"
+    assert check["running"] is True
+
+
+def test_read_gateway_pid_across_formats(tmp_path):
+    # Legacy bare-int pid file.
+    (tmp_path / "gateway.pid").write_text(str(os.getpid()), encoding="utf-8")
+    assert od._read_gateway_pid(tmp_path) == (os.getpid(), "gateway.pid")
+
+    # Current JSON-object pid file.
+    (tmp_path / "gateway.pid").write_text(
+        json.dumps({"pid": os.getpid(), "kind": "hermes-gateway"}), encoding="utf-8"
+    )
+    assert od._read_gateway_pid(tmp_path) == (os.getpid(), "gateway.pid")
+
+    # Unparsable pid file falls back to gateway_state.json.
+    (tmp_path / "gateway.pid").write_text("not-a-pid", encoding="utf-8")
+    (tmp_path / "gateway_state.json").write_text(
+        json.dumps({"pid": os.getpid(), "gateway_state": "running"}), encoding="utf-8"
+    )
+    assert od._read_gateway_pid(tmp_path) == (os.getpid(), "gateway_state.json")
+
+    # Nothing usable anywhere.
+    (tmp_path / "gateway.pid").unlink()
+    (tmp_path / "gateway_state.json").unlink()
+    assert od._read_gateway_pid(tmp_path) == (None, None)
+
+
 def test_doctor_fails_for_corrupt_cron_jobs(hermes_root, clean_env, audit_override):
     (hermes_root / "cron" / "jobs.json").write_text("not json", encoding="utf-8")
     out = od.hermes_operator_doctor(profile="default", hermes_root=hermes_root)

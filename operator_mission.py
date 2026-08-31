@@ -874,16 +874,11 @@ def _profile_summary(profile: str, root: Path | None, warnings: list[str]) -> di
     except Exception:
         pass
 
-    # Gateway running (pid probe).
+    # Gateway running (pid probe). gateway.pid may hold a bare int (legacy) or a
+    # JSON object (current gateways); gateway_state.json is the fallback.
     gateway_running = False
     try:
-        pid_path = home / "gateway.pid"
-        pid: int | None = None
-        if pid_path.exists():
-            try:
-                pid = int(pid_path.read_text(encoding="utf-8").strip())
-            except (OSError, ValueError):
-                pid = None
+        pid, _source = op_diag._read_gateway_pid(home)
         gateway_running = op_diag._is_process_alive(pid) if pid is not None else False
     except Exception:
         gateway_running = False

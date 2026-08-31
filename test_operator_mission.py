@@ -9,6 +9,7 @@ fixture and the real home directory is never read.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -368,6 +369,19 @@ def test_profiles_resolve_current_and_legacy_provider_config(hermes_root):
     assert profiles["default"]["provider"] == "test-provider"
     assert profiles["dev"]["model"] == "dev-model"
     assert profiles["dev"]["provider"] == "dev-provider"
+
+
+def test_profiles_gateway_running_with_json_pid_file(hermes_root):
+    # Current gateways write a JSON object into gateway.pid. The old bare-int
+    # parse raised ValueError and reported every gateway as not running.
+    (hermes_root / "gateway.pid").write_text(
+        json.dumps({"pid": os.getpid(), "kind": "hermes-gateway"}),
+        encoding="utf-8",
+    )
+    out = _run("hermes_mission_profiles_tool", hermes_root, force_refresh=True)
+    profiles = {item["profile"]: item for item in out["data"]["profiles"]}
+
+    assert profiles["default"]["gateway_running"] is True
 
 
 def test_overview_contract(hermes_root):

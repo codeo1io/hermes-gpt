@@ -253,38 +253,58 @@ def _check_operator_runtime() -> dict[str, Any]:
     )
 
 
-def _check_gateway_status(profile_home: Path) -> dict[str, Any]:
-    pid_path = _gateway_pid_path(profile_home)
-    heartbeat_path = _ticker_heartbeat_path(profile_home)
+def _read_gateway_pid(profile_home: Path) -> tuple[int | None, str | None]:
+    """Resolve the gateway PID for a profile across storage formats.
 
-    pid: int | None = None
-    pid_source: str | None = None
+    Handles all three layouts seen in the wild:
+    - legacy ``gateway.pid`` containing a bare integer,
+    - newer ``gateway.pid`` containing a JSON object (``{"pid": 123, ...}``),
+    - ``gateway_state.json`` fallback when the pid file is absent/unparsable.
+
+    Returns ``(pid, source)``; ``(None, None)`` when no usable PID is found.
+    The caller still verifies liveness via ``_is_process_alive()``.
+    """
+    pid_path = _gateway_pid_path(profile_home)
+    raw = ""
     if pid_path.exists():
         try:
-            pid = int(pid_path.read_text(encoding="utf-8").strip())
-            pid_source = "gateway.pid"
-        except (OSError, ValueError):
-            pid = None
-            pid_source = None
-
-    # Current Hermes gateways persist their authoritative runtime PID in
-    # gateway_state.json. Keep the legacy gateway.pid path for compatibility,
-    # but fall back to the state file when the legacy PID file is absent.
-    # The PID is still verified below with _is_process_alive(), so a stale state
-    # file can never produce GATEWAY_OK by itself.
-    if pid is None:
-        state_path = _gateway_state_path(profile_home)
-        if state_path.exists():
+            raw = pid_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            raw = ""
+    if raw:
+        try:
+            return int(raw), "gateway.pid"
+        except ValueError:
             try:
-                with open(state_path, "r", encoding="utf-8") as fh:
-                    gateway_state = json.load(fh)
-                state_pid = gateway_state.get("pid")
-                if isinstance(state_pid, int) and state_pid > 0:
-                    pid = state_pid
-                    pid_source = "gateway_state.json"
-            except (OSError, ValueError, TypeError, json.JSONDecodeError):
-                pid = None
-                pid_source = None
+                obj = json.loads(raw)
+            except (ValueError, TypeError):
+                obj = None
+            if isinstance(obj, dict):
+                obj_pid = obj.get("pid")
+                if isinstance(obj_pid, int) and obj_pid > 0:
+                    return obj_pid, "gateway.pid"
+
+    state_path = _gateway_state_path(profile_home)
+    if state_path.exists():
+        try:
+            with open(state_path, "r", encoding="utf-8") as fh:
+                gateway_state = json.load(fh)
+            state_pid = gateway_state.get("pid")
+            if isinstance(state_pid, int) and state_pid > 0:
+                return state_pid, "gateway_state.json"
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+    return None, None
+
+
+def _check_gateway_status(profile_home: Path) -> dict[str, Any]:
+    heartbeat_path = _ticker_heartbeat_path(profile_home)
+
+    # Current gateways write a JSON object into gateway.pid; older ones wrote a
+    # bare integer, and the authoritative PID may live in gateway_state.json.
+    # _read_gateway_pid covers all three. The PID is still verified below with
+    # _is_process_alive(), so a stale state file can never produce GATEWAY_OK.
+    pid, pid_source = _read_gateway_pid(profile_home)
 
     running = _is_process_alive(pid) if pid is not None else False
 
@@ -674,13 +694,9 @@ def hermes_operator_snapshot(
         gateway: dict[str, Any] = {"running": False}
         if profile_home is not None:
             try:
-                pid_path = _gateway_pid_path(profile_home)
-                pid = None
-                if pid_path.exists():
-                    try:
-                        pid = int(pid_path.read_text(encoding="utf-8").strip())
-                    except (OSError, ValueError):
-                        pid = None
+                # gateway.pid may be a bare int (legacy) or a JSON object
+                # (current gateways); gateway_state.json is the fallback.
+                pid, _source = _read_gateway_pid(profile_home)
                 gateway["pid"] = pid
                 gateway["running"] = _is_process_alive(pid) if pid is not None else False
                 hb_path = _ticker_heartbeat_path(profile_home)
