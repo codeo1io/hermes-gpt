@@ -1088,6 +1088,83 @@ def test_reconcile_ambiguous_cancel_retains_latch_without_terminal_authority(
     assert out["delegation"]["cancellation_in_progress"] is True
 
 
+def test_reconcile_ambiguous_cancel_resolves_from_pre_claim_terminal_observation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A run that died before cancellation was claimed must not latch forever.
+
+    The ordering rule only accepts terminal timestamps newer than the claim;
+    a dead runner can never emit one. Reconcile must still resolve when the
+    observation is byte-identical to the claim-time watermark and the run
+    started before the claim (nothing left to cancel).
+    """
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    root = tmp_path / "hermes"
+    _enable_workspace(monkeypatch, workspace)
+    task_id = "cancel-preclaim-terminal"
+    delegation_id = "dlg-cancel-preclaim-terminal"
+    monkeypatch.setattr(
+        delegations.contract_mod,
+        "hermes_contract_dispatch",
+        lambda *args, **kwargs: json.dumps({"success": True, "changed": True, "state": "running"}),
+    )
+    assert json.loads(delegations.hermes_delegation_dispatch(
+        json.dumps(_contract(workspace, task_id=task_id)), delegation_id=delegation_id,
+        confirm=True, dry_run=False, hermes_root=root,
+    ))["success"]
+
+    # The runner died BEFORE any cancellation was attempted: write its terminal
+    # record first, so the cancellation claim watermarks this exact observation.
+    meta_path, _, _ = runners._job_paths(task_id, root)
+    terminal_record = {
+        "schema_version": runners.SCHEMA_VERSION,
+        "task_id": task_id,
+        "backend": "pi_rpc",
+        "state": "failed",
+        "outcome": "failed",
+        "created_at": "2026-08-22T00:00:00+00:00",
+        "started_at": "2026-08-22T00:00:01+00:00",
+        "ended_at": "2026-08-22T00:00:02+00:00",
+        "error": "runner exited with code 127",
+    }
+    runners._atomic_json(meta_path, terminal_record)
+
+    monkeypatch.setattr(
+        delegations.runners,
+        "hermes_runner_cancel",
+        lambda *args, **kwargs: json.dumps({"success": True, "changed": False, "state": "failed"}),
+    )
+    ambiguous = json.loads(delegations.hermes_delegation_cancel(
+        delegation_id, confirm=True, dry_run=False, hermes_root=root,
+    ))
+    assert ambiguous["delegation"]["cancellation_in_progress"] is True
+
+    # Backdate the claim to just after the run ended: no post-claim terminal
+    # record can ever exist, and the claim-time watermark still matches this
+    # observation byte for byte.
+    with delegations._connect(delegations._db_path(root), write=True) as db:
+        db.execute(
+            "UPDATE delegations SET cancellation_claimed_at='2026-08-22T00:00:10+00:00' "
+            "WHERE delegation_id=?", (delegation_id,),
+        )
+        db.commit()
+        stored = delegations._get_row(db, delegation_id)
+        assert stored["cancellation_observation_sha256"] == delegations._observation_sha256(
+            delegations._latest_observation(task_id, root)
+        )
+
+    out = json.loads(delegations.hermes_delegation_reconcile(
+        delegation_id, apply=True, hermes_root=root,
+    ))
+    row = out["delegation"]
+    assert row["state"] == "failed"
+    assert row["cancellation_in_progress"] is False
+    assert row["cancel_requested"] is False
+    assert row["terminal_at"] is not None
+
+
 @pytest.mark.parametrize("with_mission", [False, True])
 @pytest.mark.parametrize(
     ("backend_payload", "expected_backend_state"),

@@ -576,7 +576,25 @@ def _observation_is_fresh_for_cancellation(stored: dict[str, Any], observed: dic
         if (parsed := ordered_time(observed.get(key))) is not None
     ]
     terminal_at = max(terminal_times) if terminal_times else None
-    return terminal_at is not None and terminal_at > claimed_at
+    if terminal_at is not None and terminal_at > claimed_at:
+        return True
+    # Pre-claim terminality: a run that terminated before the cancellation was
+    # claimed can never emit a post-claim terminal timestamp, so the ordering
+    # rule above would latch the delegation forever. Accept the observation
+    # only when it is still byte-identical to the record watermarked at claim
+    # time (proof that no newer run appeared) and the observed run itself
+    # started before the claim, so the cancellation had nothing left to target.
+    started_at = ordered_time(observed.get("started_at")) or ordered_time(observed.get("dispatched_at"))
+    watermark = str(stored.get("cancellation_observation_sha256") or "")
+    if (
+        terminal_at is not None
+        and started_at is not None
+        and started_at <= claimed_at
+        and watermark
+        and watermark == _observation_sha256(observed)
+    ):
+        return True
+    return False
 
 
 def _manifest_row(db: sqlite3.Connection, delegation_id: str) -> dict[str, Any]:
