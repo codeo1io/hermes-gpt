@@ -1039,86 +1039,22 @@ def _truncate(text: str, limit: int = 4096) -> str:
     return text[:limit] + f"\n... [truncated {len(text) - limit} chars]"
 
 
-# ── Canonical secret shapes (B1) ─────────────────────────────────────────
-# This table is the SINGLE source of truth for secret-looking substrings on
-# every surface: operator_policy.redact_output (operator text), ui_security
-# (browser payloads), and ui_chat's streaming delta redactor (SSE) all
-# consume it, so the surfaces cannot drift apart. Keep every pattern linear
-# on adversarial input (bounded quantifiers, non-greedy anchored runs) —
-# browser payloads are capped before redaction, but content mode still runs
-# these over up to 1 MiB of the user's own text.
-SECRET_SHAPES: tuple[tuple[re.Pattern[str], str], ...] = tuple(
-    (re.compile(pattern), replacement)
-    for pattern, replacement in (
-        # PEM private-key blocks. Terminated first; an unterminated BEGIN
-        # redacts to end-of-input (fail closed — a cut-off key body must not
-        # survive just because the END line is missing).
-        (
-            (
-                r"(?s)-----BEGIN [A-Z0-9 ]{0,32}PRIVATE KEY(?: BLOCK)?-----"
-                r".*?-----END [A-Z0-9 ]{0,32}PRIVATE KEY(?: BLOCK)?-----"
-            ),
-            "[REDACTED_PRIVATE_KEY]",
-        ),
-        (
-            r"(?s)-----BEGIN [A-Z0-9 ]{0,32}PRIVATE KEY(?: BLOCK)?-----.*",
-            "[REDACTED_PRIVATE_KEY]",
-        ),
-        # Anthropic / OpenAI key shapes.
-        (r"(?i)\b(sk-ant-[A-Za-z0-9_-]{20,})\b", "[REDACTED_ANTHROPIC_KEY]"),
-        (r"(?i)\b(sk(?:-proj)?-[A-Za-z0-9_-]{20,})\b", "[REDACTED_OPENAI_KEY]"),
-        # Google API keys, GitHub tokens (classic + fine-grained), Slack
-        # tokens, AWS access key IDs (AKIA… and temporary ASIA…). Neither a
-        # leading nor a trailing word boundary here: a token glued to a
-        # surrounding run ("xxxxghp_…", "ghp_…bbbb" in a flushed hold-back
-        # buffer) must still redact, and a bounded {m,n} run can never reach
-        # a boundary inside a longer run — for these shapes a false positive
-        # is cheaper than a leak. The sk- family keeps its boundaries: it is
-        # unbounded so it always reaches one, and "risk-"/"task-" prose
-        # prefixes would otherwise match.
-        (r"(AIza[0-9A-Za-z_-]{30,250})", "[REDACTED_GOOGLE_KEY]"),
-        (r"(gh[pousr]_[A-Za-z0-9]{36,255})", "[REDACTED_GITHUB_TOKEN]"),
-        (r"(xox[bpars]-[0-9A-Za-z-]{10,250})", "[REDACTED_SLACK_TOKEN]"),
-        (r"(?i)((?:AKIA|ASIA)[0-9A-Z.]{6,})\b", "[REDACTED_AWS_KEY]"),
-        # Bearer tokens and label=value secret assignments.
-        (r"(?i)(\bBearer\s+)([A-Za-z0-9._\-]{16,})\b", r"\1[REDACTED]"),
-        (
-            r"(?i)(\b(?:token|secret|password|api[_-]?key|passwd)\s*[:=]\s*[\"']?)([^\s\"']{8,})",
-            r"\1[REDACTED]",
-        ),
-    )
-)
-
-# Marker prefixes that could still grow into one of SECRET_SHAPES. Used by
-# the streaming hold-back buffer (ui_chat) and the secret-safe preview cap
-# (ui_security) so a secret split across a boundary can never reassemble or
-# survive as a visible prefix.
-SECRET_START_RE: re.Pattern[str] = re.compile(
-    r"(?i)(?:"
-    r"sk-(?:ant-|proj-)?"
-    r"|aiza"
-    r"|(?:akia|asia)"
-    r"|gh[pousr]_"
-    r"|xox[bpars]-"
-    r"|-----begin"
-    r"|bearer\s+[a-z0-9._\-]{0,16}"
-    r"|(?:api[_-]?key|password|passwd|pwd|secret|token)[\"']?\s*[:=]"
-    r")"
-)
-
-
 def redact_output(text: str) -> str:
-    """Best-effort redaction of secret-looking substrings in command output.
-
-    The shape list is SECRET_SHAPES above — the single canonical table shared
-    with the browser surfaces (ui_security, ui_chat). Add shapes there, not
-    here.
-    """
+    """Best-effort redaction of secret-looking substrings in command output."""
     if not text:
         return ""
+    # Redact common secret shapes: long hex/base64 strings after key/token-like
+    # labels, Bearer tokens, sk-... / sk-proj-... OpenAI keys, AKIA... AWS keys.
+    patterns: list[tuple[str, str]] = [
+        (r"(?i)\b(sk(?:-proj)?-[A-Za-z0-9_-]{20,})\b", "[REDACTED_OPENAI_KEY]"),
+        (r"(?i)\b(AKIA[0-9A-Z.]{6,})\b", "[REDACTED_AWS_KEY]"),
+        (r"(?i)\b(AKIA[0-9A-Z]{16})\b", "[REDACTED_AWS_KEY]"),
+        (r"(?i)(\bBearer\s+)([A-Za-z0-9._\-]{16,})\b", r"\1[REDACTED]"),
+        (r"(?i)(\b(?:token|secret|password|api[_-]?key|passwd)\s*[:=]\s*[\"']?)([^\s\"']{8,})", r"\1[REDACTED]"),
+    ]
     out = text
-    for pattern, replacement in SECRET_SHAPES:
-        out = pattern.sub(replacement, out)
+    for pattern, repl in patterns:
+        out = re.sub(pattern, repl, out)
     return out
 
 

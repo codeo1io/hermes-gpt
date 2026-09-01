@@ -40,6 +40,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -320,9 +321,10 @@ _SSE_HOLD_BACK_CHARS = 256
 # Upper bound on how much text may be held back: a run of secret-looking
 # text longer than this is flushed anyway, bounding worst-case added latency.
 _SSE_MAX_HOLD_CHARS = 1024
-# Single source (B1): the same markers operator_policy.SECRET_SHAPES can
-# grow into, re-exported through the ui_security boundary.
-_SECRET_START_RE = ui_security.SECRET_START_RE
+_SECRET_START_RE = re.compile(
+    r"(?i)(?:sk-|akia|bearer\s+|(?:api[_-]?key|password|passwd|pwd|secret|token)"
+    r"[\"']?\s*[:=]|-----begin)"
+)
 
 
 class _DeltaRedactor:
@@ -339,16 +341,12 @@ class _DeltaRedactor:
         self._pending += delta
         emit, self._pending = self._split_safe(self._pending)
         if emit:
-            # B7: Turn.publish is the single redaction chokepoint — emitting
-            # raw here means each delta is redacted exactly once (content mode
-            # for token/reasoning events). Pre-redacting here redacted twice
-            # and doubled the cost of every streamed character.
-            self._turn.publish(self._event, {"delta": emit})
+            self._turn.publish(self._event, {"delta": _redact_content_text(emit)})
 
     def flush(self) -> None:
         if self._pending:
             pending, self._pending = self._pending, ""
-            self._turn.publish(self._event, {"delta": pending})
+            self._turn.publish(self._event, {"delta": _redact_content_text(pending)})
 
     @staticmethod
     def _split_safe(buffer: str) -> tuple[str, str]:

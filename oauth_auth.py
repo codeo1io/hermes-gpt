@@ -656,15 +656,7 @@ def _client_credentials(request: Request, form: dict[str, list[str]]) -> tuple[s
 
 def _authenticate_client(request: Request, form: dict[str, list[str]], state: OAuthState) -> str:
     client_id, client_secret = _client_credentials(request, form)
-    # B4: non-ASCII credentials used to raise TypeError inside
-    # hmac.compare_digest and surface as a 500 on /oauth/token. Malformed
-    # credentials are a client error — reject them before any comparison.
-    for credential in (client_id, client_secret):
-        if credential and not credential.isascii():
-            raise OAuthError("invalid_client", "Invalid OAuth client credentials.", status_code=400)
-    if not hmac.compare_digest(
-        client_id.encode("utf-8"), state.config.client_id.encode("utf-8")
-    ):
+    if not hmac.compare_digest(client_id, state.config.client_id):
         raise OAuthError("invalid_client", "Invalid OAuth client credentials.", status_code=401)
     grant_type = _form_value(form, "grant_type")
     # Public PKCE clients (e.g. ChatGPT connectors) send no client_secret.
@@ -683,9 +675,7 @@ def _authenticate_client(request: Request, form: dict[str, list[str]], state: OA
         )
     ):
         return client_id
-    if not hmac.compare_digest(
-        client_secret.encode("utf-8"), state.config.client_secret.encode("utf-8")
-    ):
+    if not hmac.compare_digest(client_secret, state.config.client_secret):
         raise OAuthError("invalid_client", "Invalid OAuth client credentials.", status_code=401)
     return client_id
 
