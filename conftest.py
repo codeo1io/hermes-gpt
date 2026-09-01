@@ -22,6 +22,10 @@ _ISOLATED_ENV_VARS = (
     "HERMES_GPT_OPERATOR_ALLOWED_PROFILES",
     "HERMES_GPT_OWNER_ACK",
     "HERMES_GPT_OWNER_ACTIVE",
+    # Runner confinement is a host deployment posture (this host exports it
+    # with bwrap installed); tests that exercise confinement set it
+    # explicitly, so the suite must not inherit the invoking shell's flag.
+    "HERMES_GPT_ENABLE_RUNNER_CONFINEMENT",
     "HERMES_GPT_ENABLE_CODEX_RUNNER",
     "HERMES_GPT_ALLOW_CODEX_WRITE",
     "HERMES_GPT_CODEX_TOOLSET",

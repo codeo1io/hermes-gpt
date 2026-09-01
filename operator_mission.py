@@ -860,10 +860,17 @@ def _profile_summary(profile: str, root: Path | None, warnings: list[str]) -> di
     try:
         cfg = op_diag._read_config_safe(home)
         if isinstance(cfg, dict):
-            model = cfg.get("model")
-            provider = cfg.get("provider")
-            model = str(model) if isinstance(model, str) and model else None
-            provider = str(provider) if isinstance(provider, str) and provider else None
+            raw_model = cfg.get("model")
+            if isinstance(raw_model, dict):
+                model_value = raw_model.get("default")
+                provider_value = raw_model.get("provider") or cfg.get("provider")
+            else:
+                # Backward compatibility for older Hermes configs that stored
+                # model/provider as top-level scalar values.
+                model_value = raw_model
+                provider_value = cfg.get("provider")
+            model = str(model_value) if isinstance(model_value, str) and model_value else None
+            provider = str(provider_value) if isinstance(provider_value, str) and provider_value else None
     except Exception:
         pass
 
