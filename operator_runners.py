@@ -262,6 +262,7 @@ def _minimal_child_env() -> dict[str, str]:
         "TERM",
         "PYTHONIOENCODING",
         "PI_CODING_AGENT_DIR",
+        "LD_LIBRARY_PATH",
         "APPDATA",
         "LOCALAPPDATA",
         "USERPROFILE",
