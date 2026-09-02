@@ -586,15 +586,13 @@ def _observation_is_fresh_for_cancellation(stored: dict[str, Any], observed: dic
     # started before the claim, so the cancellation had nothing left to target.
     started_at = ordered_time(observed.get("started_at")) or ordered_time(observed.get("dispatched_at"))
     watermark = str(stored.get("cancellation_observation_sha256") or "")
-    if (
+    return bool(
         terminal_at is not None
         and started_at is not None
         and started_at <= claimed_at
         and watermark
         and watermark == _observation_sha256(observed)
-    ):
-        return True
-    return False
+    )
 
 
 def _manifest_row(db: sqlite3.Connection, delegation_id: str) -> dict[str, Any]:
@@ -1593,8 +1591,8 @@ __all__ = [
     "DELEGATION_SCHEMA",
     "SCHEMA_VERSION",
     "STATES",
-    "hermes_delegation_cancel",
     "contain_mission_delegations",
+    "hermes_delegation_cancel",
     "hermes_delegation_dispatch",
     "hermes_delegation_force_terminal",
     "hermes_delegation_get",
