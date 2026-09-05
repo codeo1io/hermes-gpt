@@ -31,6 +31,8 @@ OAUTH_CLIENT_ID_ENV = "HERMES_GPT_OAUTH_CLIENT_ID"
 OAUTH_CLIENT_SECRET_ENV = "HERMES_GPT_OAUTH_CLIENT_SECRET"
 OAUTH_REDIRECT_URI_ENV = "HERMES_GPT_OAUTH_REDIRECT_URI"
 OAUTH_SCOPE_ENV = "HERMES_GPT_OAUTH_SCOPE"
+OAUTH_PKCE_MODE_ENV = "HERMES_GPT_OAUTH_PKCE_MODE"
+_PKCE_MODES = ("required", "optional")
 _PKCE_VALUE = re.compile(r"^[A-Za-z0-9._~-]{43,128}$")
 _CLIENT_SECRET = re.compile(r"^[A-Za-z0-9._~-]{43,128}$")
 _BASE64URL = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -91,8 +93,11 @@ class OAuthConfig:
     client_secret: str
     redirect_uris: tuple[str, ...]
     scope: str = "hermes"
+    pkce_mode: str = "required"
 
     def __post_init__(self) -> None:
+        if self.pkce_mode not in _PKCE_MODES:
+            raise ValueError(f"pkce_mode must be one of {_PKCE_MODES}: {self.pkce_mode!r}")
         issuer = self.issuer.rstrip("/")
         parsed = urllib.parse.urlparse(issuer)
         if parsed.scheme != "https" and parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
@@ -282,6 +287,7 @@ class OAuthState:
         client_id: str,
         redirect_uri: str,
         code_verifier: str,
+        confidential: bool = False,
     ) -> dict[str, Any]:
         self.cleanup()
         item = self._decode_authorization_code(code)
@@ -291,13 +297,19 @@ class OAuthState:
         if item.get("client_id") != client_id or item.get("redirect_uri") != redirect_uri:
             raise OAuthError("invalid_grant", "Authorization code validation failed.")
         challenge = item.get("code_challenge", "")
-        # PKCE is mandatory: a code without a stored S256 challenge (e.g. one
-        # issued before PKCE enforcement, or by a bypassed authorize path) can
-        # never be exchanged — fail closed instead of skipping verification.
-        if not challenge:
+        # PKCE verification is mode-dependent. "required" (default): a code
+        # without a stored S256 challenge (e.g. issued before PKCE
+        # enforcement, or by a bypassed authorize path) can never be exchanged
+        # — fail closed instead of skipping verification. "optional": a
+        # challenge-less code (pre-2026-08-31 compat) is only redeemable by a
+        # confidential client — the token endpoint authenticates it with the
+        # client_secret (see _authenticate_client / the ``confidential``
+        # argument); a public/secretless client must always redeem via PKCE.
+        if not challenge and (self.config.pkce_mode != "optional" or not confidential):
             raise OAuthError("invalid_grant", "Authorization code validation failed.")
-        if not _valid_pkce_verifier(code_verifier) or not hmac.compare_digest(_s256(code_verifier), challenge):
-            raise OAuthError("invalid_grant", "Authorization code validation failed.")
+        if challenge:
+            if not _valid_pkce_verifier(code_verifier) or not hmac.compare_digest(_s256(code_verifier), challenge):
+                raise OAuthError("invalid_grant", "Authorization code validation failed.")
 
         scope = self.normalize_scope(item["scope"])
         self._require_capacity(self.used_auth_codes, self.max_auth_codes, "Authorization-code replay cache")
@@ -443,6 +455,7 @@ def config_from_env() -> OAuthConfig | None:
         client_secret=required[OAUTH_CLIENT_SECRET_ENV],
         redirect_uris=redirects,
         scope=os.environ.get(OAUTH_SCOPE_ENV, "hermes").strip() or "hermes",
+        pkce_mode=os.environ.get(OAUTH_PKCE_MODE_ENV, "required").strip().lower() or "required",
     )
 
 
@@ -609,14 +622,29 @@ def authorize(request: Request, state: OAuthState) -> JSONResponse | RedirectRes
             raise OAuthError("invalid_target", "Requested resource is not supported.")
         challenge = params.get("code_challenge", "")
         method = params.get("code_challenge_method", "")
-        # PKCE is mandatory at authorization: every issued code is bound to
-        # an S256 challenge, so a stolen/intercepted code cannot be redeemed
-        # without the verifier (RFC 7636; public clients have no secret to
-        # authenticate with, the challenge IS the client authentication).
-        if not challenge or method != "S256" or not _PKCE_VALUE.fullmatch(challenge):
-            raise OAuthError(
-                "invalid_request", "A valid S256 code_challenge (PKCE) is required."
-            )
+        # PKCE policy is mode-dependent. "required" (default): every code is
+        # bound to an S256 challenge, so a stolen/intercepted code cannot be
+        # redeemed without the verifier (RFC 7636; public clients have no
+        # secret to authenticate with, the challenge IS the client
+        # authentication). "optional": pre-2026-08-31 compat — challenge-less
+        # authorize is accepted (the code is redeemed confidentially with the
+        # client_secret at the token endpoint, see _authenticate_client), a
+        # supplied challenge must still be valid S256, and method-without-
+        # challenge is rejected.
+        if state.config.pkce_mode == "optional":
+            if challenge and (method != "S256" or not _PKCE_VALUE.fullmatch(challenge)):
+                raise OAuthError(
+                    "invalid_request", "Only a valid S256 PKCE challenge is supported."
+                )
+            if method and not challenge:
+                raise OAuthError(
+                    "invalid_request", "code_challenge is required when a method is supplied."
+                )
+        else:
+            if not challenge or method != "S256" or not _PKCE_VALUE.fullmatch(challenge):
+                raise OAuthError(
+                    "invalid_request", "A valid S256 code_challenge (PKCE) is required."
+                )
         code = state.issue_authorization_code(
             client_id=client_id,
             redirect_uri=redirect_uri,
@@ -724,6 +752,7 @@ async def token(request: Request, state: OAuthState) -> JSONResponse:
                 client_id=client_id,
                 redirect_uri=_form_value(form, "redirect_uri"),
                 code_verifier=_form_value(form, "code_verifier"),
+                confidential=bool(_form_value(form, "client_secret")),
             )
         else:
             refresh_token = _form_value(form, "refresh_token")
