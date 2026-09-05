@@ -64,6 +64,31 @@ def test_workspace_read_refuses_denied_path(workspace_tree, clean_env, audit_ove
     assert "denied" in parsed["error"].lower()
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        "server.pem",
+        "bundle.p12",
+        "bundle.pfx",
+        "database.kdbx",
+        "id_ecdsa",
+        "id_dsa",
+        "app.env",
+        "production.env",
+        "settings.env",
+    ],
+)
+def test_workspace_read_refuses_secret_key_material(workspace_tree, clean_env, audit_override, name):
+    """A1: private-key/certificate containers and *.env basenames stay denied
+    end-to-end (through the operator read surface), not only at policy level."""
+    secret = workspace_tree / name
+    secret.write_text("material", encoding="utf-8")
+    out = ows.hermes_workspace_read(path=str(secret))
+    parsed = json.loads(out)
+    assert parsed["success"] is False
+    assert "denied" in parsed["error"].lower()
+
+
 def test_workspace_read_allows_normal_path(workspace_tree, clean_env, audit_override):
     out = ows.hermes_workspace_read(path=str(workspace_tree / "README.md"))
     parsed = json.loads(out)

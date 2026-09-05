@@ -291,9 +291,13 @@ class OAuthState:
         if item.get("client_id") != client_id or item.get("redirect_uri") != redirect_uri:
             raise OAuthError("invalid_grant", "Authorization code validation failed.")
         challenge = item.get("code_challenge", "")
-        if challenge:
-            if not _valid_pkce_verifier(code_verifier) or not hmac.compare_digest(_s256(code_verifier), challenge):
-                raise OAuthError("invalid_grant", "Authorization code validation failed.")
+        # PKCE is mandatory: a code without a stored S256 challenge (e.g. one
+        # issued before PKCE enforcement, or by a bypassed authorize path) can
+        # never be exchanged — fail closed instead of skipping verification.
+        if not challenge:
+            raise OAuthError("invalid_grant", "Authorization code validation failed.")
+        if not _valid_pkce_verifier(code_verifier) or not hmac.compare_digest(_s256(code_verifier), challenge):
+            raise OAuthError("invalid_grant", "Authorization code validation failed.")
 
         scope = self.normalize_scope(item["scope"])
         self._require_capacity(self.used_auth_codes, self.max_auth_codes, "Authorization-code replay cache")
@@ -605,10 +609,14 @@ def authorize(request: Request, state: OAuthState) -> JSONResponse | RedirectRes
             raise OAuthError("invalid_target", "Requested resource is not supported.")
         challenge = params.get("code_challenge", "")
         method = params.get("code_challenge_method", "")
-        if challenge and (method != "S256" or not _PKCE_VALUE.fullmatch(challenge)):
-            raise OAuthError("invalid_request", "Only a valid S256 PKCE challenge is supported.")
-        if method and not challenge:
-            raise OAuthError("invalid_request", "code_challenge is required when a method is supplied.")
+        # PKCE is mandatory at authorization: every issued code is bound to
+        # an S256 challenge, so a stolen/intercepted code cannot be redeemed
+        # without the verifier (RFC 7636; public clients have no secret to
+        # authenticate with, the challenge IS the client authentication).
+        if not challenge or method != "S256" or not _PKCE_VALUE.fullmatch(challenge):
+            raise OAuthError(
+                "invalid_request", "A valid S256 code_challenge (PKCE) is required."
+            )
         code = state.issue_authorization_code(
             client_id=client_id,
             redirect_uri=redirect_uri,
@@ -648,18 +656,36 @@ def _client_credentials(request: Request, form: dict[str, list[str]]) -> tuple[s
 
 def _authenticate_client(request: Request, form: dict[str, list[str]], state: OAuthState) -> str:
     client_id, client_secret = _client_credentials(request, form)
-    if not hmac.compare_digest(client_id, state.config.client_id):
+    # B4: non-ASCII credentials used to raise TypeError inside
+    # hmac.compare_digest and surface as a 500 on /oauth/token. Malformed
+    # credentials are a client error — reject them before any comparison.
+    for credential in (client_id, client_secret):
+        if credential and not credential.isascii():
+            raise OAuthError("invalid_client", "Invalid OAuth client credentials.", status_code=400)
+    if not hmac.compare_digest(
+        client_id.encode("utf-8"), state.config.client_id.encode("utf-8")
+    ):
         raise OAuthError("invalid_client", "Invalid OAuth client credentials.", status_code=401)
     grant_type = _form_value(form, "grant_type")
     # Public PKCE clients (e.g. ChatGPT connectors) send no client_secret.
-    # Allow secretless auth for authorization_code with a code_verifier, or
-    # refresh_token grants; everything else still requires the secret.
+    # Secretless auth is only accepted for authorization_code grants that
+    # carry a syntactically valid PKCE verifier — and that verifier is then
+    # REQUIRED to match the S256 challenge stored in the authorization code
+    # (see exchange_authorization_code), so the absence of a client_secret
+    # never bypasses client authentication. Refresh-token grants stay
+    # secretless; refresh tokens are only issued to clients that already
+    # completed a verified PKCE exchange.
     if not client_secret and (
         grant_type == "refresh_token"
-        or (grant_type == "authorization_code" and _form_value(form, "code_verifier"))
+        or (
+            grant_type == "authorization_code"
+            and _valid_pkce_verifier(_form_value(form, "code_verifier"))
+        )
     ):
         return client_id
-    if not hmac.compare_digest(client_secret, state.config.client_secret):
+    if not hmac.compare_digest(
+        client_secret.encode("utf-8"), state.config.client_secret.encode("utf-8")
+    ):
         raise OAuthError("invalid_client", "Invalid OAuth client credentials.", status_code=401)
     return client_id
 

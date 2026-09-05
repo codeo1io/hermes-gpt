@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import hashlib
 import json
 import os
 import sqlite3
@@ -386,6 +388,11 @@ def test_http_asgi_app_exposes_confidential_oauth_and_protects_mcp(monkeypatch):
                 "redirect_uri": "https://chatgpt.com/connector/oauth/callback",
                 "scope": "openid hermes offline_access",
                 "resource": "https://mcp.example.com/mcp",
+                # PKCE (RFC 7636) is mandatory at the authorize endpoint.
+                "code_challenge": base64.urlsafe_b64encode(
+                    hashlib.sha256(b"a" * 64).digest()
+                ).rstrip(b"=").decode(),
+                "code_challenge_method": "S256",
             },
             follow_redirects=False,
         )
@@ -400,6 +407,7 @@ def test_http_asgi_app_exposes_confidential_oauth_and_protects_mcp(monkeypatch):
                 "client_secret": "test-client-secret-0123456789-ABCDEFGHIJKLMNOPQRSTUVWXYZ",
                 "code": code,
                 "redirect_uri": "https://chatgpt.com/connector/oauth/callback",
+                "code_verifier": "a" * 64,
             },
         ).json()
         authenticated = client.post(
