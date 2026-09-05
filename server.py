@@ -1738,13 +1738,14 @@ def hermes_cron_status(profile: str = "default") -> str:
     return op_cron.hermes_cron_status(profile=profile, hermes_root=_default_hermes_root())
 
 
-def hermes_cron_run(
+async def hermes_cron_run(
     profile: str = "default",
     job_id: str = "",
     dry_run: bool = True,
     timeout: int = 1800,
 ) -> str:
-    return op_cron.hermes_cron_run(
+    return await asyncio.to_thread(
+        op_cron.hermes_cron_run,
         profile=profile, job_id=job_id, dry_run=dry_run, timeout=timeout,
         hermes_root=_default_hermes_root(),
     )
@@ -1976,8 +1977,9 @@ def hermes_workspace_write_file(path: str, content: str, dry_run: bool = True) -
     )
 
 
-def hermes_workspace_run_test(command: str, workdir: str | None = None, timeout: int = 120, dry_run: bool = True) -> str:
-    return op_workspace.hermes_workspace_run_test(
+async def hermes_workspace_run_test(command: str, workdir: str | None = None, timeout: int = 120, dry_run: bool = True) -> str:
+    return await asyncio.to_thread(
+        op_workspace.hermes_workspace_run_test,
         command=command, workdir=workdir, timeout=timeout, dry_run=dry_run,
     )
 
@@ -1990,8 +1992,9 @@ def hermes_git_diff(workdir: str, pathspec: str | None = None, stat: bool = Fals
     return op_workspace.hermes_git_diff(workdir=workdir, pathspec=pathspec, stat=stat)
 
 
-def hermes_owner_run_command(command: str, timeout: int = 120, workdir: str | None = None, dry_run: bool = True) -> str:
-    return op_workspace.hermes_owner_run_command(
+async def hermes_owner_run_command(command: str, timeout: int = 120, workdir: str | None = None, dry_run: bool = True) -> str:
+    return await asyncio.to_thread(
+        op_workspace.hermes_owner_run_command,
         command=command, timeout=timeout, workdir=workdir, dry_run=dry_run,
     )
 
@@ -2024,17 +2027,21 @@ def hermes_codex_plan(prompt: str, workdir: str, sandbox: str = "read-only", mod
     return op_codex.hermes_codex_plan(prompt, workdir, sandbox, model, ignore_user_config, timeout, execution_mode=execution_mode)
 
 
-def hermes_codex_start(prompt: str, workdir: str, sandbox: str = "read-only", model: str | None = None,
+async def hermes_codex_start(prompt: str, workdir: str, sandbox: str = "read-only", model: str | None = None,
                        ignore_user_config: bool = False, timeout: int = 900, confirm: bool = False,
                        dry_run: bool = True, execution_mode: str = "normal") -> dict[str, Any]:
-    return op_codex.hermes_codex_start(prompt, workdir, sandbox, model, ignore_user_config, timeout, confirm, dry_run,
-                                       _default_hermes_root(), execution_mode=execution_mode)
+    return await asyncio.to_thread(
+        op_codex.hermes_codex_start, prompt, workdir, sandbox, model, ignore_user_config, timeout, confirm, dry_run,
+        _default_hermes_root(), execution_mode=execution_mode,
+    )
 
 
-def hermes_codex_review_start(workdir: str, target: str = "uncommitted", instructions: str = "", model: str | None = None,
+async def hermes_codex_review_start(workdir: str, target: str = "uncommitted", instructions: str = "", model: str | None = None,
                               ignore_user_config: bool = False, timeout: int = 900, confirm: bool = False,
                               dry_run: bool = True) -> dict[str, Any]:
-    return op_codex.hermes_codex_review_start(workdir, target, instructions, model, ignore_user_config, timeout, confirm, dry_run, _default_hermes_root())
+    return await asyncio.to_thread(
+        op_codex.hermes_codex_review_start, workdir, target, instructions, model, ignore_user_config, timeout, confirm, dry_run, _default_hermes_root()
+    )
 
 
 def hermes_codex_jobs(limit: int = 50) -> dict[str, Any]:
@@ -2066,14 +2073,15 @@ def hermes_job_status(job_id: str, cursor: int = 0, max_lines: int = 50) -> str:
     )
 
 
-def hermes_job_wait(
+async def hermes_job_wait(
     job_id: str,
     cursor: int = 0,
     wait_seconds: int = op_jobs.MAX_WAIT_SECONDS,
     max_lines: int = 50,
 ) -> str:
     """Long-poll durable job state for up to 120 seconds and return early on terminal state."""
-    return op_jobs.hermes_job_wait(
+    return await asyncio.to_thread(
+        op_jobs.hermes_job_wait,
         job_id,
         cursor=cursor,
         wait_seconds=wait_seconds,
