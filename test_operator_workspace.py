@@ -307,6 +307,37 @@ def test_gateway_status_no_pid_file(tmp_path, clean_env, audit_override):
     assert parsed["gateway_pid"] is None
 
 
+def test_gateway_status_json_pid_file_wins_over_poisoned_state_file(
+    tmp_path, clean_env, audit_override
+):
+    # Incident 2026-09-05 21:40: a pytest run (fake feishu adapter writing the
+    # real ~/.hermes) overwrote gateway_state.json with its own dead pid while
+    # gateway.pid still held the live pid. The bare-int-only parser could not
+    # use gateway.pid, so status fell back to the poisoned state file and
+    # reported gateway_running=false for a healthy gateway.
+    (tmp_path / "gateway.pid").write_text(
+        json.dumps({"pid": os.getpid(), "kind": "hermes-gateway"}),
+        encoding="utf-8",
+    )
+    (tmp_path / "gateway_state.json").write_text(
+        json.dumps(
+            {
+                "pid": 999999,  # dead/poisoned writer
+                "kind": "hermes-gateway",
+                "gateway_state": "running",
+                "platforms": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    out = ows.hermes_gateway_status(profile="default", hermes_root=tmp_path)
+    parsed = json.loads(out)
+    assert parsed["success"] is True
+    assert parsed["gateway_running"] is True
+    assert parsed["gateway_pid"] == os.getpid()
+    assert parsed["gateway_pid_source"] == "gateway.pid"
+
+
 def test_gateway_status_with_state_file(tmp_path, clean_env, audit_override):
     (tmp_path / "gateway_state.json").write_text(
         json.dumps({"telegram": {"connected": True}, "discord": {"connected": False}}),

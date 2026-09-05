@@ -117,10 +117,12 @@ def _read_gateway_state(state_path: Path) -> dict[str, Any]:
 
 
 def _read_gateway_pid_from_pid_file(pid_path: Path) -> int | None:
-    """Read gateway.pid as a plain integer.
+    """Read gateway.pid as a bare integer or a JSON object with a "pid" key.
 
-    Older Hermes Gateway versions store only a raw PID here.
-    If the file is absent, empty, or not parseable, return None.
+    Current Hermes Gateway versions write a JSON record here ({"pid": ...,
+    "kind": ...}); older ones stored a raw PID. Returns None when absent,
+    empty, or unparsable so callers fall back to gateway_state.json.
+    Mirrors operator_diagnostics._read_gateway_pid.
     """
     if not pid_path.exists():
         return None
@@ -128,8 +130,17 @@ def _read_gateway_pid_from_pid_file(pid_path: Path) -> int | None:
         raw = pid_path.read_text(encoding="utf-8").strip()
         if not raw:
             return None
-        return int(raw)
-    except (OSError, ValueError):
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+        obj = json.loads(raw)
+        if isinstance(obj, dict):
+            obj_pid = obj.get("pid")
+            if isinstance(obj_pid, int) and obj_pid > 0:
+                return obj_pid
+        return None
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return None
 
 
