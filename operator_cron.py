@@ -948,12 +948,23 @@ def hermes_cron_create(
             or "cron job"
         )
 
+        # Hermes' scheduler consumes the canonical structured schedule shape.
+        # Persisting the raw user string here creates a job that lists correctly
+        # but crashes during claim/run when scheduler code calls schedule.get().
+        # Use the same parser as the native cron implementation so operator-
+        # created jobs are schema-compatible with jobs created by Hermes itself.
+        from cron.jobs import parse_schedule
+
+        parsed_schedule = parse_schedule(schedule)
+        if not parsed_schedule:
+            raise ValueError(f"Invalid schedule: {schedule!r}")
+
         new_job: dict[str, Any] = {
             "id": new_id,
             "name": job_name,
             "prompt": prompt,
-            "schedule": schedule,
-            "schedule_display": schedule,
+            "schedule": parsed_schedule,
+            "schedule_display": str(parsed_schedule.get("display") or schedule),
             "skills": skills or [],
             "deliver": deliver or "local",
             "enabled": True,

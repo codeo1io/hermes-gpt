@@ -669,6 +669,15 @@ def test_cron_create_direct_writes_job(hermes_root, clean_env, audit_override, m
     assert job["name"] == "daily-brief"
     assert job["schedule"] == "0 9 * * *"
     assert job["enabled"] is True
+
+    # Operator-created jobs must persist the same structured schedule schema
+    # consumed by the native scheduler; raw strings crash claim/run paths.
+    jobs = oc._read_jobs(hermes_root)
+    assert jobs[0]["schedule"] == {
+        "kind": "cron",
+        "expr": "0 9 * * *",
+        "display": "0 9 * * *",
+    }
     assert job["state"] == "scheduled"
 
     # Verify the job was written to disk.
