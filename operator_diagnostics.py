@@ -362,7 +362,21 @@ def _check_gateway_status(profile_home: Path) -> dict[str, Any]:
     extra = {"pid": pid, "running": running, "pid_source": pid_source}
     if heartbeat_mtime is not None:
         extra["heartbeat_mtime"] = heartbeat_mtime
-    extra.update(_gateway_state_summary(profile_home))
+    state_summary = _gateway_state_summary(profile_home)
+    extra.update(state_summary)
+
+    # A live PID proves the process exists, but a corrupt state file means the
+    # operator cannot trust the gateway's persisted runtime state. Surface that
+    # as degraded health rather than a false-positive PASS.
+    if state_summary.get("parse_error"):
+        return _check_result(
+            status=STATUS_WARN,
+            layer="gateway",
+            code="GATEWAY_STATE_UNREADABLE",
+            message="Gateway process is alive but gateway_state.json could not be parsed.",
+            suggested_action="Repair or refresh gateway_state.json before treating gateway health as fully verified.",
+            extra=extra,
+        )
 
     return _check_result(
         status=STATUS_PASS,
