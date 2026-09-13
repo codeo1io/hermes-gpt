@@ -275,6 +275,19 @@ def test_dynamic_client_registry_survives_state_serialization(client: TestClient
     assert "code=" in response.headers["location"]
 
 
+def test_dynamic_client_registry_survives_disk_restart(tmp_path):
+    root = tmp_path / "hermes"
+    state1 = OAuthState(_config())
+    state1.restore_tokens(root)
+    dyn_id = _register(_build(state1)).json()["client_id"]
+    state1.persist_tokens(root)
+
+    state2 = OAuthState(_config())
+    state2.restore_tokens(root)
+    response = _authorize(_build(state2), dyn_id, AIP_REDIRECT)
+    assert "code=" in response.headers["location"]
+
+
 # -- legacy static client unchanged ------------------------------------------
 
 
