@@ -948,6 +948,30 @@ def _command_touches_secrets(command: str) -> bool:
     return any(n in lower for n in needles)
 
 
+def _ensure_operator_tmpdir() -> Path:
+    """Route owner-command scratch away from shared /tmp.
+
+    Subprocesses inherit these variables from the long-running Hermes GPT
+    process, so pytest/tempfile/build scratch lands in a dedicated tree that
+    can be aggressively and safely janitored without guessing /tmp names.
+    """
+    configured = os.getenv("HERMES_GPT_OPERATOR_TMPDIR", "").strip()
+    if configured:
+        tmpdir = Path(configured).expanduser()
+    else:
+        tmpdir = Path.home() / ".hermes" / "tmp" / "operator"
+    tmpdir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        tmpdir.chmod(0o700)
+    except OSError:
+        pass
+    resolved = str(tmpdir.resolve())
+    os.environ["TMPDIR"] = resolved
+    os.environ["TEMP"] = resolved
+    os.environ["TMP"] = resolved
+    return Path(resolved)
+
+
 def _deferred_self_restart_argv(argv: list[str]) -> list[str] | None:
     """Return a delayed systemd command for an exact Hermes GPT self-restart.
 
@@ -1035,6 +1059,8 @@ def hermes_owner_run_command(
             return json.dumps({"success": True, "dry_run": True, "plan": plan}, indent=2)
 
         policy.require_mutation(dry_run)
+        if os.name != "nt":
+            _ensure_operator_tmpdir()
         run_fn = runner or op.run_argv
         rc, out, err = run_fn(effective_argv, timeout=timeout, workdir=workdir)
         result = {

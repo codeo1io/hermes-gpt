@@ -445,6 +445,33 @@ def test_owner_run_command_direct_runs(workspace_tree, clean_env, audit_override
     assert captured["argv"] == ["echo", "hello"]
 
 
+def test_owner_run_command_routes_temp_to_dedicated_operator_root(
+    workspace_tree, clean_env, audit_override, monkeypatch, tmp_path
+):
+    _enable_owner(monkeypatch)
+    target = tmp_path / "operator-tmp"
+    monkeypatch.setenv("HERMES_GPT_OPERATOR_TMPDIR", str(target))
+    captured = {}
+
+    def fake_runner(argv, timeout=120, workdir=None):
+        captured["tmpdir"] = ows.os.environ.get("TMPDIR")
+        captured["temp"] = ows.os.environ.get("TEMP")
+        captured["tmp"] = ows.os.environ.get("TMP")
+        return (0, "ok", "")
+
+    parsed = json.loads(ows.hermes_owner_run_command(
+        command="echo temp-root", dry_run=False, runner=fake_runner,
+    ))
+
+    assert parsed["success"] is True
+    assert target.is_dir()
+    assert captured == {
+        "tmpdir": str(target.resolve()),
+        "temp": str(target.resolve()),
+        "tmp": str(target.resolve()),
+    }
+
+
 def test_owner_run_command_defers_exact_self_restart(workspace_tree, clean_env, audit_override, monkeypatch):
     _enable_owner(monkeypatch)
     captured = {}
