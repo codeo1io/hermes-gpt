@@ -701,6 +701,12 @@ def authorization_metadata(_request: Request, state: OAuthState) -> JSONResponse
             "issuer": issuer,
             "authorization_endpoint": f"{issuer}/oauth/authorize",
             "token_endpoint": f"{issuer}/oauth/token",
+            # RFC 7591: openai-mcp (ChatGPT connectors) polls this document
+            # specifically for the registration endpoint; without it a
+            # credential-less connector loops discovery->401 forever and can
+            # never onboard.  The endpoint itself is public and rate-bounded
+            # (see register_client).
+            "registration_endpoint": f"{issuer}/oauth/register",
             "response_types_supported": ["code"],
             "grant_types_supported": ["authorization_code", "refresh_token"],
             "token_endpoint_auth_methods_supported": ["client_secret_post", "client_secret_basic", "none"],

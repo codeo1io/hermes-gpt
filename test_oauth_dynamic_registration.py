@@ -123,6 +123,39 @@ def _exchange(client: TestClient, code: str, redirect: str, client_id: str = "")
 # -- registration endpoint -------------------------------------------------
 
 
+def test_metadata_advertises_registration_endpoint(client: TestClient):
+    """2026-09-13 outage: the discovery doc omitted registration_endpoint.
+
+    A credential-less ChatGPT connector polls
+    ``/.well-known/oauth-authorization-server`` specifically for
+    ``registration_endpoint``; with it missing the connector loops
+    discovery -> 401 forever and can never onboard even though
+    ``/oauth/register`` was live (verified live: loop ran since the
+    2026-09-10 cutover; endpoint answered 201 on direct probe).
+    """
+    from oauth_auth import authorization_metadata
+
+    app = Starlette(
+        routes=[
+            Route(
+                "/.well-known/oauth-authorization-server",
+                lambda request: authorization_metadata(request, OAuthState(_config())),
+                methods=["GET"],
+            )
+        ]
+    )
+    probe = TestClient(app)
+    response = probe.get("/.well-known/oauth-authorization-server")
+    assert response.status_code == 200
+    metadata = response.json()
+    assert metadata["registration_endpoint"] == f"{ISSUER}/oauth/register"
+    assert metadata["authorization_endpoint"] == f"{ISSUER}/oauth/authorize"
+    assert metadata["token_endpoint"] == f"{ISSUER}/oauth/token"
+    # every advertised endpoint is absolutely derived from the issuer
+    for key in ("authorization_endpoint", "token_endpoint", "registration_endpoint"):
+        assert metadata[key].startswith(f"{ISSUER}/")
+
+
 def test_register_mints_dynamic_public_client(client: TestClient):
     response = _register(client)
     assert response.status_code == 201, response.text
