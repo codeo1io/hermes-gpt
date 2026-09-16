@@ -1,10 +1,21 @@
 name: CI
 
+# One CI run per branch: pull_request fires for the PR branch, and push
+# covers only master (the merge destination). Without the branch filter
+# every PR update fired the full matrix twice - once for the push, once
+# for the pull_request event - doubling pool occupancy (U104).
 on:
   push:
+    branches: [master]
   pull_request:
   workflow_dispatch:
   workflow_call:
+
+# A newer run for the same branch supersedes and cancels the one in
+# flight instead of stacking another full matrix onto the pool.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
