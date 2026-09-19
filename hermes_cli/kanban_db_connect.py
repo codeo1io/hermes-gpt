@@ -726,7 +726,11 @@ def _ensure_test_isolation(path: Path) -> None:
     production = (
         parts == ("kanban.db",)
         or (len(parts) >= 2 and parts[0] == "kanban")
-        or (len(parts) == 3 and parts[0] == "profiles")
+        # Depth-symmetric with the kanban-root arm above: a profile's board is
+        # BOTH ``profiles/<name>/kanban.db`` and the default-board
+        # ``profiles/<name>/kanban/current`` (4 parts) — an ``==3`` test left the
+        # deeper shape unguarded (2026-09-19).
+        or (len(parts) >= 2 and parts[0] == "profiles")
     )
     if production:
         raise RuntimeError(
@@ -1241,13 +1245,13 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
     (``complete_task`` & co.) must never run under an open outer transaction,
     since those side effects would fire while the outer txn can still roll back.
     """
-    _kb._assert_not_delegated_child_mutation(_main_db_file(conn))
+    db_file = _main_db_file(conn)  # one PRAGMA database_list serves both guards below
+    _kb._assert_not_delegated_child_mutation(db_file)
     # Write-boundary choke (2026-09-18 wave 8): ``connect()``/``init_db()``
     # refuse the production board from a test context, but a conn opened via
     # raw ``sqlite3.connect`` (or opened before this process imported the
     # guard) reaches every write helper here unguarded. The write boundary is
     # the last choke a fixture can hit before touching the live board.
-    db_file = _main_db_file(conn)
     if db_file:
         db_path = Path(db_file).expanduser().resolve()
         # The deny-root is the REAL home (passwd), so a sandbox conn whose

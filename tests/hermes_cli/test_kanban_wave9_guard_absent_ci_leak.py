@@ -30,6 +30,7 @@ This file pins the whole topology against the REAL platform root:
 from __future__ import annotations
 
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -52,7 +53,11 @@ def wave9_ci_topology(_hermetic_environment, monkeypatch, tmp_path):
     HERMES_KANBAN_* pins anywhere (the burst processes carried none)."""
     root = _real_platform_state_root()
     assert root is not None, "platform state root must resolve for this regression"
-    tmpdir = root / "tmp" / "wave9-regression"
+    # Per-run subdir (still UNDER the real root — that topology is the bug):
+    # concurrent checkouts share the real root's tmp tree, so a fixed name
+    # would have two runs sweeping each other's sandboxes. Scoped + swept in
+    # teardown, the incident dir no longer grows ~5 dirs / ~1 MB per run.
+    tmpdir = root / "tmp" / "wave9-regression" / f"run-{os.getpid()}"
     tmpdir.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("TMPDIR", str(tmpdir))
     for var in (
@@ -63,21 +68,22 @@ def wave9_ci_topology(_hermetic_environment, monkeypatch, tmp_path):
         "HERMES_KANBAN_GUARD_BYPASS",
     ):
         monkeypatch.delenv(var, raising=False)
-    return root, tmpdir
+    yield root, tmpdir
+    shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def _sandbox_fixture_dbs(root: Path) -> list[Path]:
-    """The kanban.db files the wave-9 fixtures created under TMPDIR — the only
-    place wave-9 rows may exist. Returns every match."""
+def _sandbox_fixture_dbs(tmpdir: Path) -> list[Path]:
+    """The kanban.db files the wave-9 fixtures created under this run's
+    TMPDIR — the only place wave-9 rows may exist. Returns every match."""
     candidates = sorted(
-        (root / "tmp").glob("wave9-regression/kanban_*_test_*/kanban.db"),
+        tmpdir.glob("kanban_*_test_*/kanban.db"),
         key=lambda p: p.stat().st_mtime,
     )
     assert candidates, "fixtures never created their sandbox DBs"
     return candidates
 
 
-def test_sandbox_under_real_root_resolves_to_itself(wave9_ci_topology):
+def test_sandbox_under_real_root_resolves_to_itself(wave9_ci_topology, monkeypatch):
     """Precondition 2 is dead: HERMES_HOME under the native root (and not a
     ``profiles/<name>`` home) must resolve as its own root, never collapse to
     the production board root."""
@@ -89,23 +95,19 @@ def test_sandbox_under_real_root_resolves_to_itself(wave9_ci_topology):
     root, _ = wave9_ci_topology
     # tempfile caches its tempdir at first use, so set it explicitly to the
     # fixture's TMPDIR — the mkdtemp sandbox must land under the real root.
-    import tempfile
-
-    tempfile.tempdir = os.environ["TMPDIR"]
+    # monkeypatch (not a bare assignment) so an assertion failure cannot leak
+    # the override into whatever runs next in this subprocess.
+    monkeypatch.setattr(tempfile, "tempdir", os.environ["TMPDIR"])
     sandbox = Path(tempfile.mkdtemp(prefix="kanban_per_profile_cap_test_"))
-    tempfile.tempdir = None
     assert sandbox.resolve().is_relative_to(root), "test premise: sandbox under the real root"
-    os.environ["HERMES_HOME"] = str(sandbox)
-    try:
-        resolved_root = get_default_hermes_root()
-        assert resolved_root == sandbox.resolve(), (
-            f"get_default_hermes_root() collapsed {sandbox} onto the real root "
-            f"{resolved_root} — the wave-9 leak is back"
-        )
-        assert kb.kanban_home() == sandbox.resolve()
-        assert kb.kanban_db_path() == sandbox.resolve() / "kanban.db"
-    finally:
-        os.environ.pop("HERMES_HOME", None)
+    monkeypatch.setenv("HERMES_HOME", str(sandbox))
+    resolved_root = get_default_hermes_root()
+    assert resolved_root == sandbox.resolve(), (
+        f"get_default_hermes_root() collapsed {sandbox} onto the real root "
+        f"{resolved_root} — the wave-9 leak is back"
+    )
+    assert kb.kanban_home() == sandbox.resolve()
+    assert kb.kanban_db_path() == sandbox.resolve() / "kanban.db"
 
 
 def test_choke_refuses_live_board_from_test_context(wave9_ci_topology):
@@ -114,10 +116,13 @@ def test_choke_refuses_live_board_from_test_context(wave9_ci_topology):
     from hermes_cli import kanban_db_connect as kbc
 
     root, _ = wave9_ci_topology
-    before = (root / "kanban.db").stat().st_mtime_ns
+    live = root / "kanban.db"
+    if not live.exists():
+        pytest.skip("no live board on this host (not the runner machine)")
+    before = live.stat().st_mtime_ns
     with pytest.raises(RuntimeError, match="test-isolation guard"):
         kbc._ensure_test_isolation(root / "kanban.db")
-    assert (root / "kanban.db").stat().st_mtime_ns == before
+    assert live.stat().st_mtime_ns == before
 
 
 def test_wave9_files_write_zero_live_board_rows_end_to_end(wave9_ci_topology):
@@ -125,7 +130,7 @@ def test_wave9_files_write_zero_live_board_rows_end_to_end(wave9_ci_topology):
     incident topology (TMPDIR under the real root, inherited-by-nothing), must
     pass AND leave the live board byte-identical. Their fixture rows may exist
     only inside the sandbox DB the fixture created."""
-    root, _ = wave9_ci_topology
+    root, tmpdir_of_run = wave9_ci_topology
     live = root / "kanban.db"
     if not live.exists():
         pytest.skip("no live board on this host (not the runner machine)")
@@ -175,7 +180,7 @@ def test_wave9_files_write_zero_live_board_rows_end_to_end(wave9_ci_topology):
     new_rows = [row for row in after_rows if row not in allowed]
     assert not new_rows, f"fixture rows reached the live board: {new_rows}"
 
-    sandbox_dbs = _sandbox_fixture_dbs(root)
+    sandbox_dbs = _sandbox_fixture_dbs(tmpdir_of_run)
     titles: set[str] = set()
     for db in sandbox_dbs:
         sconn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)

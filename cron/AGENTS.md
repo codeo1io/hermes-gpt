@@ -62,7 +62,28 @@ cannot see other boards; **tenant** is a soft namespace within a board (workspac
 isolation, one fleet serving several businesses). After `kanban.failure_limit` consecutive
 non-success attempts on a task (default 2) the dispatcher auto-blocks it to stop spin loops.
 Process-identity note: `kanban --preserve-cache` contains "serve" — never classify processes by argv
-substring (root).
+substring (root). Worker liveness today is `worker_pid` + host-prefixed `claim_lock`: runtime
+reclaim SIGTERMs → polls → SIGKILLs the recorded PID once the claim's host prefix matches — no
+start-time fingerprint is recorded at claim time, so a recycled same-host PID is a residual risk
+until the worker-lifecycle cluster (roadmap Q58) ports it; `gateway.status.get_process_start_time`
+is display-only (`cron/executions.py`).
+
+- **Notifications leave through the task's owning profile.** `hermes_cli/kanban_db_notify.py`
+  subscriptions carry the profile; `gateway/kanban_watchers_notifier.py` delivers via THAT
+  profile's adapter under its scope (`_notify_profile_filter`), never the multiplexer's launch
+  adapter; a fail-closed skip logs once at WARNING with the remedy, never a bare `continue`.
+  Dispatched workers get `HERMES_KANBAN_BOARD` and the assignee's `HERMES_HOME` pinned in a
+  scrubbed child env (`build_subprocess_env` + `strip_launch_profile_env`); they never inherit the
+  default profile's `.env`.
+- **Prompt injection sites gate on ownership, not tool access.** Tool access (`kanban_show` visible
+  via a profile's toolset) and an inherited `HERMES_KANBAN_TASK` (delegate children, cron runs beside
+  a worker) are not ownership. The kanban guidance (`agent_init`, `system_prompt` fallback) and the
+  stop nudge resolve the task via `agent/delegation_context.py::owned_kanban_task()`; other readers
+  pair their env read with `is_dispatcher_owned_worker_context()`.
+- **Descendant fence is a path, not a flag.** A delegated child's Kanban marker
+  (`agent/delegation_context.py::DELEGATED_CHILD_ENV_MARKER`) carries the fenced board ROOT;
+  `kanban_path_is_fenced(path)` denies mutations only on the dispatcher-pinned `HERMES_KANBAN_DB`
+  or under that root, so a child working against a scratch `HERMES_HOME` keeps a writable board.
 
 ## Tests
 

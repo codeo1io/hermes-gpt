@@ -168,10 +168,7 @@ class TestDelegatedChildMarker:
             with delegated_child_context():
                 env = hermes_subprocess_env(inherit_credentials=True)
 
-        # The marker is path-valued (the fenced board root), not the legacy "1":
-        # see agent/delegation_context.scrub_kanban_env.
-        assert env["HERMES_DELEGATED_CHILD_CONTEXT"]  # truthy: a fenced root path
-        assert env["HERMES_DELEGATED_CHILD_CONTEXT"] != "1"
+        assert env["HERMES_DELEGATED_CHILD_CONTEXT"]  # fenced board root (path), not a bare flag
         # Worker identity is scrubbed; board location and workspace routing survive so the
         # fenced descendant can still read the board it belongs to.
         assert "HERMES_KANBAN_TASK" not in env

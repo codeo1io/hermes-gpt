@@ -184,3 +184,56 @@ def test_real_platform_state_root_ignores_redirected_home(monkeypatch, tmp_path)
     assert _real_platform_state_root() == real, (
         "deny-root must not follow a redirected HOME env"
     )
+
+
+def test_guard_denies_default_profile_board_at_four_parts_deep():
+    """Invariant (2026-09-19): the deny predicate is depth-symmetric. A profile's
+    default board lives at ``profiles/<name>/kanban/current`` — four parts under
+    the root — which the old ``len(parts) == 3`` profiles arm let through while
+    denying the shallower ``kanban/...`` shapes."""
+    from hermes_state_guard import _real_platform_state_root
+    from hermes_cli import kanban_db_connect as kbc
+
+    root = _real_platform_state_root()
+    assert root is not None
+    with pytest.raises(RuntimeError, match="test-isolation guard"):
+        kbc._ensure_test_isolation(root / "profiles" / "worker" / "kanban" / "current")
+    with pytest.raises(RuntimeError, match="test-isolation guard"):
+        kbc._ensure_test_isolation(root / "profiles" / "worker" / "kanban.db")
+
+
+def test_write_txn_runs_one_database_list_pragma_per_transaction(tmp_path):
+    """Invariant (2026-09-19): ``write_txn`` feeds BOTH the descendant-fence
+    assertion and the write-boundary choke from a single
+    ``PRAGMA database_list`` — one probe before the transaction body, not one
+    per guard. (The post-commit file-length corruption check at exit is a
+    separate, pre-existing probe and is deliberately not counted.)"""
+    import sqlite3
+
+    from hermes_cli import kanban_db_connect as kbc
+
+    class _CountingConn:
+        def __init__(self, inner):
+            self._inner = inner
+            self.pragma_calls = 0
+            self.in_transaction = False
+
+        def execute(self, sql, *args, **kwargs):
+            if "PRAGMA database_list" in sql:
+                self.pragma_calls += 1
+            return self._inner.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    inner = sqlite3.connect(tmp_path / "board.db")
+    counting = _CountingConn(inner)
+    try:
+        with kbc.write_txn(counting):
+            assert counting.pragma_calls == 1, (
+                "the fence assertion and the write-boundary choke must share one "
+                "PRAGMA database_list probe"
+            )
+            counting.execute("CREATE TABLE probe (id INTEGER)")
+    finally:
+        inner.close()
