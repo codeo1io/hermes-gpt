@@ -4,7 +4,10 @@
 
 - Support MCP Python SDK 2.x alongside 1.28.1+, preserving local stdio, HTTP/SSE transport settings, authentication and Operator gates.
 - Correct the Codex Operator aliases' return signatures to describe normalized results, avoiding SDK 2 output-validation failures.
-- Test both SDK families and minimum versions in CI, with wire-level negotiation and result assertions.
+- Test both SDK families and minimum versions in CI, with wire-level negotiation and result assertions; add explicit `mcp==2.2.0` and `mcp==1.30.0` pin lanes and a protocol-revision assertion that fails loudly on SDK drift.
+- Resolve the Operator audit log per call under the POSIX state home (`~/.hermes/logs`, honoring `HERMES_HOME` with install-layout normalization) instead of a Windows-only default, with the package-local directory as last resort and legacy package-local history still read for task reconciliation.
+- Surface audit write failures instead of silently dropping evidence: failures are counted, exposed via `audit_write_diagnostics()`, and reported by `hermes_operator_doctor` as `AUDIT_WRITE_FAILURES` (`WARN`).
+- Bound audit growth: size-capped rotation (5 MiB active + single archived generation) and a byte-bounded tail read.
 
 ## 0.10.0 - 2026-09-07
 
