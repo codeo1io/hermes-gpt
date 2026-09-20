@@ -9,6 +9,30 @@ from starlette.testclient import TestClient
 from versioning import VERSION
 
 
+def test_sdk_protocol_revision_is_deliberate():
+    """The installed SDK's advertised protocol revision must match what this
+    server targets, deliberately. The wire surface is built against the MCP
+    2026-07-28 revision (stateless requests, _meta negotiation — see the
+    stateless tests below). A newer SDK shipping a newer LATEST_PROTOCOL_VERSION
+    must fail here instead of drifting silently: bump the expectation only
+    after re-verifying negotiate/stateless/readOnlyHint behavior under the new
+    revision (mcp_compat.py + server wire handling)."""
+    from mcp.types import LATEST_PROTOCOL_VERSION
+
+    from mcp_compat import SDK_V2
+
+    if SDK_V2:
+        assert LATEST_PROTOCOL_VERSION == "2026-07-28", (
+            "mcp SDK advertises a newer protocol revision than the server "
+            "targets; re-verify stateless/_meta negotiation before bumping"
+        )
+    else:
+        assert LATEST_PROTOCOL_VERSION in ("2025-06-18", "2025-11-25"), (
+            "SDK 1.x family drifted beyond the legacy revisions the "
+            "compat layer targets; re-verify before bumping"
+        )
+
+
 @pytest.mark.parametrize("surface", ["main", "codex"])
 @pytest.mark.parametrize("protocol", ["2024-11-05", "2025-11-25"])
 def test_http_sdk_compatibility(surface, protocol, monkeypatch, tmp_path):

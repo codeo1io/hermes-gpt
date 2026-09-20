@@ -32,6 +32,15 @@ jobs:
           - os: self-hosted
             python: '3.10'
             sdk: 'mcp==2.0.0'
+          # Current upstream releases under test (research 2026-09-20):
+          # mcp 1.30.0 and 2.2.0 shipped 2026-09-07; exact pins keep them
+          # covered deliberately rather than incidentally via the range lanes.
+          - os: self-hosted
+            python: '3.10'
+            sdk: 'mcp==1.30.0'
+          - os: self-hosted
+            python: '3.10'
+            sdk: 'mcp==2.2.0'
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
