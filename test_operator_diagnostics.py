@@ -54,6 +54,26 @@ def audit_override(tmp_path, monkeypatch):
     op.set_audit_log_override(None)
 
 
+def test_doctor_warns_on_audit_write_failures(tmp_path, monkeypatch):
+    """Audit write failures are best-effort but must surface in doctor."""
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory", encoding="utf-8")
+    op.set_audit_log_override(blocker / "sub" / "audit.jsonl")
+    monkeypatch.setattr(op, "_audit_write_failures", {
+        "count": 2,
+        "last_error": "OSError: boom",
+        "last_path": str(blocker / "sub" / "audit.jsonl"),
+        "last_timestamp": "2026-09-20T00:00:00+00:00",
+    })
+    try:
+        check = od._check_last_audit_record()
+        assert check["status"] == "WARN"
+        assert check["code"] == "AUDIT_WRITE_FAILURES"
+        assert check["audit_write_failures"]["count"] == 2
+    finally:
+        op.set_audit_log_override(None)
+
+
 # ---------------------------------------------------------------------------
 # Error envelope helpers
 # ---------------------------------------------------------------------------

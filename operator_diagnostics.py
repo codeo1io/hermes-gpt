@@ -504,6 +504,24 @@ def _check_operator_policy(profile: str, hermes_root: Path | None) -> dict[str, 
 
 def _check_last_audit_record() -> dict[str, Any]:
     try:
+        write_failures = op.audit_write_diagnostics()
+        if write_failures.get("count"):
+            # Audit writes are best-effort by design (they must never break a
+            # tool), but lost audit evidence must be visible, not silent.
+            return _check_result(
+                status=STATUS_WARN,
+                layer="audit",
+                code="AUDIT_WRITE_FAILURES",
+                message=(
+                    "Some audit records could not be persisted "
+                    f"({write_failures['count']} failure(s); last: {write_failures.get('last_error')})."
+                ),
+                suggested_action="Check audit log path and permissions; see audit_write_diagnostics().",
+                extra={
+                    "audit_log_path": str(op.audit_log_path()),
+                    "audit_write_failures": write_failures,
+                },
+            )
         record = _read_last_audit_record()
         if record is None:
             return _check_result(
