@@ -114,3 +114,52 @@ def test_update_cli_emits_check_result(monkeypatch, capsys):
     updater.main(["--pre"])
     result = json.loads(capsys.readouterr().out)
     assert result == {"ok": True, "apply": False, "include_prereleases": True}
+
+
+class TopLevelRunner(GitRunner):
+    """GitRunner that first answers ``git rev-parse --show-toplevel`` with a chosen root."""
+
+    def __init__(self, toplevel):
+        super().__init__()
+        self.toplevel = toplevel
+
+    def __call__(self, argv, cwd, timeout):
+        if argv[:2] == ["git", "rev-parse"] and "--show-toplevel" in argv:
+            self.calls.append(argv)
+            return completed(argv, str(self.toplevel) + "\n")
+        return super().__call__(argv, cwd, timeout)
+
+
+def test_check_for_update_refuses_a_foreign_git_root(tmp_path):
+    foreign = tmp_path / "unrelated-repo"
+    foreign.mkdir()
+    (foreign / "pyproject.toml").write_text('name = "someone-else"\nversion = "1.0.0"\n', encoding="utf-8")
+    runner = TopLevelRunner(foreign)
+    for apply in (False, True):
+        runner.calls.clear()
+        result = updater.check_for_update(apply=apply, start=foreign / "site-packages", runner=runner)
+        assert result["ok"] is False
+        assert result["code"] == "NOT_A_HERMES_GPT_CHECKOUT"
+        assert result["repository"] == str(foreign)
+        assert runner.calls == [["git", "rev-parse", "--show-toplevel"]]
+        assert not any("pip" in " ".join(call) for call in runner.calls)
+
+
+def test_check_for_update_refuses_a_git_root_without_a_declaring_pyproject(tmp_path):
+    bare = tmp_path / "not-a-package-root"
+    bare.mkdir()
+    runner = TopLevelRunner(bare)
+    result = updater.check_for_update(apply=True, start=bare, runner=runner)
+    assert result["ok"] is False
+    assert result["code"] == "NOT_A_HERMES_GPT_CHECKOUT"
+
+
+def test_check_for_update_accepts_a_hermes_gpt_checkout(tmp_path):
+    checkout = tmp_path / "hermes-gpt"
+    checkout.mkdir()
+    (checkout / "pyproject.toml").write_text('name = "hermes-gpt"\nversion = "0.10.0"\n', encoding="utf-8")
+    runner = TopLevelRunner(checkout)
+    result = updater.check_for_update(start=checkout / "site-packages", runner=runner)
+    assert result["ok"] is True
+    assert result["mode"] == "git"
+    assert ["git", "status", "--porcelain", "--untracked-files=no"] in runner.calls
