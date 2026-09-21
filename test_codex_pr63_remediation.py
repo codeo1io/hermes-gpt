@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import secrets
 import time
 from pathlib import Path
 
@@ -26,6 +28,14 @@ def _oauth_config() -> oauth_auth.OAuthConfig:
         client_secret="x" * 48,
         redirect_uris=("https://example.test/callback",),
     )
+
+
+def _pkce_pair() -> tuple[str, str]:
+    """A valid RFC 7636 S256 pair: (verifier, challenge)."""
+    verifier = secrets.token_urlsafe(48)[:64]
+    assert oauth_auth._valid_pkce_verifier(verifier)
+    challenge = oauth_auth._s256(verifier)
+    return verifier, challenge
 
 
 def test_signed_access_token_rejected_after_durable_revocation(tmp_path: Path):
@@ -353,18 +363,19 @@ def test_revocation_rotates_authorization_code_key(tmp_path: Path):
     config = _oauth_config()
     state = oauth_auth.OAuthState(config)
     state.restore_tokens(root)
+    verifier, challenge = _pkce_pair()
     code = state.issue_authorization_code(
         client_id=config.client_id,
         redirect_uri=config.redirect_uris[0],
         scope=config.scope,
         resource=config.resource,
-        code_challenge="",
+        code_challenge=challenge,
     )
     first = state.exchange_authorization_code(
         code=code,
         client_id=config.client_id,
         redirect_uri=config.redirect_uris[0],
-        code_verifier="",
+        code_verifier=verifier,
     )
     assert first["access_token"]
 
@@ -376,7 +387,7 @@ def test_revocation_rotates_authorization_code_key(tmp_path: Path):
             code=code,
             client_id=config.client_id,
             redirect_uri=config.redirect_uris[0],
-            code_verifier="",
+            code_verifier=verifier,
         )
     assert replay_exc.value.error == "invalid_grant"
     # (b) a fresh code minted before revocation is dead after key rotation
@@ -507,18 +518,19 @@ def test_post_revocation_fresh_exchange_persists(tmp_path: Path):
 
     oauth_auth.set_persist_hook(lambda s, kind: s.persist_tokens(root))
     try:
+        verifier, challenge = _pkce_pair()
         code = state.issue_authorization_code(
             client_id=config.client_id,
             redirect_uri=config.redirect_uris[0],
             scope=config.scope,
             resource=config.resource,
-            code_challenge="",
+            code_challenge=challenge,
         )
         resp = state.exchange_authorization_code(
             code=code,
             client_id=config.client_id,
             redirect_uri=config.redirect_uris[0],
-            code_verifier="",
+            code_verifier=verifier,
         )
     finally:
         oauth_auth.set_persist_hook(None)
@@ -788,12 +800,13 @@ def test_outstanding_code_dies_on_revocation(tmp_path: Path):
     config = _oauth_config()
     state = oauth_auth.OAuthState(config)
     state.restore_tokens(root)
+    verifier, challenge = _pkce_pair()
     code = state.issue_authorization_code(
         client_id=config.client_id,
         redirect_uri=config.redirect_uris[0],
         scope=config.scope,
         resource=config.resource,
-        code_challenge="",
+        code_challenge=challenge,
     )
     token_store.revoke_tokens(root, rotate_key=False)
     state.clear_live_tokens()
@@ -804,7 +817,7 @@ def test_outstanding_code_dies_on_revocation(tmp_path: Path):
             code=code,
             client_id=config.client_id,
             redirect_uri=config.redirect_uris[0],
-            code_verifier="",
+            code_verifier=verifier,
         )
     assert excinfo.value.error == "invalid_grant"
 
@@ -815,12 +828,13 @@ def test_exchange_fails_loud_when_persistence_fails(tmp_path: Path):
     config = _oauth_config()
     state = oauth_auth.OAuthState(config)
     state.restore_tokens(root)
+    verifier, challenge = _pkce_pair()
     code = state.issue_authorization_code(
         client_id=config.client_id,
         redirect_uri=config.redirect_uris[0],
         scope=config.scope,
         resource=config.resource,
-        code_challenge="",
+        code_challenge=challenge,
     )
     # Break durable persistence AFTER the code decodes: the store exists
     # (epoch readable) but commits fail.
@@ -837,7 +851,7 @@ def test_exchange_fails_loud_when_persistence_fails(tmp_path: Path):
                 code=code,
                 client_id=config.client_id,
                 redirect_uri=config.redirect_uris[0],
-                code_verifier="",
+                code_verifier=verifier,
             )
         assert excinfo.value.error in ("temporarily_unavailable", "invalid_grant")
     finally:
@@ -967,18 +981,19 @@ def test_startup_migration_preserves_positive_legacy_epoch(tmp_path: Path):
         # Fresh issuance still works against the migrated store.
         oauth_auth.set_persist_hook(lambda s, k: s.persist_tokens(root))
         try:
+            verifier, challenge = _pkce_pair()
             code = state.issue_authorization_code(
                 client_id=config.client_id,
                 redirect_uri=config.redirect_uris[0],
                 scope=config.scope,
                 resource=config.resource,
-                code_challenge="",
+                code_challenge=challenge,
             )
             resp = state.exchange_authorization_code(
                 code=code,
                 client_id=config.client_id,
                 redirect_uri=config.redirect_uris[0],
-                code_verifier="",
+                code_verifier=verifier,
             )
             assert resp["access_token"]
             assert (
