@@ -18,7 +18,7 @@ from starlette.responses import JSONResponse, RedirectResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 AUTH_CODE_TTL_SECONDS = 300
-ACCESS_TOKEN_TTL_SECONDS = 30 * 24 * 3600
+ACCESS_TOKEN_TTL_SECONDS = 3600
 REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60
 MAX_AUTH_CODES = 1024
 MAX_ACCESS_TOKENS = 4096
