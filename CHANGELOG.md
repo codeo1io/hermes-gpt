@@ -5,6 +5,10 @@
 - Support MCP Python SDK 2.x alongside 1.28.1+, preserving local stdio, HTTP/SSE transport settings, authentication and Operator gates.
 - Correct the Codex Operator aliases' return signatures to describe normalized results, avoiding SDK 2 output-validation failures.
 - Test both SDK families and minimum versions in CI, with wire-level negotiation and result assertions.
+- Restored the stale pr63 OAuth authorization-code regression tests to real S256 challenge/verifier pairs (five sites, including one that passed only accidentally and one vacuously), and pinned the empty-challenge fail-closed contract with a new test; the runtime guard was already correct.
+- Skip the package-metadata SDK-compatibility test when installed distribution metadata is absent (bare checkouts) instead of erroring.
+- Deleted an unreachable post-return block in `token_store.py` (five undefined-name lint findings, orphaned since #64).
+- Raised the build floor to `setuptools>=77` so the PEP 639 SPDX license string builds under the declared floor, and bounded `pyyaml>=6,<7`.
 
 ## 0.10.0 - 2026-09-07
 

@@ -19,6 +19,15 @@ import operator_policy as op
 import token_store
 
 
+# Mandatory PKCE (RFC 7636): every happy-path code issuance in this module
+# must bind a real S256 challenge/verifier pair — the authorize endpoint has
+# enforced S256 since the 2026-08-31 hardening and the token endpoint fails
+# closed on codes without a stored challenge. Issuing with an empty challenge
+# is only legitimate in explicit fail-closed negative tests.
+_CODE_VERIFIER = "codex-pr63-verifier-" + "a" * 44  # 64 chars, [A-Za-z0-9._~-]
+_CODE_CHALLENGE = oauth_auth._s256(_CODE_VERIFIER)
+
+
 def _oauth_config() -> oauth_auth.OAuthConfig:
     return oauth_auth.OAuthConfig(
         issuer="https://example.test",
@@ -358,13 +367,13 @@ def test_revocation_rotates_authorization_code_key(tmp_path: Path):
         redirect_uri=config.redirect_uris[0],
         scope=config.scope,
         resource=config.resource,
-        code_challenge="",
+        code_challenge=_CODE_CHALLENGE,
     )
     first = state.exchange_authorization_code(
         code=code,
         client_id=config.client_id,
         redirect_uri=config.redirect_uris[0],
-        code_verifier="",
+        code_verifier=_CODE_VERIFIER,
     )
     assert first["access_token"]
 
@@ -376,7 +385,7 @@ def test_revocation_rotates_authorization_code_key(tmp_path: Path):
             code=code,
             client_id=config.client_id,
             redirect_uri=config.redirect_uris[0],
-            code_verifier="",
+            code_verifier=_CODE_VERIFIER,
         )
     assert replay_exc.value.error == "invalid_grant"
     # (b) a fresh code minted before revocation is dead after key rotation
@@ -512,13 +521,13 @@ def test_post_revocation_fresh_exchange_persists(tmp_path: Path):
             redirect_uri=config.redirect_uris[0],
             scope=config.scope,
             resource=config.resource,
-            code_challenge="",
+            code_challenge=_CODE_CHALLENGE,
         )
         resp = state.exchange_authorization_code(
             code=code,
             client_id=config.client_id,
             redirect_uri=config.redirect_uris[0],
-            code_verifier="",
+            code_verifier=_CODE_VERIFIER,
         )
     finally:
         oauth_auth.set_persist_hook(None)
@@ -793,7 +802,7 @@ def test_outstanding_code_dies_on_revocation(tmp_path: Path):
         redirect_uri=config.redirect_uris[0],
         scope=config.scope,
         resource=config.resource,
-        code_challenge="",
+        code_challenge=_CODE_CHALLENGE,
     )
     token_store.revoke_tokens(root, rotate_key=False)
     state.clear_live_tokens()
@@ -804,7 +813,7 @@ def test_outstanding_code_dies_on_revocation(tmp_path: Path):
             code=code,
             client_id=config.client_id,
             redirect_uri=config.redirect_uris[0],
-            code_verifier="",
+            code_verifier=_CODE_VERIFIER,
         )
     assert excinfo.value.error == "invalid_grant"
 
@@ -820,7 +829,7 @@ def test_exchange_fails_loud_when_persistence_fails(tmp_path: Path):
         redirect_uri=config.redirect_uris[0],
         scope=config.scope,
         resource=config.resource,
-        code_challenge="",
+        code_challenge=_CODE_CHALLENGE,
     )
     # Break durable persistence AFTER the code decodes: the store exists
     # (epoch readable) but commits fail.
@@ -837,7 +846,7 @@ def test_exchange_fails_loud_when_persistence_fails(tmp_path: Path):
                 code=code,
                 client_id=config.client_id,
                 redirect_uri=config.redirect_uris[0],
-                code_verifier="",
+                code_verifier=_CODE_VERIFIER,
             )
         assert excinfo.value.error in ("temporarily_unavailable", "invalid_grant")
     finally:
@@ -845,6 +854,34 @@ def test_exchange_fails_loud_when_persistence_fails(tmp_path: Path):
     assert calls["n"] >= 1, "strict hook must have been invoked"
     # No uncommitted credentials remain in the live caches.
     assert not state.access_tokens
+
+
+def test_exchange_rejects_code_without_stored_challenge(tmp_path: Path):
+    """Mandatory-PKCE fail-closed contract: an authorization code whose stored
+    challenge is empty (issued before PKCE enforcement, or by a bypassed
+    authorize path) must NEVER exchange — even when the caller supplies a
+    syntactically valid verifier. Locks oauth_auth exchange-side enforcement
+    (companion to the authorize-side S256 requirement)."""
+    root = tmp_path / "hermes"
+    config = _oauth_config()
+    state = oauth_auth.OAuthState(config)
+    state.restore_tokens(root)
+    code = state.issue_authorization_code(
+        client_id=config.client_id,
+        redirect_uri=config.redirect_uris[0],
+        scope=config.scope,
+        resource=config.resource,
+        code_challenge="",
+    )
+    with pytest.raises(oauth_auth.OAuthError) as excinfo:
+        state.exchange_authorization_code(
+            code=code,
+            client_id=config.client_id,
+            redirect_uri=config.redirect_uris[0],
+            code_verifier=_CODE_VERIFIER,
+        )
+    assert excinfo.value.error == "invalid_grant"
+    assert not state.access_tokens, "no credentials may be minted from a challenge-less code"
 
 
 def test_startup_restore_migrates_legacy_envelope(tmp_path: Path):
@@ -972,13 +1009,13 @@ def test_startup_migration_preserves_positive_legacy_epoch(tmp_path: Path):
                 redirect_uri=config.redirect_uris[0],
                 scope=config.scope,
                 resource=config.resource,
-                code_challenge="",
+                code_challenge=_CODE_CHALLENGE,
             )
             resp = state.exchange_authorization_code(
                 code=code,
                 client_id=config.client_id,
                 redirect_uri=config.redirect_uris[0],
-                code_verifier="",
+                code_verifier=_CODE_VERIFIER,
             )
             assert resp["access_token"]
             assert (
