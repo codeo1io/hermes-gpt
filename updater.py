@@ -59,6 +59,16 @@ def _find_git_root(start: Path, runner: Runner) -> Path | None:
         return None
 
 
+def _is_hermes_gpt_checkout(root: Path) -> bool:
+    """True when *root* is a hermes-gpt source checkout (its pyproject declares this package)."""
+    pyproject = root / "pyproject.toml"
+    try:
+        text = pyproject.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return re.search(rf'^name\s*=\s*["\']{re.escape(PACKAGE_NAME)}["\']', text, re.MULTILINE) is not None
+
+
 def _git_output(argv: list[str], root: Path, runner: Runner, timeout: int = 30) -> tuple[str | None, dict[str, Any] | None]:
     try:
         result = runner(argv, root, timeout)
@@ -204,6 +214,16 @@ def check_for_update(*, apply: bool = False, include_prereleases: bool = False, 
     """Check for an update, or apply only a safe, explicit update path."""
     source_root = _find_git_root((start or Path(__file__).resolve().parent), runner)
     if source_root:
+        if not _is_hermes_gpt_checkout(source_root):
+            return _error(
+                "NOT_A_HERMES_GPT_CHECKOUT",
+                f"The enclosing Git repository at {source_root} is not a {PACKAGE_NAME} checkout, so no update was attempted.",
+                repository=str(source_root),
+                suggested_action=(
+                    f"Run the update from inside a {PACKAGE_NAME} checkout; update a pip-installed {PACKAGE_NAME} "
+                    "from outside any unrelated Git repository."
+                ),
+            )
         return _source_update(root=source_root, apply=apply, runner=runner)
     return _pip_update(apply=apply, include_prereleases=include_prereleases, runner=runner)
 

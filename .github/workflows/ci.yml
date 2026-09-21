@@ -19,7 +19,10 @@ concurrency:
 
 jobs:
   private-leak:
-    uses: codeo1io/.github/.github/workflows/private-leak-sentinel.yaml@main
+    # Immutable pin for supply-chain integrity (repo is public with no branch protection).
+    # Tracks codeo1io/.github@main; rotate deliberately:
+    #   gh api repos/codeo1io/.github/commits/main --jq .sha   # review the commit, then update the ref below
+    uses: codeo1io/.github/.github/workflows/private-leak-sentinel.yaml@a86c8ef77170831d7efc7c683542e3b364366168 # gitleaks allowlist for redaction fixtures (2026-09-21)
 
   test:
     strategy:

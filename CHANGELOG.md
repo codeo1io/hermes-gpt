@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Made the source updater refuse to operate on an enclosing repository that is not a hermes-gpt checkout (new `NOT_A_HERMES_GPT_CHECKOUT` result): a package installed inside another project's Git tree can no longer fast-forward that unrelated repository via `hermes-gpt update --apply`.
+- Pinned the CI private-leak-sentinel reusable workflow to an immutable commit of `codeo1io/.github` instead of the mutable `@main` ref, with the rotation procedure documented beside the pin.
+- Bounded the `pyyaml` runtime dependency to `>=6,<7`.
+- Removed the unused `dompurify` and `@types/dompurify` web dependencies (chat markdown rendering uses ReactMarkdown without raw HTML).
 - Support MCP Python SDK 2.x alongside 1.28.1+, preserving local stdio, HTTP/SSE transport settings, authentication and Operator gates.
 - Correct the Codex Operator aliases' return signatures to describe normalized results, avoiding SDK 2 output-validation failures.
 - Test both SDK families and minimum versions in CI, with wire-level negotiation and result assertions.

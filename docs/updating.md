@@ -31,10 +31,11 @@ Agents should determine whether they are operating a checkout or an installed pa
 
 For a Git checkout, the updater:
 
-1. refuses to apply over tracked local changes;
-2. refuses to apply from a feature branch;
-3. checks the remote default branch without changing the working tree;
-4. on `--apply`, fetches the default branch and uses fast-forward-only merge behavior.
+1. verifies the enclosing repository is a hermes-gpt checkout (its `pyproject.toml` declares the `hermes-gpt` package) and refuses with `NOT_A_HERMES_GPT_CHECKOUT` otherwise — an installed package nested inside another project's Git tree never updates that unrelated repository;
+2. refuses to apply over tracked local changes;
+3. refuses to apply from a feature branch;
+4. checks the remote default branch without changing the working tree;
+5. on `--apply`, fetches the default branch and uses fast-forward-only merge behavior.
 
 It does not create merge commits, rebase, stash tracked edits, force-reset the checkout, downgrade, or delete untracked files.
 
