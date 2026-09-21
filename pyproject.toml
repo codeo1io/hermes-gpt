@@ -17,7 +17,7 @@ dependencies = [
   "packaging>=23",
   "uvicorn",
   "cryptography>=42",
-  "pyyaml",
+  "pyyaml>=6.0.3,<7",
   "tomli; python_version < '3.11'",
 ]
 

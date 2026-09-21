@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Consolidate the install set into `pyproject.toml`: remove the duplicated `requirements.txt` manifest and the `requirements-dev.txt` wrapper that included it; `pip install -e ".[dev]"` (the CI path) is now the documented developer install.
+- Bound `pyyaml>=6.0.3,<7` — 6.0.3 fixes CVE-2026-31132; no other runtime dependency is unbounded.
+- Remove 12 unresolvable gitlink (submodule placeholder) index entries left over from archived review workspaces; `actions/checkout` runs with `submodules:false`, so CI and installs are unaffected.
+- Stop `.gitignore`'s broad `*.ps1` rule from swallowing the shipped `examples/*.example.ps1` templates (negation `!examples/*.example.ps1`); the tracked example set is unchanged.
 - Support MCP Python SDK 2.x alongside 1.28.1+, preserving local stdio, HTTP/SSE transport settings, authentication and Operator gates.
 - Correct the Codex Operator aliases' return signatures to describe normalized results, avoiding SDK 2 output-validation failures.
 - Test both SDK families and minimum versions in CI, with wire-level negotiation and result assertions.
