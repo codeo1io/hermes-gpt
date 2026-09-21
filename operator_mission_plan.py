@@ -43,6 +43,7 @@ from typing import Any
 
 import operator_mission_runtime as mission
 import operator_policy as op
+import operator_skill_resolution as skill_res
 from operator_swarm_workflows import CANONICAL_STAGE_SPECS, DEFAULT_OWNERS
 
 SCHEMA_VERSION = "0.9-plan.1"
@@ -675,6 +676,18 @@ def hermes_plan_create(
             )
             _canonical, plan, plan_sha = _parse_plan(json.dumps(plan))
 
+        # Canonical skill resolution, stage 1: every node's declared skills
+        # must exist somewhere (global skills root or any profile) before the
+        # plan is accepted. Fail-closed in dry-run and direct alike — an
+        # unresolvable skill name is a plan defect, not a policy question.
+        declared_skills: set[str] = set()
+        for _node in plan["nodes"]:
+            _req = _node.get("capability_req") or {}
+            declared_skills.update(str(s) for s in (_req.get("skills") or []))
+        skill_res.validate_required_skills(
+            sorted(declared_skills), mission._root(hermes_root)
+        )
+
         effective_dry = policy.effective_dry_run(dry_run)
         if not effective_dry and not confirm:
             raise PermissionError("direct plan creation requires confirm=true")
@@ -734,7 +747,12 @@ def hermes_plan_create(
             "mission_id": mission_id, "version": new_version, "plan_sha256": plan_sha,
             "node_count": len(plan["nodes"]), "status": status, "changed": True, "dry_run": False,
         })
-    except (ValueError, TypeError, PermissionError, LookupError, OSError, sqlite3.Error, json.JSONDecodeError) as exc:
+    except skill_res.SkillNotFoundError as exc:
+        _audit("hermes_plan_create", policy, dry_run=dry_run, success=False, changed=False, mission_id=mission_id)
+        return _error(exc, "SKILL_NOT_FOUND", "Create the skill (global root or the profiles that need it).")
+    except (
+        ValueError, TypeError, PermissionError, LookupError, OSError, sqlite3.Error, json.JSONDecodeError
+    ) as exc:
         _audit("hermes_plan_create", policy, dry_run=dry_run, success=False, changed=False, mission_id=mission_id)
         return _error(exc, "PLAN_CREATE_REJECTED", "Check mission id, plan schema, and Operator workspace/direct policy.")
 
@@ -796,6 +814,14 @@ def hermes_plan_validate(plan_json: str) -> str:
     try:
         policy.require_level("read_only")
         _canonical, plan, plan_sha = _parse_plan(plan_json)
+        # Canonical skill resolution, stage 1 — read-only, same contract as
+        # hermes_plan_create: a plan whose declared skills cannot resolve
+        # anywhere is invalid, so validate and create cannot disagree.
+        declared: set[str] = set()
+        for _node in plan["nodes"]:
+            _req = _node.get("capability_req") or {}
+            declared.update(str(s) for s in (_req.get("skills") or []))
+        skill_res.validate_required_skills(sorted(declared), mission._root(None))
         return json.dumps({
             "success": True, "schema_version": SCHEMA_VERSION, "tool": "hermes_plan_validate",
             "valid": True, "plan_sha256": plan_sha, "mission_id": plan["mission_id"],
@@ -803,6 +829,10 @@ def hermes_plan_validate(plan_json: str) -> str:
             "node_count": len(plan["nodes"]),
             "nodes": [{"node_id": n["node_id"], "kind": n["kind"], "state": "pending"} for n in plan["nodes"]],
         })
+    except skill_res.SkillNotFoundError as exc:
+        # Same envelope contract as hermes_plan_create (validate and create
+        # cannot disagree on skill resolution).
+        return _error(exc, "SKILL_NOT_FOUND", "Create the skill (global root or the profiles that need it).")
     except (ValueError, PermissionError, json.JSONDecodeError) as exc:
         return json.dumps({
             "success": False, "schema_version": SCHEMA_VERSION, "tool": "hermes_plan_validate",
