@@ -175,6 +175,44 @@ Sibling-run interlock (2026-09-21): run 6d49d1e3979f and run a51c0f6cb5b0 (rm-00
 - acceptance: D3 hard-block enforced live behind the flag with tests (over-budget iterations blocked, resume path defined); controller promoted from shadow to live with an opt-out; docs updated
 - evidence: tests proving block/resume under the flag; ops note recording the first live run; docs diff
 
+<!-- cycle-2 additions below: run 684b97865efc456da2a21dc4259ce30f (assess 2bd3be4650704a3c877a885cecb695d1, research 71c34e3615f44a4d9fd36687be3b468a) — seeded from origin/conductor/run-6d49d1e3979f (89865b1281); this run's worktree base c1785b22e5 predates ROADMAP.md; new ids continue at rm-026, no collision with rm-003..rm-025 pending merge in PR #13 -->
+
+### Catch up upstream v0.11.0 (supersedes the local PKCE test-repair path)
+- id: `rm-026` | track: reliability | priority: 110.0 | status: candidate
+- signals: conductor.run-684b9786:research-C1, upstream asimons81/hermes-gpt v0.11.0 released 2026-09-21 (PyPI hermes-gpt==0.11.0 live; CHANGELOG.md@upstream/master); merge-base 9f537106e9..upstream/master 7795aa3ce8 = exactly 5 commits (PRs #69-#73): dual MCP SDK 1.28.1+/2.x support, Codex alias return-signature fixes, opt-in Gemini Spark OAuth client profile (docs/gemini-spark.md), profile-aware session history + Bot Chat tools, Windows-portable token-store lock, security remediation bundle (signed tokens require durable store; revocation retires+advances epoch in one SQLite txn; atomic refresh rotation; ledger watermark pagination; plan-readiness parent checks; controller contract-hash binding), loopback Agent Card + unknown-peer admission, doctor JSON gateway.pid. The remediation bundle is the upstream-canonical fix for the 4 stale-PKCE failures this run's assess reproduced fresh at c1785b22e5 (test_codex_pr63_remediation.py:348,492,812,941) and for rm-018's dropped mint-side question
+- acceptance: the 5-commit upstream delta merges with oauth_auth.py/server.py/token_store.py conflicts resolved deliberately (sibling rm-003/rm-016/rm-017 work reconciled by content per the cycle-1 interlock note, not re-implemented); full suite green on the baseline interpreter post-merge; PKCE tests exercise upstream remediation semantics; version/docs line adopts 0.11.0 or a fork-equivalent entry
+- evidence: post-merge full-suite run green (serial, HERMES_HTTP_TEST=1, baseline venv); merge commit message records conflict resolution decisions; docs/gemini-spark.md present in-tree
+
+### Bound pyyaml (the last bare runtime dependency)
+- id: `rm-027` | track: reliability | priority: 55.0 | status: implemented
+- signals: conductor.run-684b9786:research-C4 + run-6d49d1e3 next-cycle note, pyproject.toml [project] dependencies lists `pyyaml` unbounded — the only bare runtime dep left after rm-023; PyPI latest 6.0.3 (2026-09-21 probe); yaml parsing sits on the operator config/skills path
+- acceptance: pyproject pins `pyyaml>=6,<7`; CI installs the bounded range green; cap moves become deliberate changelog events (rm-023 policy)
+- evidence: pyproject diff + green CI on the bounded range; CHANGELOG note when the cap moves. Cycle-2 implement (2026-09-22, attempt 06181fb4): pyproject.toml:20 now `pyyaml>=6,<7` (tomllib parse ok), CHANGELOG Unreleased entry added; full serial suite delta-zero vs the 5-failure assess baseline. REMAINING: review + commit/merge gates, then a green CI run on the bounded range
+
+### Profile-aware skill-resolution gate before placement/dispatch
+- id: `rm-028` | track: correctness | priority: 38.0 | status: candidate
+- signals: conductor.run-684b9786:research-C5, upstream issue #74 (opened 2026-09-21, the only open upstream issue): 'skill exists' != 'the target profile can resolve it at execution time'; cites server.py::skill_roots/discover_skills/hermes_skill_list, operator_skills.py::_find_skill_dir, operator_capability_manifest.py, operator_placement.py; depends on rm-026 (v0.11.0 reshaped capability-manifest surfaces)
+- acceptance: placement/dispatch validates that the target profile can actually resolve each referenced skill at execution time (or fails loudly pre-flight); contract agreed architecture-first with upstream before implementation
+- evidence: upstream issue #74 linked; tests proving a placement referencing an unresolvable skill fails before dispatch; docs/operator-mode.md skills section updated
+
+### Updater must verify it found a hermes-gpt checkout before fast-forwarding
+- id: `rm-029` | track: reliability | priority: 42.0 | status: implemented
+- signals: conductor.run-684b9786:assess, updater.py:49-58 _find_git_root walks to the first enclosing repo with no hermes-gpt sentinel; updater.py:203-206 then updates whatever it found; docs/updating.md:19-26 promises updates apply to the hermes-gpt installation — a venv nested inside a foreign git repo (the standard hermes layout) makes `update --apply` fast-forward the wrong repository
+- acceptance: candidate roots are verified as hermes-gpt checkouts (pyproject name / package marker / remote URL) with a loud refusal otherwise; regression test using a foreign git-root fixture
+- evidence: unit test with a foreign-repo fixture proving refusal; docs/updating.md statement matches behavior. Cycle-2 implement (2026-09-22, attempt 06181fb4): updater.py:62-70 `_is_hermes_gpt_checkout()` + `NOT_A_HERMES_GPT_CHECKOUT` loud refusal in `check_for_update` (:213, refusal :217-227) covering check and apply paths; 3 new tests in test_updater.py (foreign-pyproject root refused with only the single rev-parse call and zero fetch/merge/pip calls; bare root refused; genuine hermes-gpt checkout proceeds to git mode) — 10/10 green; docs/updating.md guarantee list now leads with the refusal. REMAINING: review + commit/merge gates
+
+### SHA-pin the reusable private-leak-sentinel workflow
+- id: `rm-030` | track: reliability | priority: 48.0 | status: implemented
+- signals: conductor.run-684b9786:assess, .github/workflows/ci.yml:22 references codeo1io/.github/.github/workflows/private-leak-sentinel.yaml@main; codeo1io/.github is public with no branch protection (gh api verified 2026-09-21: private:false, default_branch main) — a mutable pin means any push to that main silently changes what every CI run, including upstream PR runs, scans
+- acceptance: the reusable-workflow reference pins an immutable commit SHA (human-readable branch noted in a comment); a re-pin rotation procedure is documented
+- evidence: ci.yml diff showing the SHA ref; rotation note in docs or repo workflow docs. Cycle-2 implement (2026-09-22, attempt 06181fb4): ci.yml:22 pinned to a86c8ef77170831d7efc7c683542e3b364366168 (codeo1io/.github main at 2026-09-21, the gitleaks-allowlist commit that unblocked PR #12's sentinel job; re-verified via gh api at implement time), rotation procedure documented in comments adjacent to the pin; yaml parse ok. REMAINING: review + commit/merge gates; the pinned workflow is exercised by the next CI run
+
+### Remove or wire the unused dompurify web dependencies
+- id: `rm-031` | track: maintainability | priority: 12.0 | status: implemented
+- signals: conductor.run-684b9786:assess, web/package.json:15,28 declare dompurify + @types/dompurify but no web/src file imports them; chat renders via ReactMarkdown without rehype-raw (web/src/chat/Message.tsx:15) so the implied sanitization layer neither exists nor is needed today
+- acceptance: dependencies removed (clean install + green web build) or sanitization genuinely wired with a test proving raw HTML is stripped
+- evidence: package.json diff + green web build/test; grep shows zero dompurify imports or a passing sanitization test. Cycle-2 implement (2026-09-22, attempt 06181fb4): dompurify + @types/dompurify removed via `npm uninstall` (package.json AND package-lock.json both zero dompurify refs); web build green (`tsc -b && vite build`, 307 modules, exit 0); CHANGELOG Unreleased entry added. REMAINING: review + commit/merge gates
+
 ## Cycle 1 outcome — run 6d49d1e3979f (2026-09-21; review loop appended at commit gate)
 
 Batch implemented in worktree run-6d49d1e3979f-6d49d1e3 (uncommitted; commit/merge are later gates): rm-016, rm-017 (61->0 + CI list widened to repo-wide), rm-023, stretch rm-021 promoted; rm-018 dropped (see its resolution). Validation (attempts e607cfb2 targeted, a179d016 full): targeted 567/576 pass over all 33 changed surfaces; full suite 1359/1368 pass, 5 skip, 4 fail — all 4 are the stale-PKCE baseline, stash-verified identical at clean HEAD c1785b22e5; CI-parity HTTP smoke passed; `ruff check .` = 0.
@@ -203,8 +241,6 @@ Review loop: independent review 6084fc89 PASS with 4 findings -> fix 711573d0 (n
 - Watch **test_mcp_compat.py:81** in CI: its assess-time failure no longer reproduces in-session (passes in-suite and standalone) — env-state-dependent, needs a skip guard for bare checkouts regardless.
 - Remaining design-gated/low items unchanged: rm-019, rm-020, rm-022, rm-025.
 
-<<<<<<< HEAD
-=======
 <!-- cycle-1 additions below: run fd2bc85ff5994b8fa6b59f286efedce7 (assess db8d375501724, research 9662e1e8286) -->
 
 Interlock (2026-09-21): run fd2bc85ff599 is a third parallel repository-maintenance cycle-1 run on the same base c1785b22e5. Its assess independently re-confirmed at this HEAD — on the baseline interpreter (py3.11.15/mcp 2.0.0/pytest 9.1.1) in CI's exact serial shape (HERMES_HTTP_TEST=1, log /tmp/assess-db8d3755-full.log) — the 4 stale empty-challenge PKCE failures (rm-003; defs :348/:492/:812/:941 failing at oauth_auth.py:477-480 fail-closed guard), test_mcp_compat.py:81 metadata failure (rm-007), token_store.py:1097-1141 dead block with 5x F821 (rm-016), the curated CI lint-list gap (rm-017), unbounded uvicorn/pyyaml (rm-023 bounded uvicorn on the sibling branch; pyyaml remains), and the 3.12 matrix ceiling (rm-024). No delegation/g4c flake reproduces serially. Adopt sibling implementations by content at the merge gates; do not re-implement.
@@ -255,5 +291,28 @@ Validation (attempts 8d1e62ec implement, 3b787ac5 targeted_tests): ruff --isolat
 
 <!-- restored 2026-09-21 (prioritize attempt 87402e78): roadmap-phase write was cut off mid-edit; block re-emitted verbatim from the folded roadmap phase_result -->
 
->>>>>>> a47bca6f0c (test: restore pr63 PKCE regression contracts, green the baseline (B1))
+## Cycle 2 research digest — run 684b97865efc (2026-09-21; assess 2bd3be46, research 71c34e36)
+
+External evidence probed 2026-09-21: upstream v0.11.0 live on PyPI, delta = 5 commits (PRs #69-#73) -> rm-026. mcp SDK 2.2.0 + 1.30.0 (released 2026-09-07) and latest protocol revision still 2026-07-28 — rm-009's remaining acceptance (green new lanes + 2.1 behavior-change audit) is unchanged; no new item. Python 3.10 EOL confirmed 2026-10-31; 3.13.15/3.14.7 current (endoflife.date) — rm-024 stands as written; no new item. Upstream's only open issue is #74 (skill resolution) -> rm-028. FastMCP v4.0.5 (2026-09-17, ~27.8k stars) recorded as evaluation-only reference for future auth/middleware patterns — not a dependency candidate (repo invariant: thin mcp_compat.py shim over the official SDKs). Independent-reproduction interlock: this run's assess reproduced at base c1785b22e5 the same defect classes the sibling runs fixed on unmerged branches (4 stale-PKCE failures + env-shaped test_mcp_compat.py:81; token_store.py dead block; 39 ruff errors across the 69 files outside the 62-file CI lint list) — rm-003/rm-016/rm-017 adopt-by-content per the cycle-1 interlock note; acceptance is re-verification at merge time, not re-implementation.
+
+## Cycle 2 outcome — run 684b97865efc (2026-09-22; pre-review compound 9ed20686)
+
+Batch B1 'Verified-Fresh Hygiene' implemented in worktree run-684b97865efc-684b9786 (uncommitted; review/commit/merge are later gates): rm-027, rm-030, rm-031, rm-029 (implement order), all four flipped to `implemented`. 8 files changed (+83/-36): pyproject.toml, .github/workflows/ci.yml, web/package.json, web/package-lock.json, updater.py, test_updater.py, docs/updating.md, CHANGELOG.md. Validation (attempts 06181fb4 implement, d86d1db2 targeted_tests): test_updater.py 10/10 exit 0; web build exit 0; ruff delta zero on touched files (4 pre-existing errors in updater.py, count+locations identical to HEAD copies); full serial suite on the baseline interpreter = exactly the 5-failure assess baseline (4 inherited stale-PKCE + env-shaped test_mcp_compat.py:81), zero new failures; one loaded-run g4c flake (test_launch_wins_first_and_cancel_returns_while_launch_call_is_in_flight) triaged to the load-timing class via solo-rerun pass and did not recur in the validation run.
+
+### Cycle 2 learnings — prevention rules
+
+1. **Put safety sentinels at the decision point, not the discovery helper.** The hermes-gpt-checkout verification lives in `check_for_update` (updater.py:213) rather than `_find_git_root`, so check and apply paths are covered together and the existing `_source_update` unit tests keep their seam.
+2. **A mutable `@main` ref on a shared reusable workflow is supply-chain surface.** codeo1io/.github is public with no branch protection, so the pin's integrity is only as strong as that repo's main. Pin the immutable SHA and document the rotation procedure adjacent to the pin.
+3. **Judge suites by baseline delta, not raw exit code.** The serial full-suite log compared against the assess-time baseline is the comparable artifact; inherited failures (4 stale-PKCE + env-shaped mcp_compat) are not regressions and must not be "fixed" in passing.
+4. **The load-timing flake class has a 4th member:** test_operator_fabric_g4c.py::test_launch_wins_first_and_cancel_returns_while_launch_call_is_in_flight (failed under a loaded serial run, passed solo). Extend rm-012's evidence list rather than chasing the mechanism.
+5. **Remove JS dependencies through the package manager, never by hand.** `npm uninstall` kept package.json and package-lock.json coherent (both grep to zero dompurify refs); hand-editing the lock risks silent drift — then run the real build (`npm run build`) as the acceptance gate.
+6. **Do not double-fix superseded defects.** Upstream v0.11.0's security bundle is the canonical fix for the 4 stale-PKCE tests (rm-026); local repair would only conflict with the catch-up merge.
+7. **A cheap proof of "zero new lint debt":** run ruff on the changed files and on their HEAD copies — identical count+locations (4 == 4) proves the batch added nothing without touching sibling-owned cleanup (rm-017 on PR #13).
+
+### Cycle 2 next-cycle context
+
+- **rm-026 (upstream v0.11.0 catch-up) stays the headline** and is gated on PR #12/#13 merging (adopt-by-content: this run re-verified both still open 2026-09-22); it carries the canonical stale-PKCE fix and unblocks rm-028 (upstream issue #74 contract).
+- The batch's review/commit gates are pending at this writing — outcome text above is pre-review by design and must not be read as shipped.
+- De-flake scope (rm-012) now covers 4 g4c/delegation members; serial remains authoritative.
+- Sentinel-pin rotation (rm-030) re-verify on each catch-up cycle: `gh api repos/codeo1io/.github/commits/main --jq .sha` vs the pinned ref in ci.yml.
 <!-- managed by hermes-roadmap render; do not edit by hand -->
