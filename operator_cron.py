@@ -29,7 +29,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -38,6 +40,223 @@ import operator_policy as op
 # Preserve the original jobs.json container shape per profile_home so writes
 # round-trip list-shaped files and Hermes' canonical {"jobs": [...]} form.
 _jobs_shape_cache: dict[str, str] = {}
+
+
+# ---------------------------------------------------------------------------
+# Self-contained schedule parser (vendored contract of hermes cron.jobs).
+#
+# hermes-gpt is a standalone distribution — it does NOT ship hermes-agent's
+# ``cron`` package, so a hermes-agent cron.jobs import would resolve only
+# on machines where hermes-agent happens to be importable (and worse, silently
+# binds the PRODUCTION install there). The parser below reproduces the
+# canonical schedule schema
+#   {"kind": "once"|"interval"|"cron", ...}
+# consumed by the Hermes Agent scheduler contract.
+# ---------------------------------------------------------------------------
+
+_DURATION_MULTIPLIERS = {"m": 1, "h": 60, "d": 1440}
+
+# Day-spec phrases for "every monday 9am" / "every day at 9am". Cron weekday
+# numbering is 0=Sunday … 6=Saturday (croniter's default).
+_WEEKDAY_TO_CRON_DOW = {
+    "sunday": "0", "sun": "0",
+    "monday": "1", "mon": "1",
+    "tuesday": "2", "tue": "2", "tues": "2",
+    "wednesday": "3", "wed": "3", "weds": "3",
+    "thursday": "4", "thu": "4", "thur": "4", "thurs": "4",
+    "friday": "5", "fri": "5",
+    "saturday": "6", "sat": "6",
+}
+
+# Keyword day-specs that expand to a cron weekday field.
+_DAYSPEC_TO_CRON_DOW = {
+    "day": "*", "daily": "*", "everyday": "*",
+    "weekday": "1-5", "weekdays": "1-5",
+    "weekend": "0,6", "weekends": "0,6",
+}
+
+_croniter: Any = None
+_croniter_checked: bool = False
+
+
+def _ensure_croniter() -> bool:
+    """Import croniter on first use (lazy: slow import, cron exprs only)."""
+    global _croniter, _croniter_checked
+    if not _croniter_checked:
+        try:
+            from croniter import croniter as _croniter_mod  # type: ignore
+            _croniter = _croniter_mod
+        except ImportError:
+            _croniter = None
+        _croniter_checked = True
+    return _croniter is not None
+
+
+def _parse_duration(s: str) -> int:
+    """Parse a duration into minutes: "30m" → 30, "2h" → 120, "1d" → 1440."""
+    s = s.strip().lower()
+    match = re.match(
+        r"^(\d*)\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)$", s
+    )
+    if not match:
+        raise ValueError(
+            f"Invalid duration: '{s}'. Use format like '30m', '2h', '1d', "
+            "or a bare unit like 'hour' (defaults to 1)."
+        )
+    value = int(match.group(1)) if match.group(1) else 1
+    return value * _DURATION_MULTIPLIERS[match.group(2)[0]]
+
+
+def _parse_clock_time(text: str) -> Optional[tuple[int, int]]:
+    """Parse ``9am``/``9:30am``/``14:00``/``7``/``noon``/``midnight`` into a
+    24-hour ``(hour, minute)`` tuple, or None when unrecognized."""
+    t = text.strip().lower().replace(" ", "")
+    if not t:
+        return None
+    if t in ("noon", "midday"):
+        return (12, 0)
+    if t == "midnight":
+        return (0, 0)
+    match = re.match(r"^(\d{1,2})(?::(\d{2}))?(am|pm)?$", t)
+    if not match:
+        return None
+    hour = int(match.group(1))
+    minute = int(match.group(2) or 0)
+    meridiem = match.group(3)
+    if meridiem:
+        if not 1 <= hour <= 12:
+            return None
+        hour = hour % 12 + (12 if meridiem == "pm" else 0)
+    if hour > 23 or minute > 59:
+        return None
+    return (hour, minute)
+
+
+def _natural_every_to_cron(rest: str) -> Optional[str]:
+    """Convert ``<when> [at] <time>`` ("monday 9am", "weekday at 9am",
+    "monday, wednesday at 9am") to a 5-field cron expr, or None so
+    ``_parse_schedule`` can fall back to the interval path."""
+    tokens = rest.lower().replace(",", " ").split()
+    if not tokens:
+        return None
+    dow = _DAYSPEC_TO_CRON_DOW.get(tokens[0])
+    idx = 1
+    if dow is None:
+        days: list[str] = []
+        idx = len(tokens)
+        for i, tok in enumerate(tokens):
+            if tok == "and":
+                continue
+            mapped = _WEEKDAY_TO_CRON_DOW.get(tok)
+            if mapped is None:
+                idx = i
+                break
+            if mapped not in days:
+                days.append(mapped)
+        if not days:
+            return None
+        dow = ",".join(days)
+    time_tokens = tokens[idx:]
+    if time_tokens and time_tokens[0] == "at":
+        time_tokens = time_tokens[1:]
+    if not time_tokens:
+        return None
+    parsed = _parse_clock_time(" ".join(time_tokens))
+    if parsed is None:
+        return None
+    hour, minute = parsed
+    return f"{minute} {hour} * * {dow}"
+
+
+def _cron_schedule(expr: str, display: str, missing_croniter: str, invalid_label: str) -> dict[str, Any]:
+    """Validate a cron expression with croniter and build the stored schedule dict."""
+    if not _ensure_croniter():
+        raise ValueError(f"{missing_croniter} Install with: pip install croniter")
+    try:
+        _croniter(expr)
+    except Exception as e:
+        raise ValueError(f"Invalid {invalid_label} '{display}': {e}") from e
+    return {"kind": "cron", "expr": expr, "display": display}
+
+
+def _interval_schedule(minutes: int) -> dict[str, Any]:
+    return {"kind": "interval", "minutes": minutes, "display": f"every {minutes}m"}
+
+
+def _parse_schedule(schedule: str) -> dict[str, Any]:
+    """Parse a schedule string into ``{"kind": "once"|"interval"|"cron", ...}``.
+
+    "30m" and "every 30m" are recurring intervals; "every monday 9am" and
+    "0 9 * * *" are cron; an ISO timestamp or "in 30m" is one-shot.
+    Mirrors the Hermes Agent scheduler contract so operator-created jobs are
+    schema-compatible with jobs created by Hermes itself.
+    """
+    schedule = schedule.strip()
+    original = schedule
+    schedule_lower = schedule.lower()
+
+    is_every = schedule_lower.startswith("every ")
+    rest = schedule[6:].strip() if is_every else schedule_lower
+    cron_expr = _natural_every_to_cron(rest)
+    if cron_expr is not None:
+        example = "every monday 9am" if is_every else "weekdays at 9am"
+        return _cron_schedule(
+            cron_expr, original,
+            f"Weekday/time schedules like '{example}' require the 'croniter' package.",
+            "schedule",
+        )
+    if is_every:
+        return _interval_schedule(_parse_duration(rest))
+
+    parts = schedule.split()
+    if len(parts) >= 5 and all(re.match(r"^[A-Za-z\d\*\-,/]+$", p) for p in parts[:5]):
+        return _cron_schedule(
+            schedule, schedule, "Cron expressions require 'croniter' package.",
+            "cron expression",
+        )
+
+    if "T" in schedule or re.match(r"^\d{4}-\d{2}-\d{2}", schedule):
+        try:
+            dt = datetime.fromisoformat(schedule.replace("Z", "+00:00"))
+        except ValueError as e:
+            raise ValueError(f"Invalid timestamp '{schedule}': {e}") from e
+        # Naive timestamps become aware in server-local wall time (the standalone
+        # distribution has no configured Hermes timezone to honor): the stored
+        # value keeps the user's wall clock, so it doesn't depend on the system
+        # timezone matching at check time.
+        if dt.tzinfo is None:
+            dt = dt.astimezone().replace(tzinfo=dt.astimezone().tzinfo)
+        return {
+            "kind": "once",
+            "run_at": dt.isoformat(),
+            "display": f"once at {dt.strftime('%Y-%m-%d %H:%M')}",
+        }
+
+    if schedule_lower.startswith("in "):
+        duration_str = schedule[3:].strip()
+        try:
+            minutes = _parse_duration(duration_str)
+        except ValueError:
+            raise ValueError(
+                f"Invalid duration '{duration_str}' after 'in '. Use e.g. 'in 30m', 'in 2h'."
+            ) from None
+        now = datetime.now().astimezone()
+        run_at = (now.astimezone(timezone.utc) + timedelta(minutes=minutes)).astimezone(now.tzinfo)
+        return {"kind": "once", "run_at": run_at.isoformat(), "display": f"once in {duration_str}"}
+
+    try:
+        return _interval_schedule(_parse_duration(schedule))
+    except ValueError:
+        pass
+
+    raise ValueError(
+        f"Invalid schedule '{original}'. Use:\n"
+        f"  - Interval: '30m', 'every 30m', 'every 2h' (recurring)\n"
+        f"  - One-shot delay: 'in 30m', 'in 2h' (fires once)\n"
+        f"  - Weekly/daily: 'every monday 9am', 'weekdays at 9am' (recurring)\n"
+        f"  - Cron: '0 9 * * *' (cron expression)\n"
+        f"  - Timestamp: '2026-02-03T14:00:00' (one-shot at time)"
+    )
 
 # Fields that are PRESERVED when copying a job across profiles.
 _PRESERVED_COPY_FIELDS: tuple[str, ...] = (
@@ -976,11 +1195,11 @@ def hermes_cron_create(
         # Hermes' scheduler consumes the canonical structured schedule shape.
         # Persisting the raw user string here creates a job that lists correctly
         # but crashes during claim/run when scheduler code calls schedule.get().
-        # Use the same parser as the native cron implementation so operator-
-        # created jobs are schema-compatible with jobs created by Hermes itself.
-        from cron.jobs import parse_schedule
-
-        parsed_schedule = parse_schedule(schedule)
+        # hermes-gpt is a standalone distribution and does NOT ship hermes-agent's
+        # ``cron`` package — the vendored parser below reproduces the same
+        # canonical schema so operator-created jobs stay schema-compatible with
+        # jobs created by Hermes itself, without binding the production install.
+        parsed_schedule = _parse_schedule(schedule)
         if not parsed_schedule:
             raise ValueError(f"Invalid schedule: {schedule!r}")
 

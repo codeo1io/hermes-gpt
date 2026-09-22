@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 from pathlib import Path
 
@@ -741,6 +742,44 @@ def test_cron_create_model_only_scheduler_contract(hermes_root, clean_env, audit
     assert written["model"] == "claude-sonnet-4"
     assert "provider" not in written
     assert not isinstance(written["model"], dict)
+
+
+def test_cron_create_schedule_parser_is_selfcontained(hermes_root, clean_env, audit_override, monkeypatch):
+    """rm-hermes-gpt-standalone: hermes_cron_create must NOT import hermes-agent's
+    cron package. hermes-gpt is a standalone distribution; a module-level or
+    function-level ``from cron.jobs import ...`` silently bound the PRODUCTION
+    hermes-agent install on the self-hosted box and raised ImportError
+    (success=False) everywhere hermes-agent is not installed — which killed all
+    9 CI lanes (test_cron_create_*, 2026-09-22). The vendored parser must
+    produce the canonical scheduler schema without any hermes-agent import."""
+    monkeypatch.setenv(op.OPERATOR_ENABLED_ENV, "1")
+    monkeypatch.setenv(op.OPERATOR_LEVEL_ENV, "cron")
+    # 1) The module's source carries no hermes-agent cron import at all.
+    source = inspect.getsource(oc)
+    assert "from cron.jobs import" not in source
+    assert "from cron import" not in source
+    # 2) The vendored parser yields the canonical shapes hermes-agent's
+    #    scheduler consumes (kind + minutes / expr / run_at).
+    interval = oc._parse_schedule("every 30m")
+    assert interval == {"kind": "interval", "minutes": 30, "display": "every 30m"}
+    expr = oc._parse_schedule("0 9 * * *")
+    assert expr["kind"] == "cron" and expr["expr"] == "0 9 * * *"
+    once = oc._parse_schedule("in 30m")
+    assert once["kind"] == "once" and once["run_at"]
+    # 3) End-to-end: create a job with an every-N schedule on a host that has
+    #    no hermes-agent on sys.path (this test env) and confirm the persisted
+    #    job carries a structured schedule, not the raw string.
+    monkeypatch.setenv(op.OPERATOR_APPLY_MODE_ENV, "direct")
+    out = oc.hermes_cron_create(
+        profile="default", schedule="every 30m", prompt="run report",
+        name="selfcontained-job", dry_run=False, hermes_root=hermes_root,
+    )
+    parsed = json.loads(out)
+    assert parsed["success"] is True, parsed
+    jobs = oc._read_jobs(hermes_root)
+    written = next(j for j in jobs if j["id"] == parsed["job_id"])
+    assert written["schedule"] == {"kind": "interval", "minutes": 30, "display": "every 30m"}
+    assert written["schedule_display"] == "every 30m"
 
 
 

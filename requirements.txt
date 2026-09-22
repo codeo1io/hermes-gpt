@@ -3,3 +3,4 @@ uvicorn
 packaging>=23
 cryptography>=42
 pyyaml
+croniter>=2.0,<7
