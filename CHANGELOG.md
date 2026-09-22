@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Hardened the RFC 7591 dynamic client registration lifecycle (unauthenticated-endpoint abuse controls): a per-peer rate limit (5 registrations per 60 s), a 7-day TTL with expired-slot reclamation (a full registry self-heals instead of returning 429 forever), fail-closed lookups for expired registrations across authorize/exchange/refresh, and re-validation of restored registry entries against the chatgpt.com-family redirect allowlist.
+- Added operator registry surfaces (Python-level on `OAuthState`): `list_dynamic_clients()` and `purge_dynamic_client()` (documented in `docs/gemini-spark.md` → “OAuth behavior knobs”). These are library calls today — HTTP/operator-tool wiring is tracked as remaining work under roadmap item rm-048.
+- Fixed an unauthenticated `TypeError`→500 on `GET /oauth/authorize` with a non-ASCII `client_id` (mirrors the earlier B4 token-endpoint guard; now a 401 `invalid_client`).
+- Authorization responses (success and error) now carry the RFC 9207 `iss` parameter and the authorization-server metadata advertises `authorization_response_iss_parameter_supported`, per MCP SEP-2468 (Final).
+- Documented `HERMES_GPT_OAUTH_DCR` and `HERMES_GPT_OAUTH_PKCE_MODE` (previously undocumented) and corrected `docs/gemini-spark.md`, which claimed `registration_endpoint` was not advertised — it is advertised by default; `HERMES_GPT_OAUTH_DCR=0` is the single-client deployment knob.
+- Fixed dynamic-client access tokens failing bearer validation at `/mcp`: the validation gate matched only statically configured clients, so RFC 7591-onboarded connectors received 401s (found in independent review). The state-level gate now accepts live dynamic registrations and fails closed on expiry or purge. Restored registries are also re-validated against the 1..8 redirect budget, static-id shadowing, and non-ASCII client ids; the per-peer register limiter prunes stale window entries so its peer map stays bounded.
+
 ## 0.11.0 - 2026-09-21
 
 - Drove the repository-wide `ruff` error count from 61 to zero and replaced the CI lint job's hand-maintained file list with a repo-wide `ruff check .` gate.

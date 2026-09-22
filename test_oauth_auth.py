@@ -769,3 +769,77 @@ def test_non_ascii_basic_auth_credentials_are_rejected(oauth_client: TestClient)
     )
     assert response.status_code in (400, 401)
     assert response.json()["error"] == "invalid_client"
+
+
+# -- rm-049: authorize input hardening (non-ASCII client_id) -----------------
+
+
+def test_authorize_non_ascii_client_id_is_client_error(oauth_client: TestClient):
+    """Reproduces the assess finding: a non-ASCII client_id used to raise
+    TypeError inside hmac.compare_digest (client_for_id) and surfaced as an
+    unauthenticated 500 on GET /oauth/authorize. Malformed ids are a 401."""
+    response = oauth_client.get(
+        "/oauth/authorize",
+        params={
+            "response_type": "code",
+            "client_id": "attacker-客户端",
+            "redirect_uri": REDIRECT_URI,
+            "scope": "openid hermes offline_access",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 401
+    assert response.json()["error"] == "invalid_client"
+
+
+# -- rm-052: SEP-2468 issuer parameter in authorization responses ------------
+
+
+def test_authorization_response_iss_parameter(oauth_client: TestClient):
+    """SEP-2468 (Final): authorization responses — success and error — carry
+    the RFC 9207 iss parameter, and the metadata advertises the capability."""
+    metadata = oauth_client.get("/.well-known/oauth-authorization-server")
+    assert metadata.status_code == 200
+    assert (
+        metadata.json()["authorization_response_iss_parameter_supported"] is True
+    )
+
+    success = oauth_client.get(
+        "/oauth/authorize",
+        params={
+            "response_type": "code",
+            "client_id": CLIENT_ID,
+            "redirect_uri": REDIRECT_URI,
+            "scope": "openid hermes offline_access",
+            "state": "opaque-state",
+            "code_challenge": s256(DEFAULT_VERIFIER),
+            "code_challenge_method": "S256",
+        },
+        follow_redirects=False,
+    )
+    assert success.status_code == 302
+    success_query = urllib.parse.parse_qs(
+        urllib.parse.urlparse(success.headers["location"]).query
+    )
+    assert success_query["iss"] == [ISSUER]
+    assert "code" in success_query
+
+    error = oauth_client.get(
+        "/oauth/authorize",
+        params={
+            "response_type": "code",
+            "client_id": CLIENT_ID,
+            "redirect_uri": REDIRECT_URI,
+            "scope": "definitely-not-a-scope",
+            "state": "opaque-state",
+            "code_challenge": s256(DEFAULT_VERIFIER),
+            "code_challenge_method": "S256",
+        },
+        follow_redirects=False,
+    )
+    assert error.status_code == 302
+    error_query = urllib.parse.parse_qs(
+        urllib.parse.urlparse(error.headers["location"]).query
+    )
+    assert error_query["error"] == ["invalid_scope"]
+    assert error_query["iss"] == [ISSUER]
