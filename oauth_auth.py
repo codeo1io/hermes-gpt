@@ -36,7 +36,19 @@ GEMINI_CLIENT_ID_ENV = "HERMES_GPT_OAUTH_GEMINI_CLIENT_ID"
 GEMINI_CLIENT_SECRET_ENV = "HERMES_GPT_OAUTH_GEMINI_CLIENT_SECRET"
 GEMINI_REDIRECT_URI_ENV = "HERMES_GPT_OAUTH_GEMINI_REDIRECT_URI"
 OAUTH_PKCE_MODE_ENV = "HERMES_GPT_OAUTH_PKCE_MODE"
+OAUTH_DCR_ENV = "HERMES_GPT_OAUTH_DCR"
+
 _PKCE_MODES = ("required", "optional")
+
+def _dcr_enabled() -> bool:
+    """RFC 7591 dynamic client registration advertised/served unless explicitly disabled.
+
+    ``HERMES_GPT_OAUTH_DCR=0`` removes ``registration_endpoint`` from the
+    authorization-server metadata (single confidential-client deployments like
+    the Gemini Spark custom-app profile, whose contract is "no DCR"); the
+    register route itself answers regardless — advertising is the compat knob.
+    """
+    return os.environ.get(OAUTH_DCR_ENV, "1").strip().lower() not in {"0", "false", "off", "no"}
 _PKCE_VALUE = re.compile(r"^[A-Za-z0-9._~-]{43,128}$")
 _CLIENT_SECRET = re.compile(r"^[A-Za-z0-9._~-]{43,128}$")
 _BASE64URL = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -217,6 +229,8 @@ class OAuthConfig:
     clients: tuple[OAuthClient, ...] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
+        if self.pkce_mode not in _PKCE_MODES:
+            raise ValueError(f"pkce_mode must be one of {_PKCE_MODES}: {self.pkce_mode!r}")
         issuer = self.issuer.rstrip("/")
         parsed = urllib.parse.urlparse(issuer)
         if parsed.scheme != "https" and parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
@@ -1190,8 +1204,9 @@ def authorization_metadata(_request: Request, state: OAuthState) -> JSONResponse
             # specifically for the registration endpoint; without it a
             # credential-less connector loops discovery->401 forever and can
             # never onboard.  The endpoint itself is public and rate-bounded
-            # (see register_client).
-            "registration_endpoint": f"{issuer}/oauth/register",
+            # (see register_client). Advertised unless DCR is explicitly
+            # disabled for single confidential-client deployments.
+            **({"registration_endpoint": f"{issuer}/oauth/register"} if _dcr_enabled() else {}),
             "response_types_supported": ["code"],
             "grant_types_supported": ["authorization_code", "refresh_token"],
             "token_endpoint_auth_methods_supported": ["client_secret_post", "client_secret_basic", "none"],
