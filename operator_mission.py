@@ -45,7 +45,6 @@ import operator_policy as op
 import operator_diagnostics as op_diag
 import operator_cron as op_cron
 import operator_fleet as op_fleet
-import operator_workspace as op_workspace
 
 # ---------------------------------------------------------------------------
 # Constants
