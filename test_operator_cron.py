@@ -779,3 +779,66 @@ def test_corrupt_jobs_json_backed_up_before_overwrite(hermes_root, clean_env):
     assert persisted["jobs"][0]["id"] == "j1"
     assert sorted(jobs_file.parent.glob("jobs.json.corrupt-*")) == binary_backups
     assert oc._read_jobs(hermes_root)[0]["id"] == "j1"
+
+
+def test_write_jobs_uses_unique_fsynced_staging_file(hermes_root: Path):
+    """Concurrent writers never share a staging file, and none is left behind."""
+    import operator_cron as cron_mod
+
+    for index in range(3):
+        cron_mod._write_jobs(hermes_root, [{"id": f"j{index}", "name": f"job{index}"}])
+    jobs_file = hermes_root / "cron" / "jobs.json"
+    assert json.loads(jobs_file.read_text(encoding="utf-8"))["jobs"][0]["id"] == "j2"
+    assert list(jobs_file.parent.glob("*.tmp")) == []
+
+
+def test_write_jobs_concurrent_writers_never_interleave_or_corrupt(hermes_root: Path):
+    """rm-039 regression (concurrency): eight threads racing _write_jobs on
+    the same jobs.json always leave one writer's complete payload — never
+    an interleaved, truncated, or JSON-invalid document — and no uniquely
+    named staging file survives the race."""
+    import threading
+
+    import operator_cron as cron_mod
+
+    writers = 8
+    rounds = 5
+    barrier = threading.Barrier(writers)
+    failures: list[Exception] = []
+
+    def _writer(index: int) -> None:
+        try:
+            barrier.wait(timeout=10)
+            for _ in range(rounds):
+                cron_mod._write_jobs(hermes_root, [{"id": f"race-{index}", "name": "race"}])
+        except Exception as exc:  # pragma: no cover - asserted below
+            failures.append(exc)
+
+    threads = [
+        threading.Thread(target=_writer, args=(index,)) for index in range(writers)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+    assert not failures
+    assert not any(thread.is_alive() for thread in threads)
+
+    jobs_file = hermes_root / "cron" / "jobs.json"
+    persisted = json.loads(jobs_file.read_text(encoding="utf-8"))
+    ids = [job["id"] for job in persisted["jobs"]]
+    # exactly one writer's full payload, atomically replaced — never a mix
+    assert ids and len(ids) == 1 and ids[0].startswith("race-"), persisted
+    assert not list(jobs_file.parent.glob(".*.tmp")), "staging files leaked"
+
+
+def test_write_jobs_removes_staging_file_on_failure(hermes_root: Path, monkeypatch):
+    import operator_cron as cron_mod
+
+    def _boom(payload, fh, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(cron_mod.json, "dump", _boom)
+    with pytest.raises(OSError):
+        cron_mod._write_jobs(hermes_root, [{"id": "j1", "name": "x"}])
+    assert list((hermes_root / "cron").glob("*.tmp")) == []

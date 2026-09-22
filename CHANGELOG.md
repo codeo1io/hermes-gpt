@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Dynamic-client registry lifecycle: dynamically registered public clients (RFC 7591, ChatGPT apps flow) now carry a 7-day TTL (`DYNAMIC_CLIENT_TTL_SECONDS`); `cleanup()` evicts expired registrations and runs before each new registration, and an expired client is treated as unknown at lookup time even before eviction — the unauthenticated `/oauth/register` surface can no longer exhaust the 64-slot registry permanently, only temporarily (HTTP 429 until TTL eviction; connectors simply re-register).
+- Restoring the persisted dynamic-client registry (`import_dynamic_clients`) now revalidates every entry at live-registration parity (`dyn-` client-id prefix, 1-8 chatgpt.com-family HTTPS redirect URIs, TTL, capacity accounting; the raw redirect list is additionally capped at 8 entries pre-dedupe, so import is never looser than `/oauth/register`), so a tampered durable-store payload cannot smuggle in a client, redirect, or shadow id that registration would refuse; entries persisted before TTLs existed are granted a fresh TTL on import instead of living forever, and a duplicated id (within one payload or already in the registry) is skipped, first occurrence wins.
+- Authorization redirects now carry the issuer identifier as the RFC 9207 `iss` query parameter on both success and error responses, for static and dynamically registered clients, and the authorization-server metadata advertises `authorization_response_iss_parameter_supported`.
+- Documentation truth batch: `docs/oauth.md` now describes the merged dynamic client registration surface (its security model previously claimed "no dynamic client registration"), the `HERMES_GPT_OAUTH_DCR` metadata gate, the `HERMES_GPT_OAUTH_PKCE_MODE` policy knob, and registry persistence/recovery; `docs/operator-mode.md` documents the `HERMES_GPT_OPERATOR_TMPDIR` owner-command scratch directory; the stale `OAuthClient` docstring in `oauth_auth.py` is corrected.
+- Durable atomic writes: `operator_workspace._atomic_write_text` and `operator_cron._write_jobs` now stage through uniquely named (pid + random token), fsynced temporary files with cleanup on failure, instead of a fixed `.tmp` suffix that concurrent writers could clobber.
+- The operator scratch tree (`HERMES_GPT_OPERATOR_TMPDIR`) now self-prunes entries older than 7 days (best-effort, never blocking an owner command).
+- `operator_diagnostics._read_gateway_pid` now delegates its `gateway.pid` parsing to the single canonical parser in `operator_workspace` instead of carrying a mirrored copy; `site/.vercel/project.json` (machine/account-specific Vercel linkage identifiers) is untracked from Git and ignored, while remaining on disk for local deployments.
+
 ## 0.11.0 - 2026-09-21
 
 - Drove the repository-wide `ruff` error count from 61 to zero and replaced the CI lint job's hand-maintained file list with a repo-wide `ruff check .` gate.

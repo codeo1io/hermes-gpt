@@ -141,6 +141,10 @@ _MAX_REGISTER_BYTES = 8 * 1024
 
 #: Bounded dynamic-client registry (single-tenant issuer).
 MAX_DYNAMIC_CLIENTS = 64
+#: Dynamic registrations expire so the unauthenticated RFC 7591 surface can
+#: never exhaust the registry permanently: a client that stops authorizing is
+#: evicted by cleanup() after this TTL, and connectors simply re-register.
+DYNAMIC_CLIENT_TTL_SECONDS = 7 * 24 * 60 * 60
 ACCESS_TOKEN_PREFIX = "hg.at.v1."
 _ACCESS_TOKEN_MAC_CONTEXT = b"hermes-gpt.oauth.access.v1\0"
 
@@ -165,11 +169,13 @@ class OAuthError(RuntimeError):
 class OAuthClient:
     """One registered confidential OAuth client.
 
-    Hermes GPT has no dynamic client registration; every client is an
-    operator-provisioned entry with its own secret and its own exact-match
-    redirect-URI allowlist. Additional clients (for example the opt-in Gemini
-    Spark client profile) stay isolated from the primary client: a client can
-    only redirect to, or authenticate with, its own credentials.
+    Every entry of this registry is an operator-provisioned client with its
+    own secret and its own exact-match redirect-URI allowlist. Additional
+    clients (for example the opt-in Gemini Spark client profile) stay
+    isolated from the primary client: a client can only redirect to, or
+    authenticate with, its own credentials. Dynamically registered public
+    clients (RFC 7591, ChatGPT apps flow) are a separate bounded registry —
+    see DynamicClient and OAuthState.register_dynamic_client.
     """
 
     client_id: str
@@ -304,6 +310,7 @@ class DynamicClient:
     client_id: str
     redirect_uris: tuple[str, ...]
     registered_at: float
+    expires_at: float
 
     def as_public_dict(self) -> dict[str, Any]:
         return {
@@ -356,6 +363,9 @@ class OAuthState:
 
     def register_dynamic_client(self, redirect_uris: list[str]) -> DynamicClient:
         """Mint a public dynamic client; bounded, chatgpt.com-redirects only."""
+        # Expire first so a registry exhausted through this unauthenticated
+        # endpoint recovers as soon as stale registrations age out.
+        self.cleanup()
         cleaned = list(dict.fromkeys(redirect_uris))
         if not cleaned or len(cleaned) > 8:
             raise OAuthError(
@@ -379,6 +389,7 @@ class OAuthState:
             client_id=client_id,
             redirect_uris=tuple(cleaned),
             registered_at=time.time(),
+            expires_at=time.time() + DYNAMIC_CLIENT_TTL_SECONDS,
         )
         self.dynamic_clients[client_id] = client
         return client
@@ -386,13 +397,22 @@ class OAuthState:
     def client_redirect_allowed(self, client_id: str, redirect_uri: str) -> bool:
         """Redirect check for dynamic clients (exact-match against their
         registered URIs; the static config path keeps its own rules)."""
-        client = self.dynamic_clients.get(client_id)
+        client = self._live_dynamic_client(client_id)
         if client is None:
             return False
         return redirect_uri in client.redirect_uris
 
     def is_dynamic_client(self, client_id: str) -> bool:
-        return client_id in self.dynamic_clients
+        return self._live_dynamic_client(client_id) is not None
+
+    def _live_dynamic_client(self, client_id: Any) -> DynamicClient | None:
+        """The dynamic client if it exists and its TTL has not elapsed."""
+        if not isinstance(client_id, str):
+            return None
+        client = self.dynamic_clients.get(client_id)
+        if client is None or client.expires_at <= time.time():
+            return None
+        return client
 
     def export_dynamic_clients(self) -> list[dict[str, Any]]:
         return [
@@ -400,38 +420,88 @@ class OAuthState:
                 "client_id": c.client_id,
                 "redirect_uris": list(c.redirect_uris),
                 "registered_at": c.registered_at,
+                "expires_at": c.expires_at,
             }
             for c in self.dynamic_clients.values()
         ]
 
     def import_dynamic_clients(self, payload: Any) -> int:
+        """Restore persisted dynamic clients, with live-registration parity.
+
+        Every entry is revalidated at live RFC 7591 registration parity
+        (``dyn-`` id prefix, 1-8 chatgpt.com-family HTTPS redirect URIs, TTL,
+        capacity accounting): the token-store payload is operator-writable
+        state, so a tampered or hand-edited payload must never smuggle in a
+        client stricter validation would have refused — in particular a
+        non-``dyn-`` id that would shadow an operator-provisioned static
+        client. Two import-specific rules keep the accounting exact: the raw
+        redirect list is capped at 8 entries pre-dedupe (live registration
+        caps the deduped set — import is never looser), and a duplicated id
+        (inside one payload or already present in the registry) is skipped,
+        first occurrence wins. Entries failing parity are skipped, never
+        fatal.
+        """
         if not isinstance(payload, list):
             return 0
         imported = 0
+        seen: set[str] = set()
+        now = time.time()
         for item in payload:
             if not isinstance(item, dict):
                 continue
             client_id = item.get("client_id")
             redirects = item.get("redirect_uris")
+            if not isinstance(client_id, str) or not client_id.startswith("dyn-"):
+                continue
+            if client_id in seen or client_id in self.dynamic_clients:
+                continue
+            if not isinstance(redirects, list) or not redirects or len(redirects) > 8:
+                continue
+            cleaned = [u for u in dict.fromkeys(redirects) if isinstance(u, str)]
+            if len(cleaned) != len(dict.fromkeys(redirects)) or not all(
+                _registerable_redirect(u) for u in cleaned
+            ):
+                continue
             registered_at = item.get("registered_at", 0)
-            if not isinstance(client_id, str) or not isinstance(redirects, list):
+            try:
+                registered_at = float(registered_at or 0)
+            except (TypeError, ValueError):
+                continue
+            expires_at = item.get("expires_at")
+            try:
+                expires_at = float(expires_at) if expires_at is not None else 0.0
+            except (TypeError, ValueError):
+                expires_at = 0.0
+            if expires_at <= 0:
+                # Registry rows persisted before TTLs existed: grant a full
+                # fresh TTL measured from import time (falling back to the
+                # row's registration stamp only if it is somehow in the
+                # future) so pre-TTL rows cannot live forever.
+                expires_at = max(registered_at, now) + DYNAMIC_CLIENT_TTL_SECONDS
+            if expires_at <= now:
                 continue
             if len(self.dynamic_clients) >= self.max_dynamic_clients:
                 break
             self.dynamic_clients[client_id] = DynamicClient(
                 client_id=client_id,
-                redirect_uris=tuple(str(u) for u in redirects),
-                registered_at=float(registered_at or 0),
+                redirect_uris=tuple(cleaned),
+                registered_at=registered_at,
+                expires_at=expires_at,
             )
+            seen.add(client_id)
             imported += 1
         return imported
 
     def cleanup(self) -> None:
+        """Evict expired authorization codes, tokens, and dynamic clients."""
         now = time.time()
         for store in (self.used_auth_codes, self.access_tokens, self.refresh_tokens):
             for credential, item in list(store.items()):
                 if item.get("expires_at", 0) <= now:
                     store.pop(credential, None)
+        for client_id, client in list(self.dynamic_clients.items()):
+            if client.expires_at <= now:
+                self.dynamic_clients.pop(client_id, None)
 
     def normalize_scope(self, scope: str) -> str:
         requested = list(dict.fromkeys(scope.split()))
@@ -1203,11 +1273,16 @@ def authorization_metadata(_request: Request, state: OAuthState) -> JSONResponse
             # RFC 7591: openai-mcp (ChatGPT connectors) polls this document
             # specifically for the registration endpoint; without it a
             # credential-less connector loops discovery->401 forever and can
-            # never onboard.  The endpoint itself is public and rate-bounded
-            # (see register_client). Advertised unless DCR is explicitly
-            # disabled for single confidential-client deployments.
+            # never onboard.  The endpoint itself is public; its
+            # unauthenticated surface is bounded by the 8KB body cap, the
+            # 64-slot registry, and TTL eviction (see register_client).
+            # Advertised unless DCR is explicitly disabled for single
+            # confidential-client deployments.
             **({"registration_endpoint": f"{issuer}/oauth/register"} if _dcr_enabled() else {}),
             "response_types_supported": ["code"],
+            # RFC 9207 §2.3: MUST be advertised (true) because every
+            # authorization response — success and error alike — carries iss.
+            "authorization_response_iss_parameter_supported": True,
             "grant_types_supported": ["authorization_code", "refresh_token"],
             "token_endpoint_auth_methods_supported": ["client_secret_post", "client_secret_basic", "none"],
             "code_challenge_methods_supported": ["S256"],
@@ -1301,11 +1376,20 @@ def authorize(request: Request, state: OAuthState) -> JSONResponse | RedirectRes
             code_challenge=challenge,
         )
     except OAuthError as exc:
-        error_query = [("error", exc.error), ("error_description", exc.description)]
+        # RFC 9207 §2: authorization responses — including error
+        # responses — carry the issuer identifier, so a client can also
+        # bind failures to this AS rather than a look-alike.
+        error_query = [
+            ("error", exc.error),
+            ("error_description", exc.description),
+            ("iss", state.config.issuer),
+        ]
         if params.get("state"):
             error_query.append(("state", params["state"]))
         return _redirect_response(redirect_uri, error_query)
-    query = [("code", code)]
+    # RFC 9207: the issuer identifier on every authorization-code redirect
+    # so the client can bind the code to the AS that issued it.
+    query = [("code", code), ("iss", state.config.issuer)]
     if params.get("state"):
         query.append(("state", params["state"]))
     return _redirect_response(redirect_uri, query)

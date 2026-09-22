@@ -262,25 +262,9 @@ def _read_gateway_pid(profile_home: Path) -> tuple[int | None, str | None]:
     Returns ``(pid, source)``; ``(None, None)`` when no usable PID is found.
     The caller still verifies liveness via ``_is_process_alive()``.
     """
-    pid_path = _gateway_pid_path(profile_home)
-    raw = ""
-    if pid_path.exists():
-        try:
-            raw = pid_path.read_text(encoding="utf-8").strip()
-        except OSError:
-            raw = ""
-    if raw:
-        try:
-            return int(raw), "gateway.pid"
-        except ValueError:
-            try:
-                obj = json.loads(raw)
-            except (ValueError, TypeError):
-                obj = None
-            if isinstance(obj, dict):
-                obj_pid = obj.get("pid")
-                if isinstance(obj_pid, int) and obj_pid > 0:
-                    return obj_pid, "gateway.pid"
+    pid = op_workspace._read_gateway_pid_from_pid_file(_gateway_pid_path(profile_home))
+    if pid is not None:
+        return pid, "gateway.pid"
 
     state_path = _gateway_state_path(profile_home)
     if state_path.exists():

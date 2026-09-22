@@ -736,3 +736,94 @@ def test_operator_policy_tool_returns_default_safe_summary(monkeypatch):
     assert parsed["apply_mode"] == "dry_run"
     assert parsed["owner_mode_ready"] is False
     assert parsed["mutation_allowed"] is False
+
+
+def test_atomic_write_text_uses_unique_staging_file(tmp_path: Path):
+    """Repeated and concurrent-shaped writes never share staging files."""
+    target = tmp_path / "nested" / "file.json"
+    for index in range(3):
+        ows._atomic_write_text(target, json.dumps({"i": index}))
+    assert json.loads(target.read_text(encoding="utf-8")) == {"i": 2}
+    assert list(tmp_path.rglob("*.tmp")) == []
+
+
+def test_atomic_write_text_concurrent_writers_never_interleave_or_corrupt(
+    tmp_path: Path,
+):
+    """rm-039 regression (concurrency): eight threads racing
+    _atomic_write_text on the same target always leave one writer's complete
+    document — never an interleaved, truncated, or JSON-invalid file — and
+    no uniquely named staging file survives the race."""
+    import threading
+
+    target = tmp_path / "nested" / "file.json"
+    writers = 8
+    rounds = 5
+    barrier = threading.Barrier(writers)
+    failures: list[Exception] = []
+
+    def _writer(index: int) -> None:
+        payload = json.dumps({"writer": index})
+        try:
+            barrier.wait(timeout=10)
+            for _ in range(rounds):
+                ows._atomic_write_text(target, payload)
+        except Exception as exc:  # pragma: no cover - asserted below
+            failures.append(exc)
+
+    threads = [
+        threading.Thread(target=_writer, args=(index,)) for index in range(writers)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+    assert not failures
+    assert not any(thread.is_alive() for thread in threads)
+
+    persisted = json.loads(target.read_text(encoding="utf-8"))
+    # exactly one writer's complete document, atomically replaced
+    assert set(persisted) == {"writer"} and isinstance(persisted["writer"], int)
+    assert 0 <= persisted["writer"] < writers
+    assert not list(tmp_path.rglob(".*.tmp")), "staging files leaked"
+
+
+def test_janitor_operator_tmpdir_prunes_stale_entries(tmp_path: Path):
+    fresh = tmp_path / "fresh-scratch.txt"
+    fresh.write_text("x", encoding="utf-8")
+    stale_file = tmp_path / "stale-file.txt"
+    stale_file.write_text("x", encoding="utf-8")
+    stale_dir = tmp_path / "stale-dir"
+    stale_dir.mkdir()
+    (stale_dir / "inner.txt").write_text("x", encoding="utf-8")
+    past = __import__("time").time() - 8 * 24 * 60 * 60
+    __import__("os").utime(stale_file, (past, past))
+    __import__("os").utime(stale_dir, (past, past))
+
+    removed = ows._janitor_operator_tmpdir(tmp_path)
+
+    assert removed == 2
+    assert fresh.exists()
+    assert not stale_file.exists()
+    assert not stale_dir.exists()
+
+
+def test_janitor_operator_tmpdir_never_raises_on_undeletable(tmp_path: Path, monkeypatch):
+    stale_dir = tmp_path / "stale-dir"
+    stale_dir.mkdir()
+    (stale_dir / "inner.txt").write_text("x", encoding="utf-8")
+    stale_file = tmp_path / "stale-file.txt"
+    stale_file.write_text("x", encoding="utf-8")
+    past = __import__("time").time() - 8 * 24 * 60 * 60
+    __import__("os").utime(stale_dir, (past, past))
+    __import__("os").utime(stale_file, (past, past))
+
+    def _fail(path, **_kwargs):
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(ows.shutil, "rmtree", _fail)
+
+    # The undeletable directory is skipped, not fatal; the file still goes.
+    assert ows._janitor_operator_tmpdir(tmp_path) == 1
+    assert stale_file.exists() is False
+    assert stale_dir.exists()
