@@ -1,0 +1,5 @@
+{"step":1,"ts":"2026-09-21T13:09:40Z","summary":"Dispatch state verified: HEAD c1785b22e5, 38 M files + .conductor//ROADMAP.md untracked, stash empty, no uv.lock/.venv","touched":[".conductor/progress/5829c7b092284e90b81a55b4dd25d9a2.ndjson"]}
+{"step":2,"ts":"2026-09-21T13:10:10Z","summary":"Read durable validation records: full_b82bae9c.log serial+n8 each exactly 4 pr63 baseline FAILED, nothing else","touched":[]}
+{"step":3,"ts":"2026-09-21T13:11:00Z","summary":"Tree identity verified: 38 files +103/-122, fix numstat matches record, mtime probe clean, diff set == engine 37 surfaces + docs","touched":[]}
+{"step":4,"ts":"2026-09-21T13:11:45Z","summary":"Built /tmp/fv5829_release_manifest.sha256 (38 tracked + ROADMAP.md, sha256sum -c OK); git-diff delta sha256 6d15c71e...caeb281","touched":["/tmp/fv5829_release_manifest.sha256"]}
+{"step":5,"ts":"2026-09-21T13:12:30Z","summary":"phase_result JSON written+schema-checked to spool 5829c7b0...json; release-integrity PASSED (digest matches b82bae9c)","touched":["/home/agent/.hermes/conductor-delegate-spool-infra-deploy/delegate/5829c7b092284e90b81a55b4dd25d9a2.json"]}

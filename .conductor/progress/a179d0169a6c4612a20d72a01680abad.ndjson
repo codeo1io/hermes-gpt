@@ -1,0 +1,5 @@
+{"step":1,"ts":"2026-09-21T12:33:49Z","summary":"Probe: CI authoritative cmd = python -m pytest -q (serial,HERMES_HTTP_TEST=1); uv lacks pytest; xdist present; running baseline-comparable serial full","touched":[]}
+{"step":2,"ts":"2026-09-21T12:37:23Z","summary":"Full serial (CI-authoritative): 1359 pass/5 skip/4 fail = pr63 baseline only; better than assess 6-baseline","touched":["/tmp/full_a179d016.log"]}
+{"step":3,"ts":"2026-09-21T12:37:23Z","summary":"HERMES_HTTP_TEST=1 smoke PASS; -n 8 run: 4 baseline + 1 g4c parallel flake (serial pass standalone+file, code untouched)","touched":["/tmp/full_a179d016_n8.log"]}
+{"step":4,"ts":"2026-09-21T12:37:23Z","summary":"Tree == dispatch-time (37 M + .conductor/ ROADMAP.md only, no uv artifacts); ruff 0; digest verbatim","touched":[]}
+{"step":5,"ts":"2026-09-21T12:37:53Z","summary":"Spool JSON written+validated (scope full, outcome passed, digest verbatim, 0 changed surfaces)","touched":["/home/agent/.hermes/conductor-delegate-spool-infra-deploy/delegate/a179d0169a6c4612a20d72a01680abad.json"]}

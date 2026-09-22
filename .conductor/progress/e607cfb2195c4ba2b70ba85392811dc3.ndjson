@@ -1,0 +1,4 @@
+{"step":1,"ts":"2026-09-21T12:28:06Z","summary":"Runner decision: uv venv resolves mcp 2.2.0/no pytest (not baseline-comparable); using baseline interpreter","touched":[]}
+{"step":2,"ts":"2026-09-21T12:30:15Z","summary":"Targeted run: 567 passed/5 skipped/4 failed (all known pr63 PKCE baseline); stash-verify: same 4 at clean HEAD; ruff 0","touched":["/tmp/targeted_e607cfb2.log"]}
+{"step":3,"ts":"2026-09-21T12:31:11Z","summary":"Removed uv probe artifacts (uv.lock/.venv) restoring dispatch-time tree; ruff repo-wide 0","touched":["uv.lock",".venv"]}
+{"step":4,"ts":"2026-09-21T12:31:11Z","summary":"Spool JSON written+validated (scope targeted, outcome passed, digest verbatim)","touched":["/home/agent/.hermes/conductor-delegate-spool-infra-deploy/delegate/e607cfb2195c4ba2b70ba85392811dc3.json"]}
