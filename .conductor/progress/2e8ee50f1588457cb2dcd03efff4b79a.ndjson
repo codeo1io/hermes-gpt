@@ -1,0 +1,2 @@
+{"step":1,"ts":"2026-09-21T15:49:02Z","summary":"Roadmap phase start: locate configured roadmap state for run-fd2bc85ff599","touched":[".conductor/progress/2e8ee50f1588457cb2dcd03efff4b79a.ndjson"]}
+{"step":2,"ts":"2026-09-21T15:51:00Z","summary":"Seeded ROADMAP.md verbatim from freshest sibling state (conductor/run-6d49d1e3979f @89865b1281, 206 lines)","touched":["ROADMAP.md"]}
