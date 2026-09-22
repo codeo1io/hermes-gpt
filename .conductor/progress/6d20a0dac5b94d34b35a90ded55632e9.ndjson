@@ -1,0 +1,4 @@
+{"step":1,"ts":"2026-09-23T17:12:34Z","summary":"State verified: HEAD 4b958379d6, 10 modified + untracked test_server_sdk1_execution.py; prior logs on disk","touched":[]}
+{"step":2,"ts":"2026-09-23T17:20:00Z","summary":"Static review done: wrapper mechanism verified in mcp1.28.1 wheel; DCR/PKCE/docs claims verified; 2 LOW findings (rate-dict growth, float() ValueError)","touched":[]}
+{"step":3,"ts":"2026-09-22T17:22:49Z","summary":"Re-verified evidence: SDK1 proof PASS, targeted exit 0, full serial CI-shape exit 0, ruff clean, ci.yml parses","touched":["/tmp/ir-6d20a0da-targeted.log","/tmp/ir-6d20a0da-full.log"]}
+{"step":4,"ts":"2026-09-22T17:22:49Z","summary":"Verdict PASS: 3 LOW + 2 INFO findings pinned (oauth rate-dict growth :371, float ValueError :469, ROADMAP :409 accounting); phase_result written to spool","touched":["/home/agent/.hermes/conductor-delegate-spool-infra-deploy/delegate/6d20a0dac5b94d34b35a90ded55632e9.json"]}

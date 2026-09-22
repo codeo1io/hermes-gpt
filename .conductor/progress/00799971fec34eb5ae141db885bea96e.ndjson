@@ -1,0 +1,4 @@
+{"step":1,"ts":"2026-09-22T16:12:28Z","summary":"tree state: clean @4b958379d6 conductor/run-e29c25913c00, 30 ahead of master; v0.11.0 adopted","touched":[]}
+{"step":2,"ts":"2026-09-22T16:18:40Z","summary":"suite green 1486P/5S 180s; PROVEN asyncio.run defect: web_extract+vision_analyze fail on mcp1.x sync-on-loop ctx (/tmp/assess-00799971-asyncioproof.py)","touched":[]}
+{"step":3,"ts":"2026-09-22T16:22:49Z","summary":"10 findings pinned file:line: asyncio.run-on-1.x-lane (2 tools, proven), 900s sync bot_chat, sticky unauth DCR cap 64 no-TTL, DCR/PKCE_MODE doc gaps, no Unreleased CHANGELOG, publish.yml self-hosted","touched":[]}
+{"step":4,"ts":"2026-09-22T16:23:50Z","summary":"phase_result JSON written+validated to spool (status=succeeded, 10 findings, 6 future-work items); tree clean","touched":["/home/agent/.hermes/conductor-delegate-spool-infra-deploy/delegate/00799971fec34eb5ae141db885bea96e.json"]}
