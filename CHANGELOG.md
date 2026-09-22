@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Security: raised the `pyyaml` runtime floor from `>=6,<7` to `>=6.0.3,<7` — 6.0.3 fixes CVE-2026-31132.
+- Consolidated the install set into `pyproject.toml`: removed the duplicated `requirements.txt` manifest and the `requirements-dev.txt` wrapper that included it; `pip install -e ".[dev]"` (the CI path) is the documented developer install. `croniter>=2.0,<7` is declared in `pyproject.toml`, not a side manifest; it is retained for parity with origin/master, where PR #22's self-contained cron schedule parser declares it (no module in this tree imports croniter yet).
+- Added canonical profile-aware skill resolution before placement and dispatch: a new `operator_skill_resolution.py` resolves each profile's skill directories against the operator policy allowlist, and `hermes_plan_create` / `hermes_plan_validate` / placement scoring (`load_manifest_targets`, `_apply_hard_filters`, `hermes_placement_score`) gate on it (fork half of upstream issue #74).
+- Fixed an unreachable duplicated `raise` in `_authenticate_client` (`oauth_auth.py`) left behind by a merge.
+- Restored visibility of the shipped `examples/*.example.ps1` templates under `.gitignore`'s broad `*.ps1` rule (negation `!examples/*.example.ps1`); the tracked example set is unchanged.
+- OAuth: added RFC 7591 dynamic client registration — `POST /oauth/register` is served by default when OAuth is enabled; `HERMES_GPT_OAUTH_DCR=0` removes the registration endpoint from discovery. Registrations are capped (64 clients) and persisted across restarts. (Converged deployment change, previously unrecorded here.)
+- Server: six blocking tool handlers were offloaded onto worker threads via `asyncio.to_thread`, so long-running operator tools no longer stall the event loop. (Converged deployment change, previously unrecorded here.)
+- Operator: owner-command scratch is routed to a dedicated tree — `HERMES_GPT_OPERATOR_TMPDIR`, default `~/.hermes/tmp/operator` — instead of shared `/tmp`. (Converged deployment change, previously unrecorded here.)
+- CI: test/lint jobs moved from self-hosted runners to `ubuntu-latest` (plus one `windows-latest` lane). (Converged deployment change, previously unrecorded here.)
+
 ## 0.11.0 - 2026-09-21
 
 - Drove the repository-wide `ruff` error count from 61 to zero and replaced the CI lint job's hand-maintained file list with a repo-wide `ruff check .` gate.
@@ -9,7 +21,8 @@
 - Made the source updater refuse to operate on an enclosing repository that is not a hermes-gpt checkout (new `NOT_A_HERMES_GPT_CHECKOUT` result): a package installed inside another project's Git tree can no longer fast-forward that unrelated repository via `hermes-gpt update --apply`.
 - Pinned the CI private-leak-sentinel reusable workflow to an immutable commit of `codeo1io/.github` instead of the mutable `@main` ref, with the rotation procedure documented beside the pin.
 - Bounded the `pyyaml` runtime dependency to `>=6,<7`.
-- Removed the unused `dompurify` and `@types/dompurify` web dependencies (chat markdown rendering uses ReactMarkdown without raw HTML).- Support MCP Python SDK 2.x alongside 1.28.1+, preserving local stdio, HTTP/SSE transport settings, authentication and Operator gates.
+- Removed the unused `dompurify` and `@types/dompurify` web dependencies (chat markdown rendering uses ReactMarkdown without raw HTML).
+- Support MCP Python SDK 2.x alongside 1.28.1+, preserving local stdio, HTTP/SSE transport settings, authentication and Operator gates.
 - Correct the Codex Operator aliases' return signatures to describe normalized results, avoiding SDK 2 output-validation failures.
 - Test both SDK families and minimum versions in CI, with wire-level negotiation and result assertions.
 - Added an opt-in Gemini Spark client profile for Google's consumer Gemini Apps "Custom apps for Spark" connector: an additional registered confidential OAuth client (`HERMES_GPT_OAUTH_GEMINI_ENABLE=1` plus `HERMES_GPT_OAUTH_GEMINI_CLIENT_ID` / `_CLIENT_SECRET` / `_REDIRECT_URI`) isolated from the primary client with its own secret and exact-match redirect allowlist; enabling it without complete configuration fails startup validation. Setup guide: `docs/gemini-spark.md`.

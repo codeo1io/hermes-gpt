@@ -1410,7 +1410,6 @@ def _authenticate_client(request: Request, form: dict[str, list[str]], state: OA
     client = state.config.client_for_id(client_id)
     if client is None:
         raise OAuthError("invalid_client", "Invalid OAuth client credentials.", status_code=401)
-        raise OAuthError("invalid_client", "Invalid OAuth client credentials.", status_code=401)
     # Public PKCE clients (e.g. ChatGPT connectors) send no client_secret.
     # Secretless auth is only accepted for authorization_code grants that
     # carry a syntactically valid PKCE verifier — and that verifier is then
