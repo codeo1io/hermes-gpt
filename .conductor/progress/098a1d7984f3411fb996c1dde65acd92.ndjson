@@ -1,0 +1,4 @@
+{"step":1,"ts":"2026-09-21T16:58:50Z","summary":"KTD5 re-dispatch: verified all 5 fix surfaces still on disk from cf265a76 (manifests 0, refs 0, README/CHANGELOG/ROADMAP/prioritization present)","touched":[]}
+{"step":2,"ts":"2026-09-21T16:59:11Z","summary":"solo reruns: g4c rotation test PASSED (load-flake class #6625 confirmed), mcp_compat 16p — both non-inherited failures pass in isolation","touched":[]}
+{"step":3,"ts":"2026-09-21T17:00:01Z","summary":"correction: rotation test is test_codex_pr63_remediation.py:1208 (5th stale-PKCE site #6579), NOT g4c; solo exit 0 — full2 = 5 inherited PKCE sites, mcp_compat passed","touched":[]}
+{"step":4,"ts":"2026-09-21T17:00:47Z","summary":"full phase_result with validation_evidence (scope=full, outcome=passed, digest verbatim) written to spool; schema-validated","touched":["/home/agent/.hermes/conductor-delegate-spool-infra-deploy/delegate/098a1d7984f3411fb996c1dde65acd92.json"]}
