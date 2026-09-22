@@ -28,16 +28,20 @@ jobs:
     uses: codeo1io/.github/.github/workflows/private-leak-sentinel.yaml@a86c8ef77170831d7efc7c683542e3b364366168 # gitleaks allowlist for redaction fixtures (2026-09-21)
 
   test:
-    # PR fast lane: on pull_request only ONE lane runs (python 3.11 +
-    # mcp>=2,<3). Push(master), nightly, and dispatch run the full
-    # matrix. With one self-hosted runner executing jobs serially, the
-    # PR run previously queued every lane behind the others (run
-    # 35148449897: 2h43m wall, lanes 400-940s each).
+    # PR fast lane: on pull_request only python 3.11 runs, but BOTH SDK
+    # lanes do — SDK majors differ in tool execution semantics (SDK 1 runs
+    # sync tools on the event loop, SDK 2 offloads them to a thread), so a
+    # PR must exercise both before merge. Push(master), nightly, and
+    # dispatch additionally widen the python matrix and pin exact floors.
+    # (History: with one self-hosted runner executing jobs serially, the
+    # PR run previously queued every lane behind the others — run
+    # 35148449897: 2h43m wall, lanes 400-940s each — hence the reduced
+    # python axis.)
     strategy:
       fail-fast: false
       matrix:
         python: ${{ github.event_name == 'pull_request' && fromJSON('["3.11"]') || fromJSON('["3.10", "3.11", "3.12"]') }}
-        sdk: ${{ github.event_name == 'pull_request' && fromJSON('["mcp>=2,<3"]') || fromJSON('["mcp>=1.28.1,<2", "mcp>=2,<3"]') }}
+        sdk: ["mcp>=1.28.1,<2", "mcp>=2,<3"]
         include: >-
           ${{ github.event_name == 'pull_request' && fromJSON('[]')
           || fromJSON('[{"python": "3.10", "sdk": "mcp==1.28.1"}, {"python": "3.10", "sdk": "mcp==2.0.0"}, {"python": "3.10", "sdk": "mcp==2.2.0"}]') }}

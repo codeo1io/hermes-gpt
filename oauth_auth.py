@@ -9,6 +9,7 @@ import re
 import secrets
 import time
 import urllib.parse
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -141,6 +142,17 @@ _MAX_REGISTER_BYTES = 8 * 1024
 
 #: Bounded dynamic-client registry (single-tenant issuer).
 MAX_DYNAMIC_CLIENTS = 64
+
+#: Per-source rate bound for the public RFC 7591 register endpoint:
+#: at most DYNAMIC_CLIENT_RATE_LIMIT registrations per source within
+#: DYNAMIC_CLIENT_RATE_WINDOW seconds.
+DYNAMIC_CLIENT_RATE_LIMIT = 5
+DYNAMIC_CLIENT_RATE_WINDOW = 300.0
+
+#: Dynamic clients older than this TTL are evicted (before the capacity
+#: check, and when a persisted registry is restored) so filling the
+#: capacity bound can never permanently block onboarding across restarts.
+DYNAMIC_CLIENT_TTL = 7 * 24 * 3600.0
 ACCESS_TOKEN_PREFIX = "hg.at.v1."
 _ACCESS_TOKEN_MAC_CONTEXT = b"hermes-gpt.oauth.access.v1\0"
 
@@ -339,23 +351,48 @@ class OAuthState:
         max_access_tokens: int = MAX_ACCESS_TOKENS,
         max_refresh_tokens: int = MAX_REFRESH_TOKENS,
         max_dynamic_clients: int = MAX_DYNAMIC_CLIENTS,
+        dynamic_client_rate_limit: int = DYNAMIC_CLIENT_RATE_LIMIT,
+        dynamic_client_rate_window: float = DYNAMIC_CLIENT_RATE_WINDOW,
+        dynamic_client_ttl: float = DYNAMIC_CLIENT_TTL,
     ) -> None:
         self.config = config
         self.max_auth_codes = max_auth_codes
         self.max_access_tokens = max_access_tokens
         self.max_refresh_tokens = max_refresh_tokens
         self.max_dynamic_clients = max_dynamic_clients
+        self.dynamic_client_rate_limit = dynamic_client_rate_limit
+        self.dynamic_client_rate_window = dynamic_client_rate_window
+        self.dynamic_client_ttl = dynamic_client_ttl
         self._authorization_code_key = secrets.token_bytes(32)
         self.used_auth_codes: dict[str, dict[str, Any]] = {}
         self.access_tokens: dict[str, dict[str, Any]] = {}
         self.refresh_tokens: dict[str, dict[str, Any]] = {}
         self.dynamic_clients: dict[str, DynamicClient] = {}
+        self._dynamic_client_rate: dict[str, deque[float]] = {}
         self._hermes_root: Path | None = None
         self._epoch: int = 0
         setattr(self, "_retired_refresh_to" + "kens", set())
 
-    def register_dynamic_client(self, redirect_uris: list[str]) -> DynamicClient:
-        """Mint a public dynamic client; bounded, chatgpt.com-redirects only."""
+    def _evict_expired_dynamic_clients(self, now: float | None = None) -> int:
+        """Drop dynamic clients past their TTL; returns how many were dropped."""
+        if now is None:
+            now = time.time()
+        expired = [
+            client_id
+            for client_id, client in self.dynamic_clients.items()
+            if now - client.registered_at > self.dynamic_client_ttl
+        ]
+        for client_id in expired:
+            del self.dynamic_clients[client_id]
+        return len(expired)
+
+    def register_dynamic_client(
+        self, redirect_uris: list[str], *, source: str = "local"
+    ) -> DynamicClient:
+        """Mint a public dynamic client; bounded, chatgpt.com-redirects only.
+
+        Bound three ways: per-source rate window, capacity, and TTL eviction
+        (expired slots are reclaimed before the capacity check)."""
         cleaned = list(dict.fromkeys(redirect_uris))
         if not cleaned or len(cleaned) > 8:
             raise OAuthError(
@@ -368,6 +405,17 @@ class OAuthState:
                     "invalid_redirect_uri",
                     "redirect_uris must be absolute HTTPS URLs on chatgpt.com/openai.com hosts.",
                 )
+        now = time.time()
+        self._evict_expired_dynamic_clients(now)
+        window = self._dynamic_client_rate.setdefault(source, deque())
+        while window and window[0] <= now - self.dynamic_client_rate_window:
+            window.popleft()
+        if len(window) >= self.dynamic_client_rate_limit:
+            raise OAuthError(
+                "temporarily_unavailable",
+                "Dynamic client registration rate exceeded for this source; retry later.",
+                status_code=429,
+            )
         if len(self.dynamic_clients) >= self.max_dynamic_clients:
             raise OAuthError(
                 "temporarily_unavailable",
@@ -378,9 +426,10 @@ class OAuthState:
         client = DynamicClient(
             client_id=client_id,
             redirect_uris=tuple(cleaned),
-            registered_at=time.time(),
+            registered_at=now,
         )
         self.dynamic_clients[client_id] = client
+        window.append(now)
         return client
 
     def client_redirect_allowed(self, client_id: str, redirect_uri: str) -> bool:
@@ -407,6 +456,7 @@ class OAuthState:
     def import_dynamic_clients(self, payload: Any) -> int:
         if not isinstance(payload, list):
             return 0
+        now = time.time()
         imported = 0
         for item in payload:
             if not isinstance(item, dict):
@@ -415,6 +465,9 @@ class OAuthState:
             redirects = item.get("redirect_uris")
             registered_at = item.get("registered_at", 0)
             if not isinstance(client_id, str) or not isinstance(redirects, list):
+                continue
+            if now - float(registered_at or 0) > self.dynamic_client_ttl:
+                # Expired entries do not consume capacity on restore either.
                 continue
             if len(self.dynamic_clients) >= self.max_dynamic_clients:
                 break
@@ -1203,8 +1256,10 @@ def authorization_metadata(_request: Request, state: OAuthState) -> JSONResponse
             # RFC 7591: openai-mcp (ChatGPT connectors) polls this document
             # specifically for the registration endpoint; without it a
             # credential-less connector loops discovery->401 forever and can
-            # never onboard.  The endpoint itself is public and rate-bounded
-            # (see register_client). Advertised unless DCR is explicitly
+            # never onboard.  The endpoint itself is public; registrations
+            # are bounded by a per-source rate window, the dynamic-client
+            # capacity, and a TTL that evicts stale clients (see
+            # register_dynamic_client). Advertised unless DCR is explicitly
             # disabled for single confidential-client deployments.
             **({"registration_endpoint": f"{issuer}/oauth/register"} if _dcr_enabled() else {}),
             "response_types_supported": ["code"],
@@ -1364,7 +1419,10 @@ async def register_client(request: Request, state: OAuthState) -> JSONResponse:
         redirect_uris = payload.get("redirect_uris")
         if not isinstance(redirect_uris, list):
             raise OAuthError("invalid_redirect_uri", "redirect_uris must be a JSON array.")
-        client = state.register_dynamic_client(redirect_uris)
+        client = state.register_dynamic_client(
+            redirect_uris,
+            source=request.client.host if request.client else "unknown",
+        )
         _run_persist_hook(state, "register_client")
         return JSONResponse(client.as_public_dict(), status_code=201)
     except OAuthError as exc:

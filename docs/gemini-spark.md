@@ -1,6 +1,6 @@
 # Gemini Spark custom app
 
-Hermes GPT's built-in OAuth boundary can authenticate Google's consumer Gemini Apps **Custom apps for Spark** connector. Google drives that flow as a manually configured confidential client because this server advertises no dynamic client registration; the opt-in **Gemini Spark client profile** registers an additional confidential client that stays isolated from the primary client (for example the ChatGPT connector client).
+Hermes GPT's built-in OAuth boundary can authenticate Google's consumer Gemini Apps **Custom apps for Spark** connector. Google drives that flow as a manually configured confidential client. Dynamic client registration is advertised by default; setting `HERMES_GPT_OAUTH_DCR=0` stops advertising it (`registration_endpoint` disappears from the authorization-server metadata), which is what triggers Gemini's documented manual Client ID/Secret fallback. The opt-in **Gemini Spark client profile** registers an additional confidential client that stays isolated from the primary client (for example the ChatGPT connector client).
 
 This guide covers the profile, both configuration patterns, callback discovery, verification, and rollback. The authorization server itself — scopes, PKCE, refresh rotation, and the durable token store — is documented in [OAuth and bearer authentication](oauth.md) and is not repeated here.
 
@@ -27,7 +27,7 @@ Verified on 2026-09-21 against a real Gemini Spark connection to a Hermes GPT OA
 - **Operator/Owner authority is process-wide, not per client.** Every registered OAuth client on an instance reaches the same policy-gated tool surface, so an additional client profile can never *lower* what another client sees — but it is not separately sandboxed either. Adding the Gemini Spark profile to an instance that already runs Operator direct mode or Owner Mode gives the Gemini connector the same authority the primary client has. Prefer a **dedicated read-only instance** for Gemini instead of adding it to an owner-mode instance.
 - **Isolated credentials.** The profile registers its own `client_id`, its own secret, and its own exact-match redirect-URI allowlist. A client can only complete an authorization request to its **own** redirect URIs and can only authenticate with its **own** secret at the token endpoint; another client's credentials or redirects fail closed.
 - **Exact-match redirects.** Redirect URIs are compared exactly. Wildcards are neither accepted nor supported.
-- **No dynamic client registration, by design.** `registration_endpoint` is not advertised, which is exactly what triggers Gemini's documented manual Client ID/Secret fallback.
+- **No dynamic client registration, by design for this profile.** The verified setup ran with `HERMES_GPT_OAUTH_DCR=0`, so `registration_endpoint` was not advertised — exactly what triggers Gemini's documented manual Client ID/Secret fallback. With DCR left advertised (the default), the connector may instead register itself dynamically via `POST /oauth/register`.
 
 ## Configuration
 
@@ -102,7 +102,7 @@ Never add a wildcard, a suffix, or a "close enough" variant: exact matching mean
 
 ## Connecting in Gemini
 
-In the Gemini web app: **Settings & help → Connected Apps → Custom apps → Add a custom app**, paste the MCP URL (`https://<your-mcp-host>/mcp`), then open **Advanced features → Show more** and enter the Client ID and Client secret manually. This is Google's documented path when the server does not advertise dynamic client registration.
+In the Gemini web app: **Settings & help → Connected Apps → Custom apps → Add a custom app**, paste the MCP URL (`https://<your-mcp-host>/mcp`), then open **Advanced features → Show more** and enter the Client ID and Client secret manually. This is Google's documented path when the server does not advertise dynamic client registration (`HERMES_GPT_OAUTH_DCR=0`).
 
 Success looks like: the custom app connects without Google's account-linking error, and the server log shows the authorize hop, then `POST /oauth/token` → 200, then authenticated `POST /mcp` traffic.
 
@@ -126,7 +126,7 @@ Functional check: ask Gemini to **list Hermes skills**. That exercises the read-
 
 ## Limitations
 
-- **No dynamic client registration.** There is no `registration_endpoint`, so the Client ID/Secret must be entered manually in Gemini under **Advanced features → Show more**. This is by design, not a misconfiguration.
+- **Dynamic client registration is off for this profile.** Set `HERMES_GPT_OAUTH_DCR=0` so no `registration_endpoint` is advertised and the Client ID/Secret must be entered manually in Gemini under **Advanced features → Show more**. This is a deliberate deployment choice, not a misconfiguration; the `/oauth/register` route itself still answers direct calls (the knob controls advertising only).
 - **PKCE S256 works.** Only S256 is advertised and accepted; another `code_challenge_method` is rejected with `invalid_request`.
 - **Google-side errors can be opaque or transient.** An observed example is "Account linking is required to use this custom app. Try again." — retrying the connection is often sufficient.
 - **The user's browser must resolve the MCP hostname** during the authorize hop; the Google backend reaching the server is not enough.

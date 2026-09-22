@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import time
 
 import pytest
 from starlette.applications import Starlette
@@ -179,13 +180,66 @@ def test_register_refuses_confidential_auth_method(client: TestClient):
 
 
 def test_register_rejects_malformed_payload(client: TestClient):
-    response = client.post("/oauth/register", data="not-json")
+    response = client.post("/oauth/register", content="not-json")
     assert response.status_code == 400
 
 
 def test_register_capacity_is_bounded(client: TestClient, state: OAuthState):
+    # Widen the rate window so the CAPACITY bound is what this test hits,
+    # not the per-source rate bound (both answer 429).
+    state.dynamic_client_rate_limit = state.max_dynamic_clients + 2
     codes = [_register(client).status_code for _ in range(state.max_dynamic_clients + 2)]
     assert 429 in codes
+
+
+def test_register_is_rate_bounded_per_source(client: TestClient, state: OAuthState):
+    state.dynamic_client_rate_limit = 2
+    state.dynamic_client_rate_window = 60.0
+    codes = [_register(client).status_code for _ in range(4)]
+    assert codes[:2] == [201, 201]
+    assert codes[2:] == [429, 429]
+    # A different source is unaffected (the rate window is per source).
+    other = state.register_dynamic_client(
+        [REDIRECT_URI], source="10.0.0.9:4444"
+    )
+    assert other.client_id.startswith("dyn-")
+
+
+def test_register_ttl_eviction_reclaims_capacity(client: TestClient, state: OAuthState):
+    state.max_dynamic_clients = 2
+    state.dynamic_client_rate_limit = 8
+    first = _register(client).json()["client_id"]
+    second = _register(client).json()["client_id"]
+    assert _register(client).status_code == 429  # capacity exhausted
+    # Age both clients past the TTL; the next registration must succeed by
+    # reclaiming the expired slots instead of bricking the endpoint.
+    expired_at = time.time() - state.dynamic_client_ttl - 1
+    # DynamicClient is a frozen dataclass; age it in place for the test.
+    object.__setattr__(state.dynamic_clients[first], "registered_at", expired_at)
+    object.__setattr__(state.dynamic_clients[second], "registered_at", expired_at)
+    response = _register(client)
+    assert response.status_code == 201, response.text
+    assert len(state.dynamic_clients) == 1
+
+
+def test_import_dynamic_clients_drops_expired(state: OAuthState):
+    now = time.time()
+    payload = [
+        {
+            "client_id": "dyn-fresh",
+            "redirect_uris": [REDIRECT_URI],
+            "registered_at": now,
+        },
+        {
+            "client_id": "dyn-stale",
+            "redirect_uris": [REDIRECT_URI],
+            "registered_at": now - state.dynamic_client_ttl - 3600,
+        },
+    ]
+    imported = state.import_dynamic_clients(payload)
+    assert imported == 1
+    assert "dyn-fresh" in state.dynamic_clients
+    assert "dyn-stale" not in state.dynamic_clients
 
 
 # -- dynamic client authorize + exchange ------------------------------------

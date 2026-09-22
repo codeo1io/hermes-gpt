@@ -16,6 +16,31 @@ else:
     SDK_V2 = True
 
 
+def _offload_sync_tool(fn: Any) -> Any:
+    """Wrap a sync tool handler in an async coroutine that runs it in a thread.
+
+    SDK 2 already offloads sync tools via ``anyio.to_thread.run_sync``; SDK
+    1 executes them directly on the event loop. ``HermesMCP.add_tool`` only
+    applies this wrapper on SDK 1, so both majors end up with the same
+    execution semantics (sync bodies never block or nest ``asyncio.run``
+    on the loop). ``functools.wraps`` keeps name/doc/signature intact for
+    schema generation.
+    """
+    import functools
+    import inspect
+
+    if inspect.iscoroutinefunction(fn):
+        return fn
+
+    @functools.wraps(fn)
+    async def _offloaded(**call_kwargs: Any) -> Any:
+        import anyio
+
+        return await anyio.to_thread.run_sync(lambda: fn(**call_kwargs))
+
+    return _offloaded
+
+
 class HermesMCP(_Server):
     """A server with explicit, version-independent transport configuration."""
 
@@ -46,6 +71,21 @@ class HermesMCP(_Server):
             )
             # SDK 1 has no public app-version constructor parameter.
             self._mcp_server.version = version
+
+    if not SDK_V2:
+
+        def add_tool(self, fn: Any, *args: Any, **kwargs: Any) -> Any:
+            """Register a tool, offloading sync handlers to a worker thread.
+
+            SDK 1 executes sync tools on the event loop (its FastMCP calls
+            ``fn(**kwargs)`` inline), so any long-blocking sync tool — e.g.
+            ``hermes_bot_chat_send`` with its 900s session timeout — froze
+            the entire server, and sync bodies calling ``asyncio.run()``
+            raised ``RuntimeError``. Wrapping sync handlers into offloading
+            coroutines reproduces SDK 2 semantics. No-op passthrough on
+            SDK 2, which already offloads.
+            """
+            return super().add_tool(_offload_sync_tool(fn), *args, **kwargs)
 
     def streamable_http_app(self, **kwargs: Any) -> Any:
         if SDK_V2:

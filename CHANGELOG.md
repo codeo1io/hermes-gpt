@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Run synchronous MCP tools on a worker thread under MCP SDK 1.x: `mcp_compat`'s `HermesMCP.add_tool` wraps sync tool handlers in an offloading coroutine only when SDK < 2 is installed, reproducing SDK 2's thread-offload semantics. Long-running sync tools (for example `hermes_bot_chat_send`, which can wait on a 900-second session) no longer stall the server event loop on SDK 1, and sync tool bodies that call `asyncio.run()` no longer raise `RuntimeError`. SDK 2 deployments are unchanged.
+- Converted `hermes_web_extract` and `hermes_vision_analyze` to async tool bodies that `await` their underlying helpers directly.
+- Hardened RFC 7591 `/oauth/register`: registrations are now rate-bounded per source (5 per 5 minutes by default) and dynamic clients expire after a 7-day TTL that is also enforced when a persisted registry is restored — filling the 64-client capacity can no longer permanently block connector onboarding across restarts. The discovery-document comment now describes these actual bounds.
+- Added the `mcp>=1.28.1,<2` lane to the pull-request CI fast lane so both SDK execution models run before merge.
+- Documented `HERMES_GPT_OAUTH_PKCE_MODE` and `HERMES_GPT_OAUTH_DCR` in `docs/oauth.md`; `docs/gemini-spark.md` no longer claims dynamic client registration is unconditionally unavailable.
+- Added the `HERMES_GPT_OAUTH_DCR` gate: `registration_endpoint` is advertised by default and disappears from the authorization-server metadata when set to `0` for single confidential-client deployments.
+- Converted the six long-polling session tools of the deployed event-loop-safety fix (`hermes_session_continue` family) to async tool bodies.
+- Fixed the delegation-ledger per-source watermark so it is set when a page is consumed (not only cleared), keeping pagination cursors correct across restarts.
+- Operator workspaces route subprocess temp directories through a workspace-scoped tmp directory.
+
 ## 0.11.0 - 2026-09-21
 
 - Drove the repository-wide `ruff` error count from 61 to zero and replaced the CI lint job's hand-maintained file list with a repo-wide `ruff check .` gate.
