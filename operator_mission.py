@@ -875,18 +875,11 @@ def _profile_summary(profile: str, root: Path | None, warnings: list[str]) -> di
     except Exception:
         pass
 
-    # Gateway running (pid probe).
+    # Gateway running (pid probe). gateway.pid may hold a bare int (legacy) or a
+    # JSON object (current gateways); gateway_state.json is the fallback.
     gateway_running = False
     try:
-        pid_path = home / "gateway.pid"
-        # Fix 2026-09-08 (see MEMORY.md / HANDOFF.md, hermes-gpt v0.8.0 @ fc1f68c):
-        # gateway.pid can hold JSON (newer gateway versions) instead of a plain
-        # int; fall back to gateway_state.json like operator_workspace does,
-        # instead of silently treating the gateway as not running.
-        pid: int | None = op_workspace._read_gateway_pid_from_pid_file(pid_path)
-        if pid is None:
-            _state = op_workspace._read_gateway_state(home / "gateway_state.json")
-            pid = op_workspace._read_gateway_pid_from_state(_state)
+        pid, _source = op_diag._read_gateway_pid(home)
         gateway_running = op_diag._is_process_alive(pid) if pid is not None else False
     except Exception:
         gateway_running = False

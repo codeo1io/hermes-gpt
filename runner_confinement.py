@@ -226,6 +226,30 @@ def _linux_nested_mounts(root: Path) -> list[Path]:
     return nested
 
 
+def _env_shebang_interpreter(raw: Path) -> Path | None:
+    """Return the PATH-resolved interpreter for an ``env`` shebang, if any.
+
+    Scripts launched with ``#!/usr/bin/env python3`` resolve their interpreter
+    through ``PATH`` *inside* the sandbox. On hosts where that resolves outside
+    the read-only bind set (for example a toolcache Python on ``PATH`` whose
+    ``libpython`` lives in an unbound tree), exec fails with 127. Callers use
+    this to bind the interpreter's runtime root proactively.
+    """
+    try:
+        with raw.open("rb") as fh:
+            head = fh.read(256)
+    except OSError:
+        return None
+    if not head.startswith(b"#!"):
+        return None
+    parts = head[2:].split(b"\n", 1)[0].strip().split()
+    if len(parts) < 2 or parts[0].endswith(b"/env") is False:
+        return None
+    name = parts[-1].decode("utf-8", "replace")
+    found = shutil.which(name)
+    return Path(found) if found else None
+
+
 def _runtime_readonly_root(argv: list[str], workspace: Path) -> Path | None:
     """Return the smallest practical extra read-only tree needed by argv[0]."""
     if not argv:
@@ -276,6 +300,20 @@ def _wrap_argv_with_tool(
     workspace_path = Path(workspace).expanduser().resolve()
     workspace_resolved = str(workspace_path)
     runtime_root = _runtime_readonly_root(argv, workspace_path)
+    runtime_roots: list[Path] = []
+    if runtime_root is not None:
+        runtime_roots.append(runtime_root)
+    # An env-shebang script resolves its interpreter through PATH inside the
+    # sandbox; bind that interpreter's runtime tree so exec cannot fail with
+    # 127 when PATH points at a toolcache interpreter outside the bind set.
+    if argv:
+        first = Path(argv[0]).expanduser()
+        if first.is_absolute():
+            interpreter = _env_shebang_interpreter(first)
+            if interpreter is not None:
+                extra = _runtime_readonly_root([str(interpreter)], workspace_path)
+                if extra is not None and extra not in runtime_roots:
+                    runtime_roots.append(extra)
     if sys.platform.startswith("linux"):
         wrapped = [tool]
         for source in _LINUX_RO_PATHS:
@@ -295,8 +333,8 @@ def _wrap_argv_with_tool(
         # as Bun that require /proc to initialize.
         proc_args = ["--proc", "/proc"] if expose_proc else ["--dir", "/proc"]
         wrapped += [*proc_args, "--dev", "/dev", "--tmpfs", "/tmp", "--tmpfs", "/run"]
-        if runtime_root is not None:
-            runtime = str(runtime_root)
+        for root in runtime_roots:
+            runtime = str(root)
             wrapped += ["--ro-bind", runtime, runtime]
         workspace_bind = "--bind" if writable else "--ro-bind"
         wrapped += [
@@ -313,7 +351,7 @@ def _wrap_argv_with_tool(
         profile = _macos_sandbox_profile(
             workspace_resolved,
             writable=writable,
-            runtime_root=runtime_root,
+            runtime_root=runtime_roots[0] if runtime_roots else None,
         )
         return [tool, "-p", profile, *argv]
     raise RuntimeError(f"confinement unsupported on platform {sys.platform!r}")

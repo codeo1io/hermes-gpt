@@ -21,6 +21,14 @@ import operator_policy as op
 import token_store
 
 
+_PKCE_VERIFIER = "A" * 64
+
+
+def _pkce_challenge(verifier: str = _PKCE_VERIFIER) -> str:
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
 def _oauth_config() -> oauth_auth.OAuthConfig:
     return oauth_auth.OAuthConfig(
         issuer="https://example.test",

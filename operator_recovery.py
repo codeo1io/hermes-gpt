@@ -71,17 +71,47 @@ def _reconcile_swarm_stages(hermes_root: Path, apply: bool) -> dict[str, Any]:
 
 
 def _reload_token_store(hermes_root: Path) -> dict[str, Any]:
+    """Report durable credential-store health across current and legacy layouts.
+
+    v0.10 moved live credentials from the legacy encrypted JSON envelope to a
+    SQLite store. Restart reconciliation must therefore use token_store.status(),
+    which understands both layouts, instead of treating a missing legacy
+    envelope as an empty store.
+    """
     try:
         import token_store
     except Exception:
         return {"available": False, "detail": "token_store not available"}
     try:
-        envelope = token_store.load_envelope(hermes_root=hermes_root)
+        store_status = token_store.status(hermes_root)
     except Exception as exc:
         return {"available": True, "integrity": "FAIL", "detail": str(exc)[:300]}
-    if envelope is None:
-        return {"available": True, "integrity": "EMPTY", "detail": "no token envelope on disk"}
-    return {"available": True, "integrity": "OK", "kid": envelope.get("kid", "")}
+
+    presence = str(store_status.get("presence") or "unknown")
+    if presence == "absent":
+        return {
+            "available": False,
+            "integrity": "EMPTY",
+            "presence": presence,
+            "detail": "no durable credential store on disk",
+            "revocation_epoch": store_status.get("revocation_epoch", 0),
+        }
+    if presence == "corrupt":
+        return {
+            "available": True,
+            "integrity": "FAIL",
+            "presence": presence,
+            "detail": str(store_status.get("error") or "durable credential store is corrupt")[:300],
+            "revocation_epoch": store_status.get("revocation_epoch"),
+        }
+    return {
+        "available": bool(store_status.get("available", True)),
+        "integrity": "OK",
+        "presence": presence,
+        "revocation_epoch": store_status.get("revocation_epoch", 0),
+        "client_count": int(store_status.get("client_count") or 0),
+        "expires_at": store_status.get("expires_at"),
+    }
 
 
 def _fabric_reconcile_summary(hermes_root: Path, *, apply: bool) -> dict[str, Any]:

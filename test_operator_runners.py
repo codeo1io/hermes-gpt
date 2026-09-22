@@ -502,6 +502,10 @@ def test_pi_writable_contract_rejected_until_filesystem_confinement_exists(tmp_p
     root = tmp_path / "hermes"
     root.mkdir()
     _enable_workspace(monkeypatch, ws)
+    # Force the no-confinement posture regardless of host tooling: the host may
+    # genuinely have bubblewrap installed (self-hosted runners), which would
+    # make the writable dispatch legitimately succeed.
+    monkeypatch.setattr(runners.confinement, "confinement_available", lambda **_: False)
     backend = runners.get_backend("pi_rpc")
     monkeypatch.setattr(backend, "executable", lambda: "/bin/true")
     raw = _contract(ws, backend="pi_rpc")
