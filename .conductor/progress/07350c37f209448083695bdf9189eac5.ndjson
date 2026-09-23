@@ -1,0 +1,6 @@
+{"step":1,"ts":"2026-09-21T13:48:00Z","summary":"lineage proven: HEAD 808de652c1, 4 per-unit commits on base c1785b22e5, diff=16 paths, 0 gitlinks","touched":[]}
+{"step":2,"ts":"2026-09-21T13:49:00Z","summary":"remotes verified: origin run-branch=808de652c1==PR12 headRefOid, master unchanged f8ba2e7862; fleet main=a86c8ef7","touched":[]}
+{"step":3,"ts":"2026-09-21T13:50:00Z","summary":"CI/PR state: PR12 OPEN MERGEABLE all checks pass/skip (run 35604745614 success); .github repo zero CI runs (none configured)","touched":[]}
+{"step":4,"ts":"2026-09-21T13:51:00Z","summary":"unrelated checkouts preserved: canonical feat/private-leak-sentinel@c1785b22e5 untouched; 4 sibling run worktrees + fork deploy f8ba2e78 unchanged","touched":[]}
+{"step":5,"ts":"2026-09-21T13:52:00Z","summary":"worktree cleanup: uv.lock+.venv removed (kept ROADMAP.md/.conductor); pruned 2 confirmed-dead /tmp worktree registrations","touched":["uv.lock",".venv"]}
+{"step":6,"ts":"2026-09-21T13:53:00Z","summary":"repository_reconciliation emitted to spool; reconcile gate evidence complete","touched":["/home/agent/.hermes/conductor-delegate-spool-infra-deploy/delegate/07350c37f209448083695bdf9189eac5.json"]}
