@@ -361,7 +361,12 @@ def test_affinity_skill_owner_ranks_first():
     v = pl.score_targets(req, [owner, other])
     assert v["candidate_set"][0]["entity_id"] == "profile:dev"
     assert v["score_breakdown"]["profile:dev"]["scores"]["affinity"] == 1.0
-    assert v["score_breakdown"]["profile:qa"]["scores"]["affinity"] == 0.0
+    # Since canonical skill resolution (rm-027): a zero-skill target is
+    # hard-filtered out when skills are required (required_skills_missing),
+    # not merely ranked last by affinity.
+    assert "profile:qa" not in v["score_breakdown"]
+    qa_optouts = v["filter_optouts"]["profile:qa"]
+    assert "required_skills_missing" in qa_optouts
 
 
 def test_load_headroom_prefers_idle():
