@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 from pathlib import Path
@@ -11,6 +12,18 @@ import operator_delegations as delegations
 import operator_mission_runtime as missions
 import operator_policy as op
 import operator_runners as runners
+
+#: Inter-thread coordination budget for this module's concurrency tests.
+# These ``Event.wait``/``Thread.join`` timeouts are deadlock detectors, not
+# wall-clock contracts: the assertion behind each call cares that coordination
+# COMPLETES, never that it completes within a fixed few seconds. The shared
+# validation runner is routinely saturated (load average 30-50 while concurrent
+# full-suite fleets run), where 2-15 s budgets produce load-timing false
+# positives (ROADMAP.md, "Cycle 1 learnings", rules 9 and 13). Healthy runs are
+# not slowed at all -- wait/join return the moment coordination completes; a
+# real deadlock still fails, at the widened deadline. Override with
+# HERMES_TEST_THREAD_BUDGET when debugging a genuine hang.
+_THREAD_BUDGET = float(os.environ.get("HERMES_TEST_THREAD_BUDGET", "30"))
 
 
 def _enable_workspace(monkeypatch: pytest.MonkeyPatch, workspace: Path) -> None:
@@ -144,7 +157,7 @@ def test_owner_approval_fails_closed_against_inflight_confirmed_cancel(
 
     def paused_cancel(*args, **kwargs):
         backend_entered.set()
-        assert backend_release.wait(5)
+        assert backend_release.wait(_THREAD_BUDGET)
         return json.dumps({"success": True, "changed": True, "state": "cancelled"})
 
     monkeypatch.setattr(delegations.runners, "hermes_runner_cancel", paused_cancel)
@@ -155,7 +168,7 @@ def test_owner_approval_fails_closed_against_inflight_confirmed_cancel(
         )
     )))
     cancel_thread.start()
-    assert backend_entered.wait(5)
+    assert backend_entered.wait(_THREAD_BUDGET)
     monkeypatch.setenv(op.OPERATOR_LEVEL_ENV, "owner")
     monkeypatch.setenv(op.OWNER_ACTIVE_ENV, "1")
     monkeypatch.setenv(op.OWNER_ACK_ENV, op.OWNER_ACK_REQUIRED_VALUE)
@@ -168,7 +181,7 @@ def test_owner_approval_fails_closed_against_inflight_confirmed_cancel(
     assert current["approval"] == {}
     assert next(a for a in current["attachments"] if a["ref"] == delegation_id)["evidence_ref"] == evidence_ref
     backend_release.set()
-    cancel_thread.join(5)
+    cancel_thread.join(_THREAD_BUDGET)
     assert not cancel_thread.is_alive()
     assert cancelled[0]["delegation"]["state"] == "cancelled"
 
@@ -198,7 +211,7 @@ def test_no_approval_reconcile_fails_closed_when_confirmed_cancel_starts_after_o
 
     def paused_guard(*args, **kwargs):
         observed.set()
-        assert release_reconcile.wait(5)
+        assert release_reconcile.wait(_THREAD_BUDGET)
         return original_guard(*args, **kwargs)
 
     monkeypatch.setattr(missions, "_completion_guard", paused_guard)
@@ -209,14 +222,14 @@ def test_no_approval_reconcile_fails_closed_when_confirmed_cancel_starts_after_o
         )
     )))
     reconcile_thread.start()
-    assert observed.wait(5)
+    assert observed.wait(_THREAD_BUDGET)
 
     backend_entered = threading.Event()
     backend_release = threading.Event()
 
     def paused_cancel(*args, **kwargs):
         backend_entered.set()
-        assert backend_release.wait(5)
+        assert backend_release.wait(_THREAD_BUDGET)
         return json.dumps({"success": True, "changed": True, "state": "cancelled"})
 
     monkeypatch.setattr(delegations.runners, "hermes_runner_cancel", paused_cancel)
@@ -227,14 +240,14 @@ def test_no_approval_reconcile_fails_closed_when_confirmed_cancel_starts_after_o
         )
     )))
     cancel_thread.start()
-    assert backend_entered.wait(5)
+    assert backend_entered.wait(_THREAD_BUDGET)
     release_reconcile.set()
-    reconcile_thread.join(5)
+    reconcile_thread.join(_THREAD_BUDGET)
     assert not reconcile_thread.is_alive()
     assert reconcile_result[0]["success"] is False
     assert json.loads(missions.hermes_mission_get(mission_id, hermes_root=root))["status"] != "completed"
     backend_release.set()
-    cancel_thread.join(5)
+    cancel_thread.join(_THREAD_BUDGET)
     assert not cancel_thread.is_alive()
     assert cancelled[0]["delegation"]["state"] == "cancelled"
 
@@ -277,7 +290,7 @@ def test_mission_completion_rejects_concurrent_reconcile_authority_change(
 
     def paused_guard(*args, **kwargs):
         observed.set()
-        assert release.wait(5)
+        assert release.wait(_THREAD_BUDGET)
         return original_guard(*args, **kwargs)
 
     monkeypatch.setattr(missions, "_completion_guard", paused_guard)
@@ -293,7 +306,7 @@ def test_mission_completion_rejects_concurrent_reconcile_authority_change(
             return missions.hermes_mission_reconcile(mission_id, confirm=True, dry_run=False, hermes_root=root)
     thread = threading.Thread(target=lambda: result.append(json.loads(call())))
     thread.start()
-    assert observed.wait(5)
+    assert observed.wait(_THREAD_BUDGET)
 
     meta_path, _, _ = runners._job_paths(task_id, root)
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -304,7 +317,7 @@ def test_mission_completion_rejects_concurrent_reconcile_authority_change(
     ))
     assert invalidated["delegation"]["state"] == "running"
     release.set()
-    thread.join(5)
+    thread.join(_THREAD_BUDGET)
     assert not thread.is_alive()
     assert result[0]["success"] is False
     assert json.loads(missions.hermes_mission_get(mission_id, hermes_root=root))["status"] != "completed"
@@ -355,7 +368,7 @@ def test_concurrent_exact_cancel_invokes_backend_once_and_latches_ambiguous_fail
         nonlocal calls
         calls += 1
         entered.set()
-        assert release.wait(5)
+        assert release.wait(_THREAD_BUDGET)
         return json.dumps({"success": False, "code": "BACKEND_TIMEOUT"})
 
     monkeypatch.setattr(delegations.runners, "hermes_runner_cancel", ambiguous_cancel)
@@ -366,7 +379,7 @@ def test_concurrent_exact_cancel_invokes_backend_once_and_latches_ambiguous_fail
         )
     )))
     first.start()
-    assert entered.wait(5)
+    assert entered.wait(_THREAD_BUDGET)
     retry = json.loads(delegations.hermes_delegation_cancel(
         delegation_id, confirm=True, dry_run=False, hermes_root=root,
     ))
@@ -375,7 +388,7 @@ def test_concurrent_exact_cancel_invokes_backend_once_and_latches_ambiguous_fail
     assert retry["idempotent_retry"] is True
     assert calls == 1
     release.set()
-    first.join(5)
+    first.join(_THREAD_BUDGET)
     assert not first.is_alive()
     assert first_result[0]["success"] is False
 
@@ -417,7 +430,7 @@ def test_parent_cancellation_racing_child_cancellation_preserves_lock_order(
 
     def paused_cancel(*args, **kwargs):
         backend_entered.set()
-        assert backend_release.wait(5)
+        assert backend_release.wait(_THREAD_BUDGET)
         return json.dumps({"success": True, "changed": True, "state": "cancelled"})
 
     monkeypatch.setattr(delegations.runners, "hermes_runner_cancel", paused_cancel)
@@ -428,7 +441,7 @@ def test_parent_cancellation_racing_child_cancellation_preserves_lock_order(
         )
     )))
     child.start()
-    assert backend_entered.wait(5)
+    assert backend_entered.wait(_THREAD_BUDGET)
 
     parent_blocked = json.loads(missions.hermes_mission_transition(
         mission_id, "cancelled", confirm=True, dry_run=False, hermes_root=root,
@@ -436,7 +449,7 @@ def test_parent_cancellation_racing_child_cancellation_preserves_lock_order(
     assert parent_blocked["success"] is False
     assert child.is_alive()
     backend_release.set()
-    child.join(5)
+    child.join(_THREAD_BUDGET)
     assert not child.is_alive()
     assert child_result[0]["delegation"]["state"] == "cancelled"
 
@@ -654,7 +667,7 @@ def test_reconcile_cas_preserves_concurrently_confirmed_cancellation(
     def paused_validate(*args, **kwargs):
         result = original_validate(*args, **kwargs)
         entered.set()
-        assert release.wait(5)
+        assert release.wait(_THREAD_BUDGET)
         return result
 
     monkeypatch.setattr(delegations.contract_mod, "_validate_manifest_impl", paused_validate)
@@ -665,7 +678,7 @@ def test_reconcile_cas_preserves_concurrently_confirmed_cancellation(
         )
     )))
     thread.start()
-    assert entered.wait(5)
+    assert entered.wait(_THREAD_BUDGET)
     monkeypatch.setattr(
         delegations.runners,
         "hermes_runner_cancel",
@@ -676,7 +689,7 @@ def test_reconcile_cas_preserves_concurrently_confirmed_cancellation(
     ))
     assert cancelled["delegation"]["state"] == "cancelled"
     release.set()
-    thread.join(5)
+    thread.join(_THREAD_BUDGET)
     assert not thread.is_alive()
     assert result[0]["stale_observation"] is True
     assert result[0]["applied"] is False
@@ -1091,6 +1104,83 @@ def test_reconcile_ambiguous_cancel_retains_latch_without_terminal_authority(
     assert out["delegation"]["cancellation_in_progress"] is True
 
 
+def test_reconcile_ambiguous_cancel_resolves_from_pre_claim_terminal_observation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A run that died before cancellation was claimed must not latch forever.
+
+    The ordering rule only accepts terminal timestamps newer than the claim;
+    a dead runner can never emit one. Reconcile must still resolve when the
+    observation is byte-identical to the claim-time watermark and the run
+    started before the claim (nothing left to cancel).
+    """
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    root = tmp_path / "hermes"
+    _enable_workspace(monkeypatch, workspace)
+    task_id = "cancel-preclaim-terminal"
+    delegation_id = "dlg-cancel-preclaim-terminal"
+    monkeypatch.setattr(
+        delegations.contract_mod,
+        "hermes_contract_dispatch",
+        lambda *args, **kwargs: json.dumps({"success": True, "changed": True, "state": "running"}),
+    )
+    assert json.loads(delegations.hermes_delegation_dispatch(
+        json.dumps(_contract(workspace, task_id=task_id)), delegation_id=delegation_id,
+        confirm=True, dry_run=False, hermes_root=root,
+    ))["success"]
+
+    # The runner died BEFORE any cancellation was attempted: write its terminal
+    # record first, so the cancellation claim watermarks this exact observation.
+    meta_path, _, _ = runners._job_paths(task_id, root)
+    terminal_record = {
+        "schema_version": runners.SCHEMA_VERSION,
+        "task_id": task_id,
+        "backend": "pi_rpc",
+        "state": "failed",
+        "outcome": "failed",
+        "created_at": "2026-08-22T00:00:00+00:00",
+        "started_at": "2026-08-22T00:00:01+00:00",
+        "ended_at": "2026-08-22T00:00:02+00:00",
+        "error": "runner exited with code 127",
+    }
+    runners._atomic_json(meta_path, terminal_record)
+
+    monkeypatch.setattr(
+        delegations.runners,
+        "hermes_runner_cancel",
+        lambda *args, **kwargs: json.dumps({"success": True, "changed": False, "state": "failed"}),
+    )
+    ambiguous = json.loads(delegations.hermes_delegation_cancel(
+        delegation_id, confirm=True, dry_run=False, hermes_root=root,
+    ))
+    assert ambiguous["delegation"]["cancellation_in_progress"] is True
+
+    # Backdate the claim to just after the run ended: no post-claim terminal
+    # record can ever exist, and the claim-time watermark still matches this
+    # observation byte for byte.
+    with delegations._connect(delegations._db_path(root), write=True) as db:
+        db.execute(
+            "UPDATE delegations SET cancellation_claimed_at='2026-08-22T00:00:10+00:00' "
+            "WHERE delegation_id=?", (delegation_id,),
+        )
+        db.commit()
+        stored = delegations._get_row(db, delegation_id)
+        assert stored["cancellation_observation_sha256"] == delegations._observation_sha256(
+            delegations._latest_observation(task_id, root)
+        )
+
+    out = json.loads(delegations.hermes_delegation_reconcile(
+        delegation_id, apply=True, hermes_root=root,
+    ))
+    row = out["delegation"]
+    assert row["state"] == "failed"
+    assert row["cancellation_in_progress"] is False
+    assert row["cancel_requested"] is False
+    assert row["terminal_at"] is not None
+
+
 @pytest.mark.parametrize("with_mission", [False, True])
 @pytest.mark.parametrize(
     ("backend_payload", "expected_backend_state"),
@@ -1213,7 +1303,7 @@ def test_concurrent_exact_cancel_coalesces_while_confirmed_cancellation_runs(
             call = calls
         if call == 1:
             first_entered.set()
-            assert second_entered.wait(5)
+            assert second_entered.wait(_THREAD_BUDGET)
             return json.dumps({"success": True, "changed": True, "state": "cancelled"})
         raise AssertionError("exact retry must not invoke backend cancellation")
 
@@ -1232,17 +1322,17 @@ def test_concurrent_exact_cancel_coalesces_while_confirmed_cancellation_runs(
 
     second = threading.Thread(target=exact_retry)
     first.start()
-    assert first_entered.wait(5)
+    assert first_entered.wait(_THREAD_BUDGET)
     second.start()
-    assert second_entered.wait(5)
-    first.join(5)
+    assert second_entered.wait(_THREAD_BUDGET)
+    first.join(_THREAD_BUDGET)
     assert not first.is_alive()
     assert results[0]["code"] == "DELEGATION_CANCELLATION_IN_PROGRESS"
     assert results[0]["cancellation_outcome_ambiguous"] is True
     confirmed = results[1]["delegation"]
     assert confirmed["state"] == "cancelled"
     terminal_at = confirmed["terminal_at"]
-    second.join(5)
+    second.join(_THREAD_BUDGET)
     assert not second.is_alive()
 
     assert calls == 1
@@ -1309,8 +1399,8 @@ def test_concurrent_exact_cancel_preserves_delayed_confirmed_cancellation(
             call = calls
         if call == 1:
             confirmed_entered.set()
-            assert weaker_entered.wait(5)
-            assert release_confirmed.wait(5)
+            assert weaker_entered.wait(_THREAD_BUDGET)
+            assert release_confirmed.wait(_THREAD_BUDGET)
             return json.dumps({"success": True, "changed": True, "state": "cancelled"})
         weaker_entered.set()
         raise AssertionError("exact retry must not invoke backend cancellation")
@@ -1330,16 +1420,16 @@ def test_concurrent_exact_cancel_preserves_delayed_confirmed_cancellation(
 
     weaker = threading.Thread(target=exact_retry)
     confirmed.start()
-    assert confirmed_entered.wait(5)
+    assert confirmed_entered.wait(_THREAD_BUDGET)
     weaker.start()
-    assert weaker_entered.wait(5)
-    weaker.join(5)
+    assert weaker_entered.wait(_THREAD_BUDGET)
+    weaker.join(_THREAD_BUDGET)
     assert not weaker.is_alive()
     assert results[0]["success"] is False
     assert results[0]["code"] == "DELEGATION_CANCELLATION_IN_PROGRESS"
     assert results[0]["delegation"]["cancellation_in_progress"] is True
     release_confirmed.set()
-    confirmed.join(5)
+    confirmed.join(_THREAD_BUDGET)
     assert not confirmed.is_alive()
 
     promoted = results[1]
@@ -1517,7 +1607,7 @@ def test_concurrent_exact_retry_invokes_backend_once(tmp_path: Path, monkeypatch
         nonlocal calls
         calls += 1
         entered.set()
-        release.wait(5)
+        release.wait(_THREAD_BUDGET)
         return json.dumps({"success": True, "changed": True, "state": "queued"})
 
     monkeypatch.setattr(delegations.contract_mod, "hermes_contract_dispatch", dispatch)
@@ -1525,10 +1615,10 @@ def test_concurrent_exact_retry_invokes_backend_once(tmp_path: Path, monkeypatch
     result: list[dict] = []
     thread = threading.Thread(target=lambda: result.append(json.loads(delegations.hermes_delegation_dispatch(*args, delegation_id="dlg-concurrent", confirm=True, dry_run=False, hermes_root=root))))
     thread.start()
-    assert entered.wait(5)
+    assert entered.wait(_THREAD_BUDGET)
     retry = json.loads(delegations.hermes_delegation_dispatch(*args, delegation_id="dlg-concurrent", confirm=True, dry_run=False, hermes_root=root))
     release.set()
-    thread.join(5)
+    thread.join(_THREAD_BUDGET)
     assert calls == 1
     assert retry["success"] is False
     assert retry["code"] == "DELEGATION_DISPATCH_AMBIGUOUS"
@@ -1551,7 +1641,7 @@ def test_dispatch_completion_cas_preserves_inflight_confirmed_cancellation(
 
     def dispatch(*args, **kwargs):
         entered.set()
-        assert release.wait(5)
+        assert release.wait(_THREAD_BUDGET)
         return json.dumps({"success": True, "changed": True, "state": "queued"})
 
     monkeypatch.setattr(delegations.contract_mod, "hermes_contract_dispatch", dispatch)
@@ -1572,7 +1662,7 @@ def test_dispatch_completion_cas_preserves_inflight_confirmed_cancellation(
         )
     )))
     thread.start()
-    assert entered.wait(5)
+    assert entered.wait(_THREAD_BUDGET)
     cancelled = json.loads(delegations.hermes_delegation_cancel(
         "dlg-dispatch-cancel-race", confirm=True, dry_run=False, hermes_root=root,
     ))
@@ -1580,7 +1670,7 @@ def test_dispatch_completion_cas_preserves_inflight_confirmed_cancellation(
     assert cancelled["delegation"]["state"] == "cancelled"
     assert cancelled["delegation"]["dispatch_phase"] == "cancelled"
     release.set()
-    thread.join(5)
+    thread.join(_THREAD_BUDGET)
     assert not thread.is_alive()
     assert result[0]["success"] is False
     assert result[0]["code"] == "DELEGATION_DISPATCH_CANCELLED"

@@ -1,0 +1,6 @@
+{"step":1,"ts":"2026-09-21T16:06:42Z","summary":"Implement start: locate sibling adoption sources for B1 content","touched":[".conductor/progress/8d1e62ec96064131ba8bf382417d6116.ndjson"]}
+{"step":2,"ts":"2026-09-21T16:14:56Z","summary":"Adopted sibling 2ff57351b7 diffs verbatim (base blobs identical): 5 PKCE re-binds + new fail-closed test + mcp_compat skip guard","touched":["test_codex_pr63_remediation.py","test_mcp_compat.py"]}
+{"step":3,"ts":"2026-09-21T16:14:56Z","summary":"Deleted token_store.py dead block (89865b1281 rm-016 hunk only; :772 F841 line restored to stay in scope)","touched":["token_store.py"]}
+{"step":4,"ts":"2026-09-21T16:14:56Z","summary":"pyproject: setuptools>=77 floor + pyyaml>=6,<7 bound","touched":["pyproject.toml"]}
+{"step":5,"ts":"2026-09-21T16:14:56Z","summary":"Validation: ruff F821=0; focused tests green; full suite HERMES_HTTP_TEST=1 serial EXIT=0, 0 FAILED (/tmp/impl-8d1e62ec-full.log)","touched":[]}
+{"step":6,"ts":"2026-09-21T16:14:56Z","summary":"Build-floor check: setuptools 77.0.3 no-isolation prepare_metadata OK (dist-info + LICENSE); temp venv cleaned","touched":[]}

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -306,6 +307,37 @@ def test_gateway_status_no_pid_file(tmp_path, clean_env, audit_override):
     assert parsed["gateway_pid"] is None
 
 
+def test_gateway_status_json_pid_file_wins_over_poisoned_state_file(
+    tmp_path, clean_env, audit_override
+):
+    # Incident 2026-09-05 21:40: a pytest run (fake feishu adapter writing the
+    # real ~/.hermes) overwrote gateway_state.json with its own dead pid while
+    # gateway.pid still held the live pid. The bare-int-only parser could not
+    # use gateway.pid, so status fell back to the poisoned state file and
+    # reported gateway_running=false for a healthy gateway.
+    (tmp_path / "gateway.pid").write_text(
+        json.dumps({"pid": os.getpid(), "kind": "hermes-gateway"}),
+        encoding="utf-8",
+    )
+    (tmp_path / "gateway_state.json").write_text(
+        json.dumps(
+            {
+                "pid": 999999,  # dead/poisoned writer
+                "kind": "hermes-gateway",
+                "gateway_state": "running",
+                "platforms": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    out = ows.hermes_gateway_status(profile="default", hermes_root=tmp_path)
+    parsed = json.loads(out)
+    assert parsed["success"] is True
+    assert parsed["gateway_running"] is True
+    assert parsed["gateway_pid"] == os.getpid()
+    assert parsed["gateway_pid_source"] == "gateway.pid"
+
+
 def test_gateway_status_with_state_file(tmp_path, clean_env, audit_override):
     (tmp_path / "gateway_state.json").write_text(
         json.dumps({"telegram": {"connected": True}, "discord": {"connected": False}}),
@@ -411,6 +443,33 @@ def test_owner_run_command_direct_runs(workspace_tree, clean_env, audit_override
     parsed = json.loads(out)
     assert parsed["success"] is True
     assert captured["argv"] == ["echo", "hello"]
+
+
+def test_owner_run_command_routes_temp_to_dedicated_operator_root(
+    workspace_tree, clean_env, audit_override, monkeypatch, tmp_path
+):
+    _enable_owner(monkeypatch)
+    target = tmp_path / "operator-tmp"
+    monkeypatch.setenv("HERMES_GPT_OPERATOR_TMPDIR", str(target))
+    captured = {}
+
+    def fake_runner(argv, timeout=120, workdir=None):
+        captured["tmpdir"] = ows.os.environ.get("TMPDIR")
+        captured["temp"] = ows.os.environ.get("TEMP")
+        captured["tmp"] = ows.os.environ.get("TMP")
+        return (0, "ok", "")
+
+    parsed = json.loads(ows.hermes_owner_run_command(
+        command="echo temp-root", dry_run=False, runner=fake_runner,
+    ))
+
+    assert parsed["success"] is True
+    assert target.is_dir()
+    assert captured == {
+        "tmpdir": str(target.resolve()),
+        "temp": str(target.resolve()),
+        "tmp": str(target.resolve()),
+    }
 
 
 def test_owner_run_command_defers_exact_self_restart(workspace_tree, clean_env, audit_override, monkeypatch):

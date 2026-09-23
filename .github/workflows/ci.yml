@@ -22,7 +22,10 @@ concurrency:
 
 jobs:
   private-leak:
-    uses: codeo1io/.github/.github/workflows/private-leak-sentinel.yaml@main
+    # Immutable pin for supply-chain integrity (repo is public with no branch protection).
+    # Tracks codeo1io/.github@main; rotate deliberately:
+    #   gh api repos/codeo1io/.github/commits/main --jq .sha   # review the commit, then update the ref below
+    uses: codeo1io/.github/.github/workflows/private-leak-sentinel.yaml@a86c8ef77170831d7efc7c683542e3b364366168 # gitleaks allowlist for redaction fixtures (2026-09-21)
 
   test:
     # PR fast lane: on pull_request only ONE lane runs (python 3.11 +
@@ -35,10 +38,15 @@ jobs:
       matrix:
         python: ${{ github.event_name == 'pull_request' && fromJSON('["3.11"]') || fromJSON('["3.10", "3.11", "3.12"]') }}
         sdk: ${{ github.event_name == 'pull_request' && fromJSON('["mcp>=2,<3"]') || fromJSON('["mcp>=1.28.1,<2", "mcp>=2,<3"]') }}
+        # Exact pins run on the full matrix only (push(master)/nightly/
+        # dispatch). Current upstream releases under test (research
+        # 2026-09-20): mcp 1.30.0 and 2.2.0 shipped 2026-09-07; exact pins
+        # keep them covered deliberately rather than incidentally via the
+        # range lanes.
         include: >-
           ${{ github.event_name == 'pull_request' && fromJSON('[]')
-          || fromJSON('[{"python": "3.10", "sdk": "mcp==1.28.1"}, {"python": "3.10", "sdk": "mcp==2.0.0"}, {"python": "3.10", "sdk": "mcp==2.2.0"}]') }}
-    runs-on: self-hosted
+          || fromJSON('[{"python": "3.10", "sdk": "mcp==1.28.1"}, {"python": "3.10", "sdk": "mcp==2.0.0"}, {"python": "3.10", "sdk": "mcp==1.30.0"}, {"python": "3.10", "sdk": "mcp==2.2.0"}]') }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -101,7 +109,7 @@ jobs:
   compatibility:
     # Full-matrix lane: push(master) + nightly only, never the PR fast path.
     if: github.event_name != 'pull_request'
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -116,7 +124,7 @@ jobs:
           test_operator_runners.py
 
   lint:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -128,7 +136,7 @@ jobs:
       - run: python -m ruff check .
 
   web:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: web
@@ -145,7 +153,7 @@ jobs:
       - run: npm run build
 
   windows-docs:
-    runs-on: self-hosted
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - name: Parse Secure MCP Tunnel PowerShell examples
@@ -171,7 +179,7 @@ jobs:
 
   build:
     needs: [test, compatibility, lint, web, windows-docs]
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

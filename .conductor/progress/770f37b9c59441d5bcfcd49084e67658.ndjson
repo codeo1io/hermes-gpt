@@ -1,0 +1,2 @@
+{"step":1,"ts":"2026-09-21T17:04:14Z","summary":"All 5 fix claims verified on disk (manifests gone, README:363, ROADMAP:247/262, CHANGELOG x4, deferral:53); egg-info regen parity + no uv leftovers","touched":[]}
+{"step":2,"ts":"2026-09-21T17:04:14Z","summary":"Focused 68 tests exit0 incl mcp_compat (env-parity works); full2 5th fail test_rotation_and_issuance solo exit0 -> inherited flake class #6625","touched":[]}

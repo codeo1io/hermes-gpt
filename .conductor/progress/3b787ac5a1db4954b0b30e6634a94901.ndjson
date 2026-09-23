@@ -1,0 +1,4 @@
+{"step":1,"ts":"2026-09-21T16:17:18Z","summary":"TT start: baseline-interpreter targeted run for 3 changed test files + static F821 gate","touched":[".conductor/progress/3b787ac5a1db4954b0b30e6634a94901.ndjson"]}
+{"step":2,"ts":"2026-09-21T16:27:26Z","summary":"Targeted (3 files) EXIT=0 + F821 static clean on baseline interpreter","touched":[]}
+{"step":3,"ts":"2026-09-21T16:27:26Z","summary":"Full run 1: 1 load flake (delegations exact_retry, load-avg 28, outside changed surfaces); solo rerun EXIT=0","touched":[]}
+{"step":4,"ts":"2026-09-21T16:27:26Z","summary":"Full rerun serial EXIT=0 / 0 FAILED; tree byte-identical, dispatch digest valid verbatim","touched":[]}

@@ -1,0 +1,3 @@
+{"step":1,"ts":"2026-09-21T16:52:28Z","summary":"Commit gate: verify tree, check sibling commit file-set precedent","touched":[".conductor/progress/6c276754a35d4020ba743c45b1818263.ndjson"]}
+{"step":2,"ts":"2026-09-21T16:52:55Z","summary":"Staged 5 M files + ROADMAP.md (sibling 89865b1281 precedent; .conductor/ excluded); committed 0cca403520","touched":["CHANGELOG.md","ROADMAP.md","pyproject.toml","test_codex_pr63_remediation.py","test_mcp_compat.py","token_store.py"]}
+{"step":3,"ts":"2026-09-21T16:52:55Z","summary":"Verified: sha 0cca403520bf32793fffac50b45556d9d100de14, 6 files +317/-60, only .conductor/ untracked, NOT pushed","touched":[]}

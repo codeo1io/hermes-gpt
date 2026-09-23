@@ -1,0 +1,4 @@
+{"step":1,"ts":"2026-09-21T16:48:50Z","summary":"Tree state captured: HEAD c1785b22e5, 5 M files +61/-60, no strays; all mtimes pre-review-validation","touched":[".conductor/progress/31c83a1c130f4312915b53a5cf51c3ea.ndjson"]}
+{"step":2,"ts":"2026-09-21T16:49:45Z","summary":"Durable records read: 3b787ac5 ve digest==work-order digest; 8b35609a full+targeted EXIT=0 verdict PASS","touched":[".conductor/progress/31c83a1c130f4312915b53a5cf51c3ea.ndjson"]}
+{"step":3,"ts":"2026-09-21T16:49:45Z","summary":"Cross-check passed: mtimes<validation-log times; status/diffstat identical to review record; digest stable","touched":[".conductor/progress/31c83a1c130f4312915b53a5cf51c3ea.ndjson"]}
+{"step":4,"ts":"2026-09-21T16:50:28Z","summary":"phase_result JSON written+verified to spool 31c83a1c; scope release-integrity, digest verbatim, outcome passed","touched":["/home/agent/.hermes/conductor-delegate-spool-infra-deploy/delegate/31c83a1c130f4312915b53a5cf51c3ea.json"]}

@@ -43,8 +43,27 @@ OWNER_ACTIVE_ENV = "HERMES_GPT_OWNER_ACTIVE"
 OWNER_ACK_REQUIRED_VALUE = "I_UNDERSTAND_THIS_CAN_MUTATE_MY_MACHINE"
 
 # Default audit log locations (tried in order; first writable wins).
-AUDIT_LOG_HERMES_PATH = Path.home() / "AppData" / "Local" / "hermes" / "logs" / "hermes_gpt_operator_audit.jsonl"
-AUDIT_LOG_FALLBACK_PATH = Path(__file__).resolve().parent / "logs" / "hermes_gpt_operator_audit.jsonl"
+AUDIT_LOG_FILENAME = "hermes_gpt_operator_audit.jsonl"
+# Last-resort fallback when no state home is usable: package-local dir.
+# (Primary resolution is dynamic -- see ``_audit_candidate_paths`` -- so that
+# HERMES_HOME and POSIX state homes are honored at call time.)
+AUDIT_LOG_FALLBACK_PATH = Path(__file__).resolve().parent / "logs" / AUDIT_LOG_FILENAME
+
+# Size caps: the audit log is append-only JSONL. Rotation keeps exactly one
+# archived generation (``.1``) so bounded tail reads stay cheap on long-lived
+# hosts while ``iter_audit_for_task`` still sees pre-rotation records.
+AUDIT_LOG_MAX_BYTES = 5 * 1024 * 1024
+AUDIT_TAIL_MAX_BYTES = 512 * 1024
+
+# Failure surfacing: an audit write failure must never break a tool, but it
+# is counted here and exposed via ``audit_write_diagnostics()`` instead of
+# being silently swallowed.
+_audit_write_failures: dict[str, Any] = {
+    "count": 0,
+    "last_error": "",
+    "last_path": "",
+    "last_timestamp": "",
+}
 
 # Override hook for tests: when set, the audit log is written/read from this
 # path instead of the production locations. Set via ``set_audit_log_override``.
@@ -774,13 +793,90 @@ def audit_log_path() -> Path:
     with _audit_lock:
         if _audit_log_override is not None:
             return _audit_log_override
-    # Prefer the Hermes logs dir if it exists / is writable.
+    for candidate in _audit_candidate_paths()[:-1]:
+        try:
+            if candidate.parent.exists():
+                return candidate
+        except OSError:
+            continue
+    # Fresh host: no state home exists yet. Default to the state home other
+    # subsystems (tokens, ledgers, contracts) use -- ``AppData/Local/hermes``
+    # on Windows, ``~/.hermes`` elsewhere -- rather than the package
+    # directory, so first-run state lands in one tree; the first audit write
+    # creates the directory.
+    return _audit_state_home_default() / "logs" / AUDIT_LOG_FILENAME
+
+
+def _audit_state_home_default() -> Path:
+    """Return the platform default state home for audit logs."""
+    home = Path.home()
+    if os.name == "nt":
+        return home / "AppData" / "Local" / "hermes"
+    return home / ".hermes"
+
+
+def _audit_candidate_paths() -> list[Path]:
+    """Candidate audit log locations, most-preferred first.
+
+    Order: ``normalize_hermes_data_root(HERMES_HOME)/logs`` (explicit operator
+    intent, platform-neutral, install-layout values normalized like every
+    other HERMES_HOME consumer), then the platform state home -- Windows
+    ``AppData/Local/hermes`` first for
+    legacy compatibility, then ``~/.hermes`` for POSIX -- and finally the
+    package-local directory as a last resort. Resolution happens per call so
+    environment changes (tests, embedded deployments) take effect immediately.
+    """
+    candidates: list[Path] = []
+    env_home = os.environ.get("HERMES_HOME")
+    if env_home:
+        normalized = normalize_hermes_data_root(Path(env_home).expanduser())
+        if normalized is not None:
+            candidates.append(normalized / "logs" / AUDIT_LOG_FILENAME)
+    home = Path.home()
+    candidates.append(home / "AppData" / "Local" / "hermes" / "logs" / AUDIT_LOG_FILENAME)
+    candidates.append(home / ".hermes" / "logs" / AUDIT_LOG_FILENAME)
+    candidates.append(AUDIT_LOG_FALLBACK_PATH)
+    return candidates
+
+
+def audit_write_diagnostics() -> dict[str, Any]:
+    """Return a snapshot of audit write-failure surfacing state.
+
+    Audit failures never raise into tool calls; this accessor makes them
+    observable (count + last error/path/timestamp) for diagnostics and
+    Operator status surfaces.
+    """
+    return dict(_audit_write_failures)
+
+
+def _record_audit_failure(exc: BaseException, path: Path | None) -> None:
+    """Count a swallowed audit failure for later diagnostics."""
+    _audit_write_failures["count"] += 1
+    _audit_write_failures["last_error"] = f"{exc.__class__.__name__}: {exc}"[:200]
+    _audit_write_failures["last_path"] = str(path) if path is not None else ""
+    _audit_write_failures["last_timestamp"] = datetime.now(timezone.utc).isoformat()
+
+
+def _rotate_audit_log_if_needed(log_path: Path) -> None:
+    """Rotate the audit log to ``<name>.1`` once it reaches the size cap.
+
+    Exactly one archived generation is kept (the previous ``.1`` is
+    replaced). Rotation failures are surfaced via diagnostics, never raised.
+    Callers must already hold ``_audit_lock``.
+    """
     try:
-        if AUDIT_LOG_HERMES_PATH.parent.exists():
-            return AUDIT_LOG_HERMES_PATH
-    except OSError:
-        pass
-    return AUDIT_LOG_FALLBACK_PATH
+        if not log_path.exists():
+            return
+        if log_path.stat().st_size < AUDIT_LOG_MAX_BYTES:
+            return
+        rotated = log_path.with_name(log_path.name + ".1")
+        try:
+            rotated.unlink()
+        except FileNotFoundError:
+            pass
+        log_path.replace(rotated)
+    except OSError as exc:
+        _record_audit_failure(exc, log_path)
 
 
 def _hash_secret_text(text: str | None) -> tuple[int, str]:
@@ -862,39 +958,66 @@ def audit_record(
             else:
                 record[k] = v
 
+    log_path: Path | None = None
     try:
         log_path = audit_log_path()
         log_path.parent.mkdir(parents=True, exist_ok=True)
         line = json.dumps(record, ensure_ascii=False, sort_keys=True)
         with _audit_lock:
+            _rotate_audit_log_if_needed(log_path)
             with open(log_path, "a", encoding="utf-8") as fh:
                 fh.write(line + "\n")
-    except OSError:
+    except OSError as exc:
         # Audit failure must never break a tool. The record is returned so
-        # callers can still surface it inline.
-        pass
+        # callers can still surface it inline -- and the failure is counted
+        # so diagnostics surfaces can report that audit evidence was lost.
+        _record_audit_failure(exc, log_path)
 
     return record
 
 
+def _read_tail_text(path: Path, max_bytes: int) -> str:
+    """Read at most the final ``max_bytes`` of a file, UTF-8 decoded.
+
+    When the read starts mid-file the potentially partial first line is
+    dropped, so callers only ever see whole lines.
+    """
+    with open(path, "rb") as fh:
+        fh.seek(0, os.SEEK_END)
+        size = fh.tell()
+        start = max(0, size - max_bytes)
+        fh.seek(start)
+        data = fh.read()
+    if start > 0:
+        newline = data.find(b"\n")
+        data = data[newline + 1:] if newline != -1 else b""
+    return data.decode("utf-8", errors="replace")
+
+
 def audit_tail(limit: int = 20) -> list[dict[str, Any]]:
-    """Read the last ``limit`` audit records. Returns newest-last."""
+    """Read the last ``limit`` audit records. Returns newest-last.
+
+    Reads are bounded: only the final ``AUDIT_TAIL_MAX_BYTES`` of the active
+    log are parsed, so an append-only log cannot make this call unbounded.
+    The archived ``.1`` generation is not consulted; use
+    ``iter_audit_for_task`` for full-history task reconciliation.
+    """
     log_path = audit_log_path()
     if not log_path.exists():
         return []
     records: list[dict[str, Any]] = []
     try:
-        with open(log_path, "r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    records.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
+        text = _read_tail_text(log_path, AUDIT_TAIL_MAX_BYTES)
     except OSError:
         return []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
     if limit <= 0:
         return records
     return records[-limit:]
@@ -905,22 +1028,33 @@ def iter_audit_for_task(task_id: str) -> Iterable[dict[str, Any]]:
     if not isinstance(task_id, str) or not task_id:
         return
     log_path = audit_log_path()
-    if not log_path.exists():
+    # Include the archived rotation generation so task reconciliation does
+    # not silently lose pre-rotation records.
+    sources = [log_path.with_name(log_path.name + ".1"), log_path]
+    # Pre-rm-004 hosts may still hold audit history in the package-local log
+    # (the old fallback); keep that legacy evidence readable after the state
+    # home takes over rather than silently orphaning it.
+    for legacy in (AUDIT_LOG_FALLBACK_PATH, AUDIT_LOG_FALLBACK_PATH.with_name(AUDIT_LOG_FALLBACK_PATH.name + ".1")):
+        if legacy not in sources:
+            sources.append(legacy)
+    sources = [src for src in sources if src.exists()]
+    if not sources:
         return
     try:
-        with open(log_path, "r", encoding="utf-8") as fh:
-            for line in fh:
-                if len(line) > 64_000:
-                    continue
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(record, dict) and str(record.get("task_id") or "") == task_id:
-                    yield record
+        for src in sources:
+            with open(src, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    if len(line) > 64_000:
+                        continue
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(record, dict) and str(record.get("task_id") or "") == task_id:
+                        yield record
     except OSError:
         return
 

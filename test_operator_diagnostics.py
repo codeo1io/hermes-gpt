@@ -53,6 +53,26 @@ def audit_override(tmp_path, monkeypatch):
     op.set_audit_log_override(None)
 
 
+def test_doctor_warns_on_audit_write_failures(tmp_path, monkeypatch):
+    """Audit write failures are best-effort but must surface in doctor."""
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory", encoding="utf-8")
+    op.set_audit_log_override(blocker / "sub" / "audit.jsonl")
+    monkeypatch.setattr(op, "_audit_write_failures", {
+        "count": 2,
+        "last_error": "OSError: boom",
+        "last_path": str(blocker / "sub" / "audit.jsonl"),
+        "last_timestamp": "2026-09-20T00:00:00+00:00",
+    })
+    try:
+        check = od._check_last_audit_record()
+        assert check["status"] == "WARN"
+        assert check["code"] == "AUDIT_WRITE_FAILURES"
+        assert check["audit_write_failures"]["count"] == 2
+    finally:
+        op.set_audit_log_override(None)
+
+
 # ---------------------------------------------------------------------------
 # Error envelope helpers
 # ---------------------------------------------------------------------------
@@ -195,6 +215,56 @@ def test_doctor_uses_live_pid_from_gateway_state_when_legacy_pid_missing(
     assert check["pid"] == os.getpid()
     assert check["pid_source"] == "gateway_state.json"
     assert check["running"] is True
+
+
+def test_doctor_parses_json_gateway_pid_object(
+    hermes_root, clean_env, audit_override
+):
+    # Current gateways write a JSON object into gateway.pid; a bare-int parse
+    # raises ValueError and every gateway must not be reported dead.
+    (hermes_root / "cron" / "ticker_heartbeat").write_text("ok", encoding="utf-8")
+    (hermes_root / "gateway.pid").write_text(
+        json.dumps(
+            {
+                "pid": os.getpid(),
+                "kind": "hermes-gateway",
+                "gateway_state": "running",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    check = od._check_gateway_status(hermes_root)
+
+    assert check["status"] == "PASS"
+    assert check["code"] == "GATEWAY_OK"
+    assert check["pid"] == os.getpid()
+    assert check["pid_source"] == "gateway.pid"
+    assert check["running"] is True
+
+
+def test_read_gateway_pid_across_formats(tmp_path):
+    # Legacy bare-int pid file.
+    (tmp_path / "gateway.pid").write_text(str(os.getpid()), encoding="utf-8")
+    assert od._read_gateway_pid(tmp_path) == (os.getpid(), "gateway.pid")
+
+    # Current JSON-object pid file.
+    (tmp_path / "gateway.pid").write_text(
+        json.dumps({"pid": os.getpid(), "kind": "hermes-gateway"}), encoding="utf-8"
+    )
+    assert od._read_gateway_pid(tmp_path) == (os.getpid(), "gateway.pid")
+
+    # Unparsable pid file falls back to gateway_state.json.
+    (tmp_path / "gateway.pid").write_text("not-a-pid", encoding="utf-8")
+    (tmp_path / "gateway_state.json").write_text(
+        json.dumps({"pid": os.getpid(), "gateway_state": "running"}), encoding="utf-8"
+    )
+    assert od._read_gateway_pid(tmp_path) == (os.getpid(), "gateway_state.json")
+
+    # Nothing usable anywhere.
+    (tmp_path / "gateway.pid").unlink()
+    (tmp_path / "gateway_state.json").unlink()
+    assert od._read_gateway_pid(tmp_path) == (None, None)
 
 
 def test_doctor_fails_for_corrupt_cron_jobs(hermes_root, clean_env, audit_override):

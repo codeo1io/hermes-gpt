@@ -1,0 +1,2 @@
+{"step":1,"ts":"2026-09-21T17:21:29Z","summary":"verified 0 CI runs for 3a38d980 on both fork+upstream (head_sha filter); surveying upstream PR lane","touched":[]}
+{"step":2,"ts":"2026-09-21T17:23:08Z","summary":"opened upstream PR #75 (asimons81<-codeo1io:conductor/run-634bf4516c83) = the proven CI lane; watching checks for sha 3a38d980","touched":["https://github.com/asimons81/hermes-gpt/pull/75"]}

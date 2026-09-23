@@ -10,6 +10,7 @@ import pytest
 import operator_policy as op
 import operator_recovery as rec
 import operator_swarm as op_swarm
+import token_store
 
 
 @pytest.fixture
@@ -82,6 +83,23 @@ def _workflow_record(workflow_id: str = "sw-abc", stage_status: str = "running")
 
 def _write_workflow(hermes_root: Path, record: dict) -> None:
     op_swarm._save_workflow(hermes_root, record)
+
+
+def test_reload_store_recognizes_sqlite_without_legacy_envelope(hermes_root):
+    """v0.10 restart reconciliation must recognize the SQLite store.
+
+    The migration closes/removes the legacy envelope, so envelope-only health
+    checks incorrectly report EMPTY even though the durable store is healthy.
+    """
+    migrated = token_store.migrate_store(hermes_root)
+    assert migrated["records"] == 0
+
+    result = rec._reload_token_store(hermes_root)
+
+    assert result["available"] is True
+    assert result["integrity"] == "OK"
+    assert result["presence"] == "present"
+    assert result["client_count"] == 0
 
 
 def test_reconcile_dry_run_marks_nothing_and_reports_interrupted(hermes_root, clean_env, audit_override):

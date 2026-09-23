@@ -288,6 +288,10 @@ def gemini_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(oauth_auth.OAUTH_CLIENT_SECRET_ENV, CLIENT_SECRET)
     monkeypatch.setenv(oauth_auth.OAUTH_REDIRECT_URI_ENV, REDIRECT_URI)
     monkeypatch.setenv(oauth_auth.OAUTH_SCOPE_ENV, SCOPE)
+    # This deployment shape is a single confidential client with no DCR
+    # (Google's documented fallback); advertising registration would break
+    # Gemini's discovery handling.
+    monkeypatch.setenv(oauth_auth.OAUTH_DCR_ENV, "0")
 
 
 @contextlib.contextmanager

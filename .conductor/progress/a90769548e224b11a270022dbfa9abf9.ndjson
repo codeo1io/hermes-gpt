@@ -1,0 +1,4 @@
+{"step":1,"ts":"2026-09-21T12:16:34Z","summary":"rm-016 done: deleted dead token_store 44-line block, F821 clean, test_token_store green","touched":["token_store.py"]}
+{"step":2,"ts":"2026-09-21T12:21:17Z","summary":"rm-017a done: ruff repo-wide 61->0 (30 autofix + manual; 1 targeted noqa E402 bootstrap)","touched":["35 files"]}
+{"step":3,"ts":"2026-09-21T12:21:45Z","summary":"rm-017b+rm-023 done: ci lint job -> repo-wide ruff check .; uvicorn bounded >=0.30,<1","touched":[".github/workflows/ci.yml","pyproject.toml"]}
+{"step":4,"ts":"2026-09-21T12:24:20Z","summary":"rm-018 dropped (A3 contract conflict, pr63:790 passing test depends on empty-challenge minting); rm-021 promoted+done: corrupt jobs.json .corrupt-* backup + test","touched":["operator_cron.py","test_operator_cron.py"]}

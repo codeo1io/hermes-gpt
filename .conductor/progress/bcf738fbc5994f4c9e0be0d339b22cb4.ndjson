@@ -1,0 +1,5 @@
+{"step":1,"ts":"2026-09-20T15:37:48Z","summary":"Research phase start: locating ce-* skills, gathering dep/upstream context","touched":[]}
+{"step":2,"ts":"2026-09-20T15:55:00Z","summary":"Upstream absorbed (0 ahead, 0 open issues/PRs); deps: mcp 2.2.0/1.30.0 newer than CI pins","touched":[]}
+{"step":3,"ts":"2026-09-20T15:58:00Z","summary":"Pulled MCP spec 2026-07-28 changelog (stateless, server/discover, Tasks ext, MRTR) + SDK 2.1/2.2/1.30 notes","touched":[]}
+{"step":4,"ts":"2026-09-20T16:02:00Z","summary":"Grounded repo alignment: stateless_http, RFC9728 done, _meta test exists, ROADMAP rm-001/002","touched":["server.py","oauth_auth.py","test_mcp_sdk_migration.py"]}
+{"step":5,"ts":"2026-09-20T16:06:00Z","summary":"Wrote 8 surviving + 8 rejected candidates with sources to .conductor/research/","touched":[".conductor/research/bcf738fbc5994f4c9e0be0d339b22cb4-candidates.md"]}

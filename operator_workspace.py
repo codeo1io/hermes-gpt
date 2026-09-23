@@ -120,10 +120,12 @@ def _read_gateway_state(state_path: Path) -> dict[str, Any]:
 
 
 def _read_gateway_pid_from_pid_file(pid_path: Path) -> int | None:
-    """Read gateway.pid as a plain integer.
+    """Read gateway.pid as a bare integer or a JSON object with a "pid" key.
 
-    Older Hermes Gateway versions store only a raw PID here.
-    If the file is absent, empty, or not parseable, return None.
+    Current Hermes Gateway versions write a JSON record here ({"pid": ...,
+    "kind": ...}); older ones stored a raw PID. Returns None when absent,
+    empty, or unparsable so callers fall back to gateway_state.json.
+    Mirrors operator_diagnostics._read_gateway_pid.
     """
     if not pid_path.exists():
         return None
@@ -131,8 +133,17 @@ def _read_gateway_pid_from_pid_file(pid_path: Path) -> int | None:
         raw = pid_path.read_text(encoding="utf-8").strip()
         if not raw:
             return None
-        return int(raw)
-    except (OSError, ValueError):
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+        obj = json.loads(raw)
+        if isinstance(obj, dict):
+            obj_pid = obj.get("pid")
+            if isinstance(obj_pid, int) and obj_pid > 0:
+                return obj_pid
+        return None
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return None
 
 
@@ -937,6 +948,30 @@ def _command_touches_secrets(command: str) -> bool:
     return any(n in lower for n in needles)
 
 
+def _ensure_operator_tmpdir() -> Path:
+    """Route owner-command scratch away from shared /tmp.
+
+    Subprocesses inherit these variables from the long-running Hermes GPT
+    process, so pytest/tempfile/build scratch lands in a dedicated tree that
+    can be aggressively and safely janitored without guessing /tmp names.
+    """
+    configured = os.getenv("HERMES_GPT_OPERATOR_TMPDIR", "").strip()
+    if configured:
+        tmpdir = Path(configured).expanduser()
+    else:
+        tmpdir = Path.home() / ".hermes" / "tmp" / "operator"
+    tmpdir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        tmpdir.chmod(0o700)
+    except OSError:
+        pass
+    resolved = str(tmpdir.resolve())
+    os.environ["TMPDIR"] = resolved
+    os.environ["TEMP"] = resolved
+    os.environ["TMP"] = resolved
+    return Path(resolved)
+
+
 def _deferred_self_restart_argv(argv: list[str]) -> list[str] | None:
     """Return a delayed systemd command for an exact Hermes GPT self-restart.
 
@@ -1024,6 +1059,8 @@ def hermes_owner_run_command(
             return json.dumps({"success": True, "dry_run": True, "plan": plan}, indent=2)
 
         policy.require_mutation(dry_run)
+        if os.name != "nt":
+            _ensure_operator_tmpdir()
         run_fn = runner or op.run_argv
         rc, out, err = run_fn(effective_argv, timeout=timeout, workdir=workdir)
         result = {

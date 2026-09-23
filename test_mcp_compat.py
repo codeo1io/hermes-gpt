@@ -91,7 +91,7 @@ def test_package_metadata_allows_both_sdk_families():
         )
     requirements = [Requirement(r) for r in dist.requires or []]
     mcp = next(r for r in requirements if r.name == "mcp")
-    for version in ("1.28.1", "2.0.0", "2.2.0"):
+    for version in ("1.28.1", "1.30.0", "2.0.0", "2.2.0"):
         assert version in mcp.specifier
     assert "3.0.0" not in mcp.specifier
 

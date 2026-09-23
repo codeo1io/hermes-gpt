@@ -1,0 +1,2 @@
+{"step":1,"ts":"2026-09-21T13:34:41Z","summary":"re-verified corrected reconcile evidence for attempt 7c7ca0070","touched":[]}
+{"step":2,"ts":"2026-09-21T13:34:56Z","summary":"spool JSON written+validated (corrected record re-emitted)","touched":["delegate/7c7ca0070fb84de8bea604d09912db6b.json"]}
