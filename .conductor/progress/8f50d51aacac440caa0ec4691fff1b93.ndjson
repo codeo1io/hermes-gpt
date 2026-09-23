@@ -1,0 +1,2 @@
+{"step":1,"ts":"2026-09-22T17:56:15+00:00","summary":"full suite launched serial/baseline (PID above), log /tmp/full-8f50d51a.log; tree verified identical to a87c0799","touched":["/tmp/full-8f50d51a.log"]}
+{"step":2,"ts":"2026-09-22T18:05:53+00:00","summary":"full suite [100%] 0 FAILED/ERROR, tree unchanged, digest a87c0799 verbatim; phase_result spooled+validated","touched":["/home/agent/.hermes/conductor-delegate-spool-infra-deploy/delegate/8f50d51aacac440caa0ec4691fff1b93.json"]}
