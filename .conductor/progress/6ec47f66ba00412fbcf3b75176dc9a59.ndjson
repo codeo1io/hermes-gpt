@@ -1,0 +1,5 @@
+{"step":1,"ts":"2026-09-23T17:46:10Z","summary":"baseline: HEAD=4b958379d6, 15 porcelain entries, no uv.lock/.venv strays","touched":[]}
+{"step":2,"ts":"2026-09-23T17:46:10Z","summary":"read durable records: implement/review-fix/approved-review spool JSONs; digest+status sets reconciled","touched":[]}
+{"step":3,"ts":"2026-09-23T17:46:30Z","summary":"digest re-derived validation:v1:4459e913...73dd1 == work order VERBATIM; MM/staged-D index split characterized (croniter staged, pyyaml+py-modules worktree)","touched":["pyproject.toml"]}
+{"step":4,"ts":"2026-09-23T17:47:00Z","summary":"temporal proof: all changed-file mtimes + index mtime < last passing full-suite log 17:41:30Z; no merge/rebase; stash@{0} pre-cycle pr20-v1 WIP, dispositioned out of scope","touched":[]}
+{"step":5,"ts":"2026-09-23T17:47:30Z","summary":"release-integrity verdict PASSED; phase_result JSON written to delegate spool 6ec47f66ba00412fbcf3b75176dc9a59.json","touched":["/home/agent/.hermes/conductor-delegate-spool-infra-deploy/delegate/6ec47f66ba00412fbcf3b75176dc9a59.json"]}

@@ -1,0 +1,2 @@
+{"step":1,"ts":"2026-09-22T17:31:12Z","summary":"Rejection = KTD5 surface-declaration gap: retest command must NAME the 4 source modules; tree unchanged (digest == 4459e913)","touched":[]}
+{"step":2,"ts":"2026-09-22T17:36:16Z","summary":"KTD5 retest done: exact targeted cmd (names 6 surfaces, 49 marks), test set 118, full 1521 all 0F/E; digest verbatim 4459e913; phase_result written","touched":[]}

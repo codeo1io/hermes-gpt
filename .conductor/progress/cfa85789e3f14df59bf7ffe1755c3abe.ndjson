@@ -1,0 +1,3 @@
+{"step":1,"ts":"2026-09-22T16:41:51Z","summary":"Stewardship start: derive exact file:line surfaces for batch B1 from PR 19/20 heads + local state","touched":[]}
+{"step":2,"ts":"2026-09-22T16:43:12Z","summary":"Surfaces derived from PR heads (-U0); corrections: pyyaml floor NOT subsumed; canonical checkout dirty operator_cron.py flagged","touched":[]}
+{"step":3,"ts":"2026-09-22T16:43:12Z","summary":"stewardship_request JSON written+validated (title/summary/repos/surfaces/must_remain_separate); tree clean except ROADMAP deliverable","touched":["/home/agent/.hermes/conductor-delegate-spool-infra-deploy/delegate/cfa85789e3f14df59bf7ffe1755c3abe.json"]}
