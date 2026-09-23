@@ -1,0 +1,4 @@
+{"step":1,"ts":"2026-09-21T16:42:04Z","summary":"Captured tree state: HEAD c1785b22e5, 8 M files + .conductor/+ROADMAP.md, no uv.lock/.venv","touched":[".conductor/progress/5a7864b5bca54fb7a47d66e6162f386c.ndjson"]}
+{"step":2,"ts":"2026-09-21T16:44:50Z","summary":"Read durable records: d86d1db2 full-scope PASSED w/ digest 5c2a574e…; 3cdb90cf review APPROVE; digest == dispatch verbatim","touched":[]}
+{"step":3,"ts":"2026-09-21T16:44:50Z","summary":"Integrity verified: 8 changed-surface mtimes 16:10-16:15Z < validation 16:26:38Z; sha256s recorded; untracked only .conductor/+ROADMAP.md","touched":[]}
+{"step":4,"ts":"2026-09-21T16:45:25Z","summary":"Wrote phase_result JSON (release-integrity, PASSED, digest 5c2a574e… verbatim) to delegate spool; verified round-trip","touched":["/home/agent/.hermes/conductor-delegate-spool-infra-deploy/delegate/5a7864b5bca54fb7a47d66e6162f386c.json"]}
