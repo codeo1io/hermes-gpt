@@ -1,0 +1,4 @@
+{"step":1,"ts":"2026-09-21T17:49:53Z","summary":"Local worktree + remote head sweep verified","touched":[]}
+{"step":2,"ts":"2026-09-21T17:50:11Z","summary":"CI/PR state verified on fork and upstream","touched":[]}
+{"step":3,"ts":"2026-09-21T18:07:10Z","summary":"Observing CI run 35633293895 (lint success, private-leak running); stale runs re-run by sibling agent","touched":[]}
+{"step":4,"ts":"2026-09-21T18:20:04Z","summary":"CI attribution complete: lane 3.12+2.x fails on exactly the 4 inherited stale-PKCE tests; B1-blameless","touched":[]}

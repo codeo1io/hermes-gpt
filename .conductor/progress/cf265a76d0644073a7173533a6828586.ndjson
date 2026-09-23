@@ -1,0 +1,4 @@
+{"step":1,"ts":"2026-09-21T16:43:47Z","summary":"re-dispatched fix turn: verified tree unchanged from review state; located edit sites","touched":[".conductor/progress/cf265a76d0644073a7173533a6828586.ndjson"]}
+{"step":2,"ts":"2026-09-21T16:43:57Z","summary":"finding #1 fixed: requirements-dev.txt git-rm (dev extras in pyproject are strict superset)","touched":["requirements-dev.txt"]}
+{"step":3,"ts":"2026-09-21T16:44:52Z","summary":"README:363 repointed; CHANGELOG Unreleased B1 entries; ROADMAP rm-029/rm-032/rm-027 + rules amended; prioritization deferral recorded","touched":["README.md","CHANGELOG.md","ROADMAP.md",".conductor/prioritization-run634bf451-cycle1.md"]}
+{"step":4,"ts":"2026-09-21T16:52:10Z","summary":"env-parity fix: regenerated gitignored egg-info (was assess-phase uv leftover, deleted mid-turn); mcp_compat solo 16p exit0","touched":["hermes_gpt.egg-info"]}
