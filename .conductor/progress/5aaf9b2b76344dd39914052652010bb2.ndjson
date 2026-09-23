@@ -1,0 +1,3 @@
+{"step":1,"ts":"2026-09-21T14:02:53Z","summary":"Redelivery (fb2e4df2/f3c5f789/82d71beb aborted by provider); re-verifying at committed HEAD 808de652c1","touched":[]}
+{"step":2,"ts":"2026-09-21T14:03:11Z","summary":"All checks PASS: clean tree@808de652c1, sha256==f36e5259-validated, markers intact, 0 drift, remote ref==HEAD","touched":[]}
+{"step":3,"ts":"2026-09-21T14:04:04Z","summary":"phase_result JSON written+validated to spool 5aaf9b2b; release-integrity PASSED","touched":["/home/agent/.hermes/conductor-delegate-spool-infra-deploy/delegate/5aaf9b2b76344dd39914052652010bb2.json"]}

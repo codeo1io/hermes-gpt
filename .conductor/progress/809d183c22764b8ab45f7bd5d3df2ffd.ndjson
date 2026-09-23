@@ -1,0 +1,2 @@
+{"step":1,"ts":"2026-09-21T15:00:00Z","summary":"PR #12 opened conductor/run-c1ef27c97ab2 -> master @ 808de652c1; body cites commits, validation, review verdicts, PR #6 supersede","touched":["/tmp/pr-809d183c-body.md"]}
+{"step":2,"ts":"2026-09-21T15:05:00Z","summary":"phase_result written to spool: PR #12 URL recorded, PR #6 supersede note in body, no close yet","touched":["/home/agent/.hermes/conductor-delegate-spool-infra-deploy/delegate/809d183c22764b8ab45f7bd5d3df2ffd.json"]}
