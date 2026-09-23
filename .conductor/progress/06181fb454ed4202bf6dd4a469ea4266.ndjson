@@ -1,0 +1,5 @@
+{"step":1,"ts":"2026-09-21T16:08:56Z","summary":"read updater.py+test_updater.py fully; callers=CLI only; sentinel goes in check_for_update","touched":[]}
+{"step":2,"ts":"2026-09-21T16:12:52Z","summary":"rm-027+030+031 applied+validated (toml/yaml parse, npm 0-dompurify, build exit 0); rm-029 edits in","touched":["pyproject.toml",".github/workflows/ci.yml","web/package.json","web/package-lock.json","updater.py","test_updater.py","docs/updating.md"]}
+{"step":3,"ts":"2026-09-21T16:13:07Z","summary":"test_updater 10/10 green; ruff clean; inspecting tree noise","touched":[]}
+{"step":4,"ts":"2026-09-21T16:19:59Z","summary":"full suite done: 6F = 5 baseline + 1 g4c load flake (passes solo); zero regressions","touched":[]}
+{"step":5,"ts":"2026-09-21T16:19:59Z","summary":"CHANGELOG entries added; spool phase_result written+validated","touched":["CHANGELOG.md","/home/agent/.hermes/conductor-delegate-spool-infra-deploy/delegate/06181fb454ed4202bf6dd4a469ea4266.json"]}
