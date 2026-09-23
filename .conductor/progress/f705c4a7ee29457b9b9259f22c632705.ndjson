@@ -1,0 +1,4 @@
+{"step":1,"ts":"2026-09-20T16:31:25Z","summary":"targeted_tests started: inspected validation block (scope full, uv+xdist commands), pre-run tree snapshot taken","touched":[".github/workflows/ci.yml","pyproject.toml"]}
+{"step":2,"ts":"2026-09-20T16:34:37Z","summary":"targeted cmd (uv, +--extra dev): 228 passed EXIT=0 on Py3.13 fresh env; dist-installed metadata test runs","touched":["/tmp/targeted_uv.log"]}
+{"step":3,"ts":"2026-09-20T16:34:37Z","summary":"full cmd (uv, +xdist): 1442 passed 2 skipped EXIT=0 in 33s; no executable surface changed; uv.lock artifact removed","touched":["/tmp/full_uv_xdist.log"]}
+{"step":4,"ts":"2026-09-20T16:35:02Z","summary":"PhaseResult with validation_evidence (scope full, passed, dispatch digest verbatim, no changes) written to spool","touched":["/home/agent/.hermes/conductor-delegate-spool-infra-deploy/delegate/f705c4a7ee29457b9b9259f22c632705.json"]}

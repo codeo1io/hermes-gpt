@@ -429,17 +429,18 @@ For Codex acting as an MCP client, use [docs/codex.md](codex.md). For the Window
 
 ## Audit behavior
 
-Preferred audit path on Windows:
+The audit log location is resolved per call, most-preferred first:
 
-```text
-%USERPROFILE%\AppData\Local\hermes\logs\hermes_gpt_operator_audit.jsonl
-```
+1. `HERMES_HOME/logs/hermes_gpt_operator_audit.jsonl` — when `HERMES_HOME` is set; the value is normalized with `normalize_hermes_data_root` (install layouts like `.../hermes-agent` or `.../profiles/<p>` resolve to their data root), matching every other `HERMES_HOME` consumer;
+2. Windows state home: `%USERPROFILE%\AppData\Local\hermes\logs\hermes_gpt_operator_audit.jsonl`;
+3. POSIX state home: `~/.hermes/logs/hermes_gpt_operator_audit.jsonl`;
+4. last-resort fallback: `<hermes-gpt>\logs\hermes_gpt_operator_audit.jsonl` (package-local).
 
-Fallback:
+The first candidate whose parent directory exists wins. If no state home exists yet (fresh host), the platform state home — `AppData\Local\hermes` on Windows, `~/.hermes` elsewhere — is used rather than the package-local fallback, so first-run state lands in the same tree as tokens and ledgers; directories are created on first write. Tests may pin an explicit path via `set_audit_log_override`.
 
-```text
-<hermes-gpt>\logs\hermes_gpt_operator_audit.jsonl
-```
+The log is append-only JSONL with size-capped rotation: once the active file reaches 5 MiB it is rotated to a single archived generation `hermes_gpt_operator_audit.jsonl.1` (the previous archive is replaced). Tail reads (`audit_tail`) parse only the final 512 KiB of the active file, while task reconciliation (`iter_audit_for_task`) scans the archive and the active file so pre-rotation records are not lost; if a legacy package-local audit log still exists (pre-rotation hosts), it is also read for task reconciliation so older evidence stays reachable after the state home takes over.
+
+Audit writes are best-effort: a failed write must never break the tool call. Failures are counted and surfaced through `audit_write_diagnostics()` and reported by `hermes_operator_doctor` as `AUDIT_WRITE_FAILURES` (`WARN`) instead of silently dropping audit evidence.
 
 Audit records contain bounded operational metadata such as tool, level, apply mode, dry-run state, changed/success state, relevant IDs, and length/hash metadata for content-bearing operations.
 

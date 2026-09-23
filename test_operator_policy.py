@@ -397,6 +397,167 @@ def test_audit_log_records_mutation_summary(tmp_path, monkeypatch):
         op.set_audit_log_override(None)
 
 
+def test_audit_log_path_prefers_hermes_home(tmp_path, monkeypatch):
+    """HERMES_HOME/logs wins over platform defaults when it exists."""
+    env_home = tmp_path / "state"
+    (env_home / "logs").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(env_home))
+    op.set_audit_log_override(None)
+    try:
+        assert op.audit_log_path() == env_home / "logs" / "hermes_gpt_operator_audit.jsonl"
+    finally:
+        op.set_audit_log_override(None)
+
+
+def test_audit_candidate_path_order(tmp_path, monkeypatch):
+    """Candidate order: HERMES_HOME, Windows AppData, ~/.hermes, package dir."""
+    env_home = tmp_path / "state"
+    monkeypatch.setenv("HERMES_HOME", str(env_home))
+    candidates = op._audit_candidate_paths()
+    assert candidates[0] == env_home / "logs" / "hermes_gpt_operator_audit.jsonl"
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    candidates = op._audit_candidate_paths()
+    assert candidates[0] == Path.home() / "AppData" / "Local" / "hermes" / "logs" / "hermes_gpt_operator_audit.jsonl"
+    assert candidates[1] == Path.home() / ".hermes" / "logs" / "hermes_gpt_operator_audit.jsonl"
+    assert candidates[-1] == op.AUDIT_LOG_FALLBACK_PATH
+
+
+def test_audit_candidate_paths_normalize_hermes_home(tmp_path, monkeypatch):
+    """HERMES_HOME install-layout values normalize like every other consumer
+    (rm-004 acceptance names the normalize_hermes_data_root pattern)."""
+    for raw, expected_root in [
+        (tmp_path / "deploy" / "hermes-agent", tmp_path / "deploy"),
+        (tmp_path / "profiles" / "nightly", tmp_path),
+    ]:
+        monkeypatch.setenv("HERMES_HOME", str(raw))
+        candidates = op._audit_candidate_paths()
+        assert candidates[0] == expected_root / "logs" / "hermes_gpt_operator_audit.jsonl"
+
+
+def test_audit_log_fresh_host_prefers_state_home_over_package_dir(tmp_path, monkeypatch):
+    """F3: with no state home in existence yet, the audit log resolves to the
+    platform state home (created on first write), not the package dir, so a
+    fresh host keeps one state tree like tokens/ledgers do."""
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))  # empty: nothing exists
+    import os as _os
+
+    expected_root = (
+        Path(tmp_path) / "AppData" / "Local" / "hermes"
+        if _os.name == "nt"
+        else Path(tmp_path) / ".hermes"
+    )
+    assert op.audit_log_path() == expected_root / "logs" / "hermes_gpt_operator_audit.jsonl"
+    assert op.audit_log_path() != op.AUDIT_LOG_FALLBACK_PATH
+
+
+def test_iter_audit_for_task_reads_legacy_package_log(tmp_path, monkeypatch):
+    """F3: pre-rm-004 audit history in the package-local log stays readable
+    for task reconciliation after the state home takes over."""
+    active = tmp_path / "active" / "audit.jsonl"
+    active.parent.mkdir(parents=True)
+    active.write_text(
+        '{"task_id": "t1", "seq": 2}\n', encoding="utf-8"
+    )
+    legacy = tmp_path / "legacy" / "pkg_audit.jsonl"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text(
+        '{"task_id": "t1", "seq": 1}\n{"task_id": "t2", "seq": 9}\n', encoding="utf-8"
+    )
+    monkeypatch.setattr(op, "AUDIT_LOG_FALLBACK_PATH", legacy)
+    op.set_audit_log_override(active)
+    try:
+        seqs = [r.get("seq") for r in op.iter_audit_for_task("t1")]
+        assert sorted(seqs) == [1, 2]
+        assert list(op.iter_audit_for_task("t2"))
+    finally:
+        op.set_audit_log_override(None)
+
+
+def test_audit_write_failure_is_counted_not_raised(tmp_path):
+    """A failed audit write must not break the tool call; the failure is
+    surfaced through audit_write_diagnostics() instead of being swallowed."""
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory", encoding="utf-8")
+    op.set_audit_log_override(blocker / "sub" / "audit.jsonl")
+    try:
+        before = op.audit_write_diagnostics()["count"]
+        record = op.audit_record(
+            tool="hermes_operator_policy",
+            level="policy",
+            apply_mode="direct",
+            dry_run=False,
+            success=True,
+            summary="must still return a record",
+        )
+        assert record["success"] is True
+        after = op.audit_write_diagnostics()
+        assert after["count"] >= before + 1
+        assert after["last_error"]
+        assert str(blocker) in after["last_path"]
+    finally:
+        op.set_audit_log_override(None)
+
+
+def test_audit_log_rotates_and_task_reconciliation_spans_generations(tmp_path, monkeypatch):
+    """At the size cap the log rotates to a single .1 archive; task
+    reconciliation must still see pre-rotation records."""
+    log_path = tmp_path / "audit.jsonl"
+    monkeypatch.setattr(op, "AUDIT_LOG_MAX_BYTES", 1)
+    op.set_audit_log_override(log_path)
+    try:
+        op.audit_record(
+            tool="t_one", level="policy", apply_mode="direct", dry_run=True,
+            success=True, summary="first", extra={"task_id": "task-rotate"},
+        )
+        op.audit_record(
+            tool="t_two", level="policy", apply_mode="direct", dry_run=True,
+            success=True, summary="second", extra={"task_id": "task-rotate"},
+        )
+        rotated = log_path.with_name(log_path.name + ".1")
+        assert rotated.exists(), "first record must live in the archive"
+        archived = json.loads(rotated.read_text(encoding="utf-8").strip())
+        assert archived["tool"] == "t_one"
+        active = json.loads(log_path.read_text(encoding="utf-8").strip())
+        assert active["tool"] == "t_two"
+        # Third write rotates again: exactly one archive generation is kept,
+        # so the archive is replaced (t_one rotates out) rather than
+        # accumulating unbounded history. At the real 5 MiB cap this window
+        # spans millions of records.
+        op.audit_record(
+            tool="t_three", level="policy", apply_mode="direct", dry_run=True,
+            success=True, summary="third", extra={"task_id": "task-rotate"},
+        )
+        assert json.loads(rotated.read_text(encoding="utf-8").strip())["tool"] == "t_two"
+        assert json.loads(log_path.read_text(encoding="utf-8").strip())["tool"] == "t_three"
+        # Reconciliation spans the archive and the active file; generations
+        # rotated out beyond the single archive are gone by design.
+        tools = [rec["tool"] for rec in op.iter_audit_for_task("task-rotate")]
+        assert tools == ["t_two", "t_three"]
+    finally:
+        op.set_audit_log_override(None)
+
+
+def test_audit_tail_reads_are_byte_bounded(tmp_path, monkeypatch):
+    """audit_tail parses only the final AUDIT_TAIL_MAX_BYTES, so a huge
+    append-only log cannot make the call unbounded."""
+    log_path = tmp_path / "audit.jsonl"
+    giant = {"tool": "giant", "summary": "x" * (2 * 1024 * 1024), "task_id": "old"}
+    log_path.write_text(json.dumps(giant) + "\n", encoding="utf-8")
+    op.set_audit_log_override(log_path)
+    try:
+        op.audit_record(
+            tool="recent", level="policy", apply_mode="direct", dry_run=True,
+            success=True, summary="recent record",
+        )
+        records = op.audit_tail(limit=20)
+        tools = [rec["tool"] for rec in records]
+        assert "recent" in tools
+        assert "giant" not in tools, "out-of-window records must not be parsed"
+    finally:
+        op.set_audit_log_override(None)
+
+
 def test_audit_log_does_not_include_full_prompt_or_content(tmp_path):
     log_path = tmp_path / "audit.jsonl"
     op.set_audit_log_override(log_path)

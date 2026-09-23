@@ -7,6 +7,10 @@
 - Raised the `pyyaml` floor to `>=6.0.3` (the `<7` ceiling is unchanged): versions through 6.0.2 are affected by CVE-2026-31132, fixed in 6.0.3, so a fresh dependency resolve can no longer land on a vulnerable build; with the install-set consolidation above, no runtime dependency is unbounded and no second manifest survives to drift.
 - Removed 12 unresolvable gitlink (submodule placeholder) index entries left over from archived review workspaces; `actions/checkout` runs with `submodules:false`, so CI and installs are unaffected.
 - Stopped `.gitignore`'s broad `*.ps1` rule from swallowing the shipped `examples/*.example.ps1` templates (negation `!examples/*.example.ps1`); the tracked example set is unchanged.
+- Added an explicit `mcp==1.30.0` pin lane to the full CI matrix beside the existing `mcp==2.2.0` lane (both shipped 2026-09-07), and a protocol-revision assertion (`test_sdk_protocol_revision_is_deliberate`) that fails loudly on SDK drift instead of covering current SDK releases only incidentally via the range lanes.
+- Resolved the Operator audit log per call under the POSIX state home (`~/.hermes/logs`, honoring `HERMES_HOME` with install-layout normalization) instead of a Windows-only default, with the package-local directory as last resort and legacy package-local history still read for task reconciliation.
+- Surfaced audit write failures instead of silently dropping evidence: failures are counted, exposed via `audit_write_diagnostics()`, and reported by `hermes_operator_doctor` as `AUDIT_WRITE_FAILURES` (`WARN`).
+- Bounded audit growth: size-capped rotation (5 MiB active + single archived generation) and a byte-bounded tail read.
 
 ## 0.11.0 - 2026-09-21
 
