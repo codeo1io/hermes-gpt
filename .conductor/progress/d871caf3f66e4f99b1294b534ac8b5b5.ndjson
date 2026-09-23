@@ -1,0 +1,4 @@
+{"step":1,"ts":"2026-09-22T06:02:56Z","summary":"review_fix dispatched (prior attempt died at provider start); reading review findings","touched":[]}
+{"step":2,"ts":"2026-09-22T06:03:55Z","summary":"findings triaged: F1 patch range-check (now), F2 roadmap deviation note (now), F3 guard module-set (next cycle per reviewer)","touched":[]}
+{"step":3,"ts":"","summary":"F1 fix applied to patched tip: per-field range check (0-59/0-23/1-31/1-12/0-7) in no-croniter branch","touched":["/tmp/rm032-fix-d871caf3/operator_cron.py"]}
+{"step":4,"ts":"2026-09-22T06:06:23Z","summary":"F1 patch regenerated (250 lines, +216/-5); battery A/B green; cron 32/32 both dirs; ruff clean; pristine apply-check OK","touched":[".conductor/patches/rm-032-cron-repair.patch"]}

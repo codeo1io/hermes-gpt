@@ -1,0 +1,4 @@
+{"step":1,"ts":"2026-09-22T06:21:52Z","summary":"Tree state verified: HEAD 5765b571b2, only CHANGELOG/ROADMAP/pyproject modified, no py-modules, no uv.lock/.venv","touched":[".conductor/progress/77d4502c8e734a0c945f5418a5b3be22.ndjson"]}
+{"step":2,"ts":"2026-09-22T06:24:44Z","summary":"Digest surfaces byte-stable: mtimes 04:57/04:58 precede 05:40:54 full green; anchors+hashes match","touched":[]}
+{"step":3,"ts":"2026-09-22T06:24:44Z","summary":"Durable records read: spool 210c9fa1+bcdf8034 both PASSED w/ dispatch digest; lastfailed={}; /tmp base log gone (finding)","touched":[]}
+{"step":4,"ts":"2026-09-22T06:25:29Z","summary":"phase_result JSON written+validated to spool (release-integrity, passed, digest verbatim); tree untouched","touched":["/home/agent/.hermes/conductor-delegate-spool-infra-deploy/delegate/77d4502c8e734a0c945f5418a5b3be22.json"]}

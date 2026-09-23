@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Declared a PEP 735 `[dependency-groups] dev` table mirroring the `dev` extra and added `pytest-xdist` (`>=3,<4`) to both, so `uv run python -m pytest -q -n 8` (the repository's full-suite validation command) works in a bare checkout without `--extra dev`; CI's `pip install -e ".[dev]"` is unchanged.
+- Raised the `pyyaml` floor to `>=6.0.3` (the `<7` ceiling is unchanged): versions through 6.0.2 are affected by CVE-2026-31132, fixed in 6.0.3, so a fresh dependency resolve can no longer land on a vulnerable build. The legacy `requirements.txt`/`requirements-dev.txt` still carry the older unbounded pins; their removal rides the packaging-consolidation PR (#19) instead of this change.
 
 ## 0.11.0 - 2026-09-21
 
