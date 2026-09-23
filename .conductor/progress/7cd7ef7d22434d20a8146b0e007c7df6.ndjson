@@ -1,0 +1,2 @@
+{"step":1,"ts":"2026-09-22T16:41:33Z","summary":"Stewardship phase start: verifying B1 file:line surfaces at HEAD","touched":[".conductor/progress/7cd7ef7d22434d20a8146b0e007c7df6.ndjson"]}
+{"step":2,"ts":"2026-09-22T16:42:39Z","summary":"stewardship_request emitted (14 surfaces, 5 separation hints) + validated","touched":["/home/agent/.hermes/conductor-delegate-spool-infra-deploy/delegate/7cd7ef7d22434d20a8146b0e007c7df6.json"]}

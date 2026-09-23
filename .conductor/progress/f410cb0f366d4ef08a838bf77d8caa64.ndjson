@@ -1,0 +1,3 @@
+{"step":1,"ts":"2026-09-22T17:13:04Z","summary":"targeted_tests dispatch f410cb0f: scope=7 changed surfaces, baseline-interpreter substitution, no-exec-change plan","touched":[]}
+{"step":2,"ts":"2026-09-22T17:13:51Z","summary":"targeted run green 252P/1S/0F exit0 + ruff changed-files clean + isolated clean + compile OK; tree unchanged","touched":[]}
+{"step":3,"ts":"2026-09-22T17:14:24Z","summary":"phase_result emitted to spool f410cb0f366d4ef08a838bf77d8caa64.json; digest verbatim; scope targeted; outcome passed","touched":[]}

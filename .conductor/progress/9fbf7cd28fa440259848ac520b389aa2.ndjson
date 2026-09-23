@@ -1,0 +1,6 @@
+{"step":1,"ts":"2026-09-23T00:00:00Z","summary":"Post-fix tree: 13 files +750/-49 vs base; fix delta +204/-4 on docs/oauth.md, oauth_auth.py, 3 test files","touched":[]}
+{"step":2,"ts":"2026-09-23T00:00:00Z","summary":"F1-F5,F7-F9 remediation verified in code+tests; F6 deferred per review scoping; F10 accepted","touched":[]}
+{"step":3,"ts":"2026-09-23T00:00:00Z","summary":"New finding: dict.fromkeys TypeError on unhashable redirect elements (latent from implement, missed in review 1); fails closed via server.py:2942 except","touched":[]}
+{"step": 4, "ts": "2026-09-23T00:00:00Z", "summary": "ROADMAP accounting stale: +549/-45 is pre-fix (now +750/-49); the +3 review-fix label miscounts the +5 tests", "touched": []}
+{"step":5,"ts":"2026-09-23T00:00:00Z","summary":"Independent retest: targeted 257P/1S exit 0; full 1505P/5S exit 0; ruff clean; fix logs present; origin/master=a93aeb0b1d verified","touched":["/tmp/rereview-9fbf7cd2-targeted.log","/tmp/rereview-9fbf7cd2-full.log"]}
+{"step":6,"ts":"2026-09-23T00:00:00Z","summary":"VERDICT PASS emitted to spool: 10/10 prior findings remediated or scoped-deferred; 2 new LOW advisory findings (R1 TypeError robustness, R2 ROADMAP accounting staleness)","touched":["/home/agent/.hermes/conductor-delegate-spool-infra-deploy/delegate/9fbf7cd28fa440259848ac520b389aa2.json"]}

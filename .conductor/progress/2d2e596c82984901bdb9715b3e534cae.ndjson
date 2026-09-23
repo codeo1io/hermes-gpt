@@ -1,0 +1,6 @@
+{"step":1,"ts":"2026-09-22T16:49:09Z","summary":"U2+U3 code landed in oauth_auth.py: TTL+eviction, import parity, iss","touched":["oauth_auth.py"]}
+{"step":2,"ts":"2026-09-22T16:51:11Z","summary":"U2/U3 tests added: 9 new, DCR file green + pkce/oauth_auth suites","touched":["test_oauth_dynamic_registration.py"]}
+{"step":3,"ts":"2026-09-22T16:53:20Z","summary":"U1 docs landed: oauth.md DCR truth+knobs+iss, operator-mode.md TMPDIR, CHANGELOG Unreleased","touched":["docs/oauth.md","docs/operator-mode.md","CHANGELOG.md"]}
+{"step":4,"ts":"2026-09-22T17:03:35Z","summary":"Full suite serial x2 green: post 1495P/5S/0F; pre-change A/B 1486P/5S/0F = exactly +9, zero regressions","touched":[]}
+{"step":5,"ts":"2026-09-22T17:08:12Z","summary":"Stretch U4+U5 landed: unique-tmp fsynced writes (workspace/cron), 7d tmpdir janitor, pid-parser dedupe, site/.vercel untracked+ignored","touched":["operator_workspace.py","operator_cron.py","operator_diagnostics.py",".gitignore","test_operator_cron.py","test_operator_workspace.py","docs/operator-mode.md","CHANGELOG.md"]}
+{"step":6,"ts":"2026-09-22T17:11:10Z","summary":"phase_result emitted to spool 2d2e596c82984901bdb9715b3e534cae.json; batch B1+U4+U5 complete, 1505P/5S/0F","touched":[]}

@@ -1,0 +1,8 @@
+{"step":1,"ts":"2026-09-22T17:37:45Z","summary":"review_fix dispatch b4233141: reading independent_review findings (7e7f5709) in full","touched":[]}
+{"step":1,"ts":"2026-09-22T17:49:18Z","summary":"Read review 7e7f5709 JSON; 4 actionable findings F1/F2/F3-F5/F4/F7 + info nits","touched":[]}
+{"step":2,"ts":"2026-09-22T17:49:18Z","summary":"Verified digest algorithm reproduces dispatch 95ed77fc on pre-fix tree","touched":[]}
+{"step":3,"ts":"2026-09-22T17:49:18Z","summary":"Fixed oauth_auth.py: iss on error redirect, s2.3 metadata flag, import dedupe/first-wins, comment truth","touched":["oauth_auth.py"]}
+{"step":4,"ts":"2026-09-22T17:49:18Z","summary":"Docs+CHANGELOG truth (allowlist exact hosts, iss both paths, parity wording); ROADMAP accounting","touched":["docs/oauth.md","CHANGELOG.md","ROADMAP.md"]}
+{"step":5,"ts":"2026-09-22T17:49:18Z","summary":"+5 tests: error-iss, metadata flag, import dedupe, 2 real 8-thread race tests","touched":["test_oauth_dynamic_registration.py","test_operator_cron.py","test_operator_workspace.py"]}
+{"step":6,"ts":"2026-09-22T17:49:18Z","summary":"Full suite 1505P/5S/0F exit0 (+5 exact), ruff clean x2, emission digest 2f869954 derived","touched":[]}
+{"step":7,"ts":"2026-09-22T17:49:18Z","summary":"phase_result JSON written to spool and validated","touched":["delegate-spool"]}

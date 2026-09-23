@@ -1,0 +1,10 @@
+{"step":1,"ts":"2026-09-22T16:12:06Z","summary":"Baseline: clean tree at 4b958379d6 on conductor/run-0c8974179349","touched":[".conductor/progress/791fb882ab674d68ab9ca2cb4348e3e8.ndjson"]}
+{"step":2,"ts":"2026-09-22T16:16:37Z","summary":"Full suite green in CI shape (HERMES_HTTP_TEST=1, serial, mcp 2.2.0); ruff clean; gitlinks 0","touched":["/tmp/assess-791fb882-full.log"]}
+{"step": 3, "ts": "2026-09-22T16:23:06Z", "summary": "Read ROADMAP/deployed-merge diff: DCR+PKCE+tmp routing landed on master 2026-09-22", "touched": []}
+{"step": 4, "ts": "2026-09-22T16:23:06Z", "summary": "Suite done: 1497 passed/28 skipped/0 failed; baseline venv now mcp 2.2.0", "touched": ["/tmp/assess-791fb882-full.log"]}
+{"step": 5, "ts": "2026-09-22T16:23:06Z", "summary": "DCR deep-dive: cleanup() never evicts dynamic_clients; import skips redirect revalidation", "touched": ["oauth_auth.py"]}
+{"step": 6, "ts": "2026-09-22T16:23:06Z", "summary": "Deployed-line surfaces: gateway-pid dedupe partial; tmpdir env mutation; async conversions redundant", "touched": ["operator_workspace.py", "server.py"]}
+{"step": 7, "ts": "2026-09-22T16:23:06Z", "summary": "Docs/env-knob gaps: docs/oauth.md:21 'no DCR' false; 3 new env vars undocumented; no CHANGELOG Unreleased", "touched": ["docs/oauth.md", "CHANGELOG.md"]}
+{"step": 8, "ts": "2026-09-22T16:23:06Z", "summary": "CI/publish: PR fast-lane single-lane risk; publish.yml back to self-hosted; master unprotected (404)", "touched": [".github/workflows/publish.yml"]}
+{"step": 9, "ts": "2026-09-22T16:23:06Z", "summary": "Prior roadmap re-verify: rm-005/006/019/020/013 open; rm-022 resolved", "touched": []}
+{"step": 10, "ts": "2026-09-22T16:23:06Z", "summary": "phase_result JSON written to spool: 19 findings, suite 1497P/0F", "touched": ["/home/agent/.hermes/conductor-delegate-spool-infra-deploy/delegate/791fb882ab674d68ab9ca2cb4348e3e8.json"]}
