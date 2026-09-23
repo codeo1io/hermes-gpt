@@ -235,7 +235,7 @@ Review loop: independent review 6084fc89 PASS with 4 findings -> fix 711573d0 (n
 
 - **rm-024** (Py3.13/3.14 CI lanes; 3.10 EOL 2026-10) — highest research-backed value; needs CI runs, not just local.
 - **pyyaml bound** — last bare runtime dependency after rm-023 (pyproject dependencies list). The dev-extra ruff pin (>=0.15,<0.16) landed in review-fix 711573d0; cap moves for either are deliberate changelog events.
-- **De-flake the parallel cancel tests** or mark them serial-only via pytest markers; add pytest-xdist to dev extras only if `-n 8` becomes an official lane (it is declared nowhere today).
+- **De-flake the parallel cancel tests** or mark them serial-only via pytest markers; pytest-xdist (>=3,<4) was declared 2026-09-23 (pyproject.toml: `[dependency-groups]` dev + the dev extra, plus a PEP 735 group so bare `uv run python -m pytest -q -n 8` works) because the conductor's pinned full-suite validation command for this repository made `-n 8` an official lane; the de-flake landed 2026-09-23 (integration case 5bffbe48: all 74 tight `Event.wait`/`Thread.join` wall-clock budgets in test_operator_delegations/fabric_g4c/mission_runtime/ui_chat widened to a `_THREAD_BUDGET` constant, default 30 s, `HERMES_TEST_THREAD_BUDGET` override; deadlock detection preserved at the widened deadline — a 5th member, `test_parent_cancellation_racing_child_cancellation_preserves_lock_order`, was caught during the fix and is covered by the same sweep).
 - **CHANGELOG entry for this batch** (user-visible: repo-wide lint gate, uvicorn bound, corrupt-jobs.json backup) at commit time.
 - **rm-018 revisit** only after the sibling rm-003 re-bind merges (one coherent unit with its test updates).
 - Watch **test_mcp_compat.py:81** in CI: its assess-time failure no longer reproduces in-session (passes in-suite and standalone) — env-state-dependent, needs a skip guard for bare checkouts regardless.
@@ -313,6 +313,6 @@ Batch B1 'Verified-Fresh Hygiene' implemented in worktree run-684b97865efc-684b9
 
 - **rm-026 (upstream v0.11.0 catch-up) stays the headline** and is gated on PR #12/#13 merging (adopt-by-content: this run re-verified both still open 2026-09-22); it carries the canonical stale-PKCE fix and unblocks rm-028 (upstream issue #74 contract).
 - The batch's review/commit gates are pending at this writing — outcome text above is pre-review by design and must not be read as shipped.
-- De-flake scope (rm-012) now covers 4 g4c/delegation members; serial remains authoritative.
+- De-flake scope (rm-012) now covers 4 g4c/delegation members; serial remains authoritative. (2026-09-23: the budget-widening sweep in integration case 5bffbe48 covers all of them plus the newly observed parent/child lock-order member across the four thread-budget files.)
 - Sentinel-pin rotation (rm-030) re-verify on each catch-up cycle: `gh api repos/codeo1io/.github/commits/main --jq .sha` vs the pinned ref in ci.yml.
 <!-- managed by hermes-roadmap render; do not edit by hand -->

@@ -9,6 +9,7 @@ persistence are all exercised end-to-end without any LLM call.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 import time
@@ -29,6 +30,18 @@ from starlette.testclient import TestClient
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import ui_chat  # noqa: E402
+
+#: Inter-thread coordination budget for this module's concurrency tests.
+# These ``Event.wait``/``Thread.join`` timeouts are deadlock detectors, not
+# wall-clock contracts: the assertion behind each call cares that coordination
+# COMPLETES, never that it completes within a fixed few seconds. The shared
+# validation runner is routinely saturated (load average 30-50 while concurrent
+# full-suite fleets run), where 2-15 s budgets produce load-timing false
+# positives (ROADMAP.md, "Cycle 1 learnings", rules 9 and 13). Healthy runs are
+# not slowed at all -- wait/join return the moment coordination completes; a
+# real deadlock still fails, at the widened deadline. Override with
+# HERMES_TEST_THREAD_BUDGET when debugging a genuine hang.
+_THREAD_BUDGET = float(os.environ.get("HERMES_TEST_THREAD_BUDGET", "30"))
 
 
 # ── Test doubles ──────────────────────────────────────────────────────────
@@ -118,7 +131,7 @@ def client(app):
         yield c
 
 
-def _wait_for_turn(session_id: str, timeout: float = 5.0) -> None:
+def _wait_for_turn(session_id: str, timeout: float = _THREAD_BUDGET) -> None:
     """Poll the turn registry until the handler registered the turn."""
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -371,7 +384,7 @@ def test_chat_busy_session_returns_409(client, app, monkeypatch):
         assert resp.json()["error"]["code"] == "TURN_IN_PROGRESS"
     finally:
         hold.set()
-        stream_thread.join(timeout=15)
+        stream_thread.join(timeout=_THREAD_BUDGET)
     assert result.get("status") == 200
     assert not stream_thread.is_alive()
 
@@ -398,7 +411,7 @@ def test_chat_stop_interrupts_turn(client, monkeypatch):
         assert resp.json()["data"]["stopped"] is True
     finally:
         hold.set()
-        stream_thread.join(timeout=15)
+        stream_thread.join(timeout=_THREAD_BUDGET)
     assert result.get("status") == 200
     events = _parse_sse(result.get("text", ""))
     assert events[-1][0] == "done"

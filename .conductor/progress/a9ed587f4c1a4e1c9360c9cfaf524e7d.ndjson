@@ -1,0 +1,3 @@
+{"step":1,"ts":"2026-09-21T13:14:37Z","summary":"Commit-gate folds: ROADMAP review-loop addendum, docs glob fix, CHANGELOG Unreleased entry; ruff 0","touched":["ROADMAP.md","docs/operator-mode.md","CHANGELOG.md"]}
+{"step":2,"ts":"2026-09-21T13:15:02Z","summary":"Committed 89865b1281 (40 files, parent c1785b22e5); .conductor/ excluded; tree clean","touched":[".git"]}
+{"step":3,"ts":"2026-09-21T13:15:40Z","summary":"Spool JSON written+validated; commit 89865b1281 recorded","touched":["/home/agent/.hermes/conductor-delegate-spool-infra-deploy/delegate/a9ed587f4c1a4e1c9360c9cfaf524e7d.json"]}

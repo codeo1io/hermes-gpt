@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import os
 import threading
 from contextlib import contextmanager
 from pathlib import Path
@@ -12,6 +13,18 @@ import operator_fabric as base
 import operator_fabric_g4c as fabric
 import operator_fabric_router as base_router
 import operator_runners as runners
+
+#: Inter-thread coordination budget for this module's concurrency tests.
+# These ``Event.wait``/``Thread.join`` timeouts are deadlock detectors, not
+# wall-clock contracts: the assertion behind each call cares that coordination
+# COMPLETES, never that it completes within a fixed few seconds. The shared
+# validation runner is routinely saturated (load average 30-50 while concurrent
+# full-suite fleets run), where 2-15 s budgets produce load-timing false
+# positives (ROADMAP.md, "Cycle 1 learnings", rules 9 and 13). Healthy runs are
+# not slowed at all -- wait/join return the moment coordination completes; a
+# real deadlock still fails, at the widened deadline. Override with
+# HERMES_TEST_THREAD_BUDGET when debugging a genuine hang.
+_THREAD_BUDGET = float(os.environ.get("HERMES_TEST_THREAD_BUDGET", "30"))
 
 TOKEN = "0123456789abcdef0123456789abcdef"
 
@@ -249,7 +262,7 @@ def _blocked_prelaunch_accept(tmp_path, monkeypatch, *, available=True):
 
     def availability(_self, **_kwargs):
         entered.set()
-        assert resume.wait(5), "test did not release pre-launch validation"
+        assert resume.wait(_THREAD_BUDGET), "test did not release pre-launch validation"
         return {"available": available}
 
     monkeypatch.setattr(FakeLocalBackend, "availability", availability)
@@ -276,7 +289,7 @@ def _blocked_prelaunch_accept(tmp_path, monkeypatch, *, available=True):
 
     thread = threading.Thread(target=run_accept)
     thread.start()
-    assert entered.wait(5), "accept did not reach the durable pre-launch window"
+    assert entered.wait(_THREAD_BUDGET), "accept did not reach the durable pre-launch window"
     return svc, value, first, launches, errors, resume, thread
 
 
@@ -294,7 +307,7 @@ def test_reconcile_during_prelaunch_keeps_claim_and_blocks_retry(tmp_path, monke
     assert launches == []
 
     resume.set()
-    thread.join(5)
+    thread.join(_THREAD_BUDGET)
     assert not thread.is_alive()
     assert errors == []
     assert len(launches) == 1
@@ -356,7 +369,7 @@ def test_cancel_wins_before_final_launch_check_and_releases_unstarted_claim(
     assert launches == []
 
     resume.set()
-    thread.join(5)
+    thread.join(_THREAD_BUDGET)
     assert not thread.is_alive()
     assert errors == []
     assert launches == []
@@ -385,7 +398,7 @@ def test_cancelled_prelaunch_validation_failure_releases_definitely_unstarted_cl
     assert claim_for(svc)["state"] == "ACTIVE"
 
     resume.set()
-    thread.join(5)
+    thread.join(_THREAD_BUDGET)
     assert not thread.is_alive()
     assert len(errors) == 1
     assert isinstance(errors[0], fabric.FabricError)
@@ -458,7 +471,7 @@ def test_launch_wins_first_and_cancel_returns_while_launch_call_is_in_flight(
     def delayed_launch(_contract, **kwargs):
         launches.append(kwargs["unit_id"])
         launch_entered.set()
-        assert launch_resume.wait(10), "test did not release delayed writer launch"
+        assert launch_resume.wait(_THREAD_BUDGET), "test did not release delayed writer launch"
         unit.activate(kwargs["unit_id"])
         return {"success": True, "changed": True, "backend": "pi_rpc"}
 
@@ -474,7 +487,7 @@ def test_launch_wins_first_and_cancel_returns_while_launch_call_is_in_flight(
 
     accept_thread = threading.Thread(target=run_accept)
     accept_thread.start()
-    assert launch_entered.wait(5), "accept did not reach delayed writer launch"
+    assert launch_entered.wait(_THREAD_BUDGET), "accept did not reach delayed writer launch"
 
     def run_cancel():
         cancel_results.append(
@@ -484,7 +497,7 @@ def test_launch_wins_first_and_cancel_returns_while_launch_call_is_in_flight(
 
     cancel_thread = threading.Thread(target=run_cancel)
     cancel_thread.start()
-    assert cancel_finished.wait(2), "cancellation blocked behind the external launch"
+    assert cancel_finished.wait(_THREAD_BUDGET), "cancellation blocked behind the external launch"
     assert claim_for(svc)["state"] == "ACTIVE"
     assert launches == [unit.unit_name(first["attempt_id"])]
     assert cancel_results[0]["state"] == "CANCEL_REQUESTED"
@@ -501,8 +514,8 @@ def test_launch_wins_first_and_cancel_returns_while_launch_call_is_in_flight(
     assert unit.stopped == []
 
     launch_resume.set()
-    accept_thread.join(5)
-    cancel_thread.join(5)
+    accept_thread.join(_THREAD_BUDGET)
+    cancel_thread.join(_THREAD_BUDGET)
     assert not accept_thread.is_alive()
     assert not cancel_thread.is_alive()
     assert accept_errors == []
@@ -523,7 +536,7 @@ def test_slow_launch_does_not_hold_peer_lock_for_unrelated_conflict_domain(
 
     def delayed_launch(_contract, **_kwargs):
         launch_entered.set()
-        assert launch_resume.wait(5), "test did not release delayed writer launch"
+        assert launch_resume.wait(_THREAD_BUDGET), "test did not release delayed writer launch"
         return {"success": True, "changed": True, "backend": "pi_rpc"}
 
     svc.write_dispatch_fn = delayed_launch
@@ -538,7 +551,7 @@ def test_slow_launch_does_not_hold_peer_lock_for_unrelated_conflict_domain(
 
     accept_thread = threading.Thread(target=run_accept)
     accept_thread.start()
-    assert launch_entered.wait(5), "accept did not reach delayed writer launch"
+    assert launch_entered.wait(_THREAD_BUDGET), "accept did not reach delayed writer launch"
 
     def run_unrelated_operations():
         try:
@@ -565,12 +578,12 @@ def test_slow_launch_does_not_hold_peer_lock_for_unrelated_conflict_domain(
 
     unrelated_thread = threading.Thread(target=run_unrelated_operations)
     unrelated_thread.start()
-    assert unrelated_finished.wait(2), "slow external launch held the peer-wide lock"
+    assert unrelated_finished.wait(_THREAD_BUDGET), "slow external launch held the peer-wide lock"
     assert claim_for(svc, "workspace:unrelated")["state"] == "ACTIVE"
 
     launch_resume.set()
-    accept_thread.join(5)
-    unrelated_thread.join(5)
+    accept_thread.join(_THREAD_BUDGET)
+    unrelated_thread.join(_THREAD_BUDGET)
     assert not accept_thread.is_alive()
     assert not unrelated_thread.is_alive()
     assert errors == []
@@ -593,7 +606,7 @@ def test_revoked_fence_with_unknown_unit_state_releases_without_execution(
     svc.unit_manager.inspect = unexpected_inspect
 
     resume.set()
-    thread.join(5)
+    thread.join(_THREAD_BUDGET)
 
     assert not thread.is_alive()
     assert errors == []
@@ -614,7 +627,7 @@ def test_status_during_healthy_slow_launch_preserves_fence_and_reaches_running(
 
     def delayed_launch(_contract, **kwargs):
         launch_entered.set()
-        assert launch_resume.wait(10), "test did not release delayed writer launch"
+        assert launch_resume.wait(_THREAD_BUDGET), "test did not release delayed writer launch"
         unit.activate(kwargs["unit_id"])
         return {"success": True, "changed": True, "backend": "pi_rpc"}
 
@@ -632,7 +645,7 @@ def test_status_during_healthy_slow_launch_preserves_fence_and_reaches_running(
 
     thread = threading.Thread(target=run_accept)
     thread.start()
-    assert launch_entered.wait(5), "accept did not reach delayed writer launch"
+    assert launch_entered.wait(_THREAD_BUDGET), "accept did not reach delayed writer launch"
 
     status = svc._status(first["dispatch_id"], first["attempt_id"], reconcile=False)
     assert status["state"] == "LAUNCHING"
@@ -640,7 +653,7 @@ def test_status_during_healthy_slow_launch_preserves_fence_and_reaches_running(
     assert claim_for(svc)["state"] == "ACTIVE"
 
     launch_resume.set()
-    thread.join(5)
+    thread.join(_THREAD_BUDGET)
     assert not thread.is_alive()
     assert errors == []
     assert responses[0]["data"]["state"] == "RUNNING"
@@ -661,7 +674,7 @@ def test_secondary_accepts_do_not_clear_original_invocation_marker(tmp_path, mon
 
     def delayed_launch(_contract, **kwargs):
         launch_entered.set()
-        assert launch_resume.wait(10), "test did not release delayed writer launch"
+        assert launch_resume.wait(_THREAD_BUDGET), "test did not release delayed writer launch"
         unit.activate(kwargs["unit_id"])
         return {"success": True, "changed": True, "backend": "pi_rpc"}
 
@@ -679,7 +692,7 @@ def test_secondary_accepts_do_not_clear_original_invocation_marker(tmp_path, mon
 
     thread = threading.Thread(target=run_accept)
     thread.start()
-    assert launch_entered.wait(5), "accept did not reach delayed writer launch"
+    assert launch_entered.wait(_THREAD_BUDGET), "accept did not reach delayed writer launch"
     assert svc._invocation_in_flight(first["attempt_id"]) is True
 
     status = svc._status(first["dispatch_id"], first["attempt_id"], reconcile=True)
@@ -687,7 +700,7 @@ def test_secondary_accepts_do_not_clear_original_invocation_marker(tmp_path, mon
     assert svc._invocation_in_flight(first["attempt_id"]) is True
 
     launch_resume.set()
-    thread.join(5)
+    thread.join(_THREAD_BUDGET)
     assert not thread.is_alive()
     assert errors == []
     assert responses[0]["data"]["state"] == "RUNNING"
@@ -775,7 +788,7 @@ def test_definite_launch_failure_after_cancel_terminalizes_and_allows_retry(
 
     def failed_launch(_contract, **kwargs):
         launch_entered.set()
-        assert launch_resume.wait(5), "test did not release failed launch"
+        assert launch_resume.wait(_THREAD_BUDGET), "test did not release failed launch"
         unit.quiesce(kwargs["unit_id"])
         return {
             "success": False,
@@ -798,7 +811,7 @@ def test_definite_launch_failure_after_cancel_terminalizes_and_allows_retry(
 
     thread = threading.Thread(target=run_accept)
     thread.start()
-    assert launch_entered.wait(5), "accept did not reach failed launch"
+    assert launch_entered.wait(_THREAD_BUDGET), "accept did not reach failed launch"
 
     def run_cancel():
         cancel_results.append(
@@ -813,13 +826,13 @@ def test_definite_launch_failure_after_cancel_terminalizes_and_allows_retry(
 
     cancel_thread = threading.Thread(target=run_cancel)
     cancel_thread.start()
-    assert cancel_finished.wait(2), "cancellation blocked behind the failed launch callback"
+    assert cancel_finished.wait(_THREAD_BUDGET), "cancellation blocked behind the failed launch callback"
     assert claim_for(svc)["state"] == "ACTIVE"
     assert cancel_results[0]["state"] == "CANCEL_REQUESTED"
 
     launch_resume.set()
-    thread.join(5)
-    cancel_thread.join(5)
+    thread.join(_THREAD_BUDGET)
+    cancel_thread.join(_THREAD_BUDGET)
     assert not thread.is_alive()
     assert not cancel_thread.is_alive()
     assert errors == []

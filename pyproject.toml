@@ -25,6 +25,21 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "pytest",
+  "pytest-xdist>=3,<4",
+  "ruff>=0.15,<0.16",
+  "build",
+  "twine",
+  "keyring",
+]
+
+# uv syncs this PEP 735 dependency group by default (unlike extras), so
+# `uv run python -m pytest -q -n 8` works in a bare checkout without
+# `--extra dev` or a pre-installed venv. Keep this list identical to
+# [project.optional-dependencies].dev (used by CI: `pip install -e ".[dev]"`).
+[dependency-groups]
+dev = [
+  "pytest",
+  "pytest-xdist>=3,<4",
   "ruff>=0.15,<0.16",
   "build",
   "twine",

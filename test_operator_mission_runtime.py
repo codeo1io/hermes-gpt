@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import json
 import threading
 from pathlib import Path
@@ -8,6 +9,18 @@ import pytest
 
 import operator_mission_runtime as mission
 import operator_policy as op
+
+#: Inter-thread coordination budget for this module's concurrency tests.
+# These ``Event.wait``/``Thread.join`` timeouts are deadlock detectors, not
+# wall-clock contracts: the assertion behind each call cares that coordination
+# COMPLETES, never that it completes within a fixed few seconds. The shared
+# validation runner is routinely saturated (load average 30-50 while concurrent
+# full-suite fleets run), where 2-15 s budgets produce load-timing false
+# positives (ROADMAP.md, "Cycle 1 learnings", rules 9 and 13). Healthy runs are
+# not slowed at all -- wait/join return the moment coordination completes; a
+# real deadlock still fails, at the widened deadline. Override with
+# HERMES_TEST_THREAD_BUDGET when debugging a genuine hang.
+_THREAD_BUDGET = float(os.environ.get("HERMES_TEST_THREAD_BUDGET", "30"))
 
 
 @pytest.fixture
@@ -318,7 +331,7 @@ def test_noncompletion_reconcile_observes_outside_mission_write_lock(
 
     def paused_observe(*args, **kwargs):
         entered.set()
-        assert release.wait(5)
+        assert release.wait(_THREAD_BUDGET)
         return original_observe(*args, **kwargs)
 
     monkeypatch.setattr(mission, "_observe_attachments", paused_observe)
@@ -327,7 +340,7 @@ def test_noncompletion_reconcile_observes_outside_mission_write_lock(
         "msn-test", confirm=True, dry_run=False, hermes_root=hermes_root,
     ))))
     thread.start()
-    assert entered.wait(5)
+    assert entered.wait(_THREAD_BUDGET)
     # This write must not wait behind attachment observation.
     updated = _j(mission.hermes_mission_update(
         "msn-test", json.dumps({"title": "Concurrent update"}),
@@ -335,7 +348,7 @@ def test_noncompletion_reconcile_observes_outside_mission_write_lock(
     ))
     assert updated["success"] is True
     release.set()
-    thread.join(5)
+    thread.join(_THREAD_BUDGET)
     assert not thread.is_alive()
     assert reconciled[0]["success"] is False
 
@@ -355,7 +368,7 @@ def test_parent_cancellation_observes_outside_mission_write_lock(
 
     def paused_observe(*args, **kwargs):
         entered.set()
-        assert release.wait(5)
+        assert release.wait(_THREAD_BUDGET)
         return original_observe(*args, **kwargs)
 
     monkeypatch.setattr(mission, "_observe_attachments", paused_observe)
@@ -364,14 +377,14 @@ def test_parent_cancellation_observes_outside_mission_write_lock(
         "msn-test", "cancelled", confirm=True, dry_run=False, hermes_root=hermes_root,
     ))))
     thread.start()
-    assert entered.wait(5)
+    assert entered.wait(_THREAD_BUDGET)
     updated = _j(mission.hermes_mission_update(
         "msn-test", json.dumps({"title": "Concurrent cancellation update"}),
         confirm=True, dry_run=False, hermes_root=hermes_root,
     ))
     assert updated["success"] is True
     release.set()
-    thread.join(5)
+    thread.join(_THREAD_BUDGET)
     assert not thread.is_alive()
     assert cancelled[0]["success"] is False
     assert _j(mission.hermes_mission_get("msn-test", hermes_root=hermes_root))["status"] != "cancelled"
