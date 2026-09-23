@@ -27,7 +27,7 @@ Verified on 2026-09-21 against a real Gemini Spark connection to a Hermes GPT OA
 - **Operator/Owner authority is process-wide, not per client.** Every registered OAuth client on an instance reaches the same policy-gated tool surface, so an additional client profile can never *lower* what another client sees — but it is not separately sandboxed either. Adding the Gemini Spark profile to an instance that already runs Operator direct mode or Owner Mode gives the Gemini connector the same authority the primary client has. Prefer a **dedicated read-only instance** for Gemini instead of adding it to an owner-mode instance.
 - **Isolated credentials.** The profile registers its own `client_id`, its own secret, and its own exact-match redirect-URI allowlist. A client can only complete an authorization request to its **own** redirect URIs and can only authenticate with its **own** secret at the token endpoint; another client's credentials or redirects fail closed.
 - **Exact-match redirects.** Redirect URIs are compared exactly. Wildcards are neither accepted nor supported.
-- **No dynamic client registration, by design.** `registration_endpoint` is not advertised, which is exactly what triggers Gemini's documented manual Client ID/Secret fallback.
+- **No dynamic client registration needed, by design.** Dynamic registration (RFC 7591) exists for ChatGPT connectors and is **advertised by default** (`HERMES_GPT_OAUTH_DCR`; see [OAuth behavior knobs](#oauth-behavior-knobs)). A dedicated Gemini deployment that wants Gemini's documented manual Client ID/Secret fallback — or any deployment that should not expose a public register endpoint at all — sets `HERMES_GPT_OAUTH_DCR=0` to stop advertising `registration_endpoint`.
 
 ## Configuration
 
@@ -74,6 +74,16 @@ HERMES_GPT_OAUTH_GEMINI_REDIRECT_URI=<the exact Google callback discovered below
 - Do not reuse the primary secret for the Gemini profile — separate credentials and separate redirect allowlists are the point of the profile.
 
 Restart the instance after changing any of these values.
+
+## OAuth behavior knobs
+
+Two environment knobs select OAuth behavior profiles. Both are read at request time and apply process-wide; restart after changing them.
+
+- `HERMES_GPT_OAUTH_DCR` — RFC 7591 dynamic client registration (ChatGPT connectors). Default `1` (on): `registration_endpoint` is advertised and `POST /oauth/register` mints ephemeral public clients. `0` (or `false`/`off`/`no`) removes the advertisement for single confidential-client deployments (the Gemini Spark dedicated-instance pattern above). The register endpoint answers regardless; the knob governs **advertising**.
+  - Dynamic registrations are ephemeral by design and bounded: a per-peer rate limit (5 registrations per 60 seconds), a capacity cap of 64 live clients, and a 7-day TTL with slot reclamation. Expired or purged clients fail closed everywhere at once.
+  - Operators can inventory the registry via `OAuthState.list_dynamic_clients()` (client id, redirect URIs, registration/expiry times, expired flag) and remove entries via `OAuthState.purge_dynamic_client(client_id)` (idempotent).
+- `HERMES_GPT_OAUTH_PKCE_MODE` — `required` (default) or `optional`. `required`: every authorization code is bound to an S256 PKCE challenge. `optional`: pre-2026-08-31 compatibility — challenge-less authorize is accepted for confidential clients, a supplied challenge must still be valid S256, and redemption still requires the client secret. Dynamic (RFC 7591) clients are always public and always require PKCE regardless of mode.
+- Authorization responses always carry the RFC 9207 `iss` parameter (success and error redirects) and the authorization-server metadata advertises `authorization_response_iss_parameter_supported`, per MCP SEP-2468 (Final). This is unconditional — there is no knob — so RFC 9207 clients can validate the issuer on every redirect.
 
 ## Callback discovery
 

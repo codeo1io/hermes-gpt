@@ -1,0 +1,6 @@
+{"step":1,"ts":"2026-09-22T17:40:19+00:00","summary":"review 4f15d132 9 findings triaged; HIGH bearer-gap fixed via state-level _client_registered gate","touched":["oauth_auth.py"]}
+{"step":2,"ts":"2026-09-22T17:40:19+00:00","summary":"import budget/shadow/ascii checks + rate-map pruning + dup-raise removal; 3 new tests + capacity test isolated","touched":["oauth_auth.py","test_oauth_dynamic_registration.py"]}
+{"step":3,"ts":"2026-09-22T17:40:19+00:00","summary":"docs iss note; CHANGELOG operator-wiring wording + bearer entry; ROADMAP rm-049 acceptance, review-fix record w/ measured numstat, sequencing fix","touched":["docs/gemini-spark.md","CHANGELOG.md","ROADMAP.md"]}
+{"step":4,"ts":"2026-09-22T17:40:19+00:00","summary":"targeted suite RC=0 (5 files incl pkce+gemini); ruff clean","touched":[]}
+{"step":5,"ts":"2026-09-22T17:45:14+00:00","summary":"full suite [100%] 0 FAILED/ERROR on review-fixed tree (/tmp/review3158/full.log)","touched":[]}
+{"step":6,"ts":"2026-09-22T17:45:14+00:00","summary":"emission-time digest a87c0799 via canonical validation_policy.validation_digest; phase_result to spool","touched":["/home/agent/.hermes/conductor-delegate-spool-infra-deploy/delegate/31581701f16a4451a167f4c4c9599ff1.json"]}

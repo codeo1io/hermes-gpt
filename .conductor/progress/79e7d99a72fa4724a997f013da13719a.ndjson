@@ -1,0 +1,4 @@
+{"step":1,"ts":"2026-09-22T18:07:47Z","summary":"tree state captured: HEAD 4b958379d6, numstat byte-identical to validated close (6 files)","touched":[]}
+{"step":2,"ts":"2026-09-22T18:07:47Z","summary":"canonical digest recomputed == work-order digest a87c0799 verbatim (no surface change)","touched":[]}
+{"step":3,"ts":"2026-09-22T18:07:47Z","summary":"durable records verified: 3 full + 1 targeted green at anchor digest; mtimes precede 17:58:25Z pass","touched":[]}
+{"step":4,"ts":"2026-09-22T18:07:47Z","summary":"verification log written /tmp/final-79e7d99a.log; verdict release-integrity PASSED","touched":["/tmp/final-79e7d99a.log"]}

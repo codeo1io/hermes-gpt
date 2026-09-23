@@ -184,8 +184,22 @@ def test_register_rejects_malformed_payload(client: TestClient):
 
 
 def test_register_capacity_is_bounded(client: TestClient, state: OAuthState):
-    codes = [_register(client).status_code for _ in range(state.max_dynamic_clients + 2)]
-    assert 429 in codes
+    """The registry capacity cap (429 at max_dynamic_clients) in isolation.
+
+    Each registration resets the per-peer rate budget so the 429 asserted
+    here can only come from the capacity cap, not the limiter (review
+    finding 6: this test silently switched to limiter-429s after rm-055
+    added the budget check).
+    """
+    for _ in range(state.max_dynamic_clients + 2):
+        state._register_hits.clear()  # isolate the capacity branch
+        response = _register(client)
+        if response.status_code == 429:
+            break
+    else:
+        pytest.fail("registry capacity cap never engaged")
+    assert response.status_code == 429
+    assert len(state.dynamic_clients) == state.max_dynamic_clients
 
 
 # -- dynamic client authorize + exchange ------------------------------------
@@ -318,3 +332,211 @@ def test_legacy_static_client_flow_unchanged(client: TestClient):
     )
     assert auth.status_code == 302, auth.text
     assert "code=" in auth.headers["location"]
+
+
+# -- rm-055: registration lifecycle (rate limit, TTL, reclaim, purge) -------
+
+
+def test_register_rate_limited_per_peer(client: TestClient, state: OAuthState):
+    """The unauthenticated register endpoint carries a per-peer fixed-window
+    budget: a single peer cannot fill the 64-slot registry in one burst."""
+    statuses = [_register(client).status_code for _ in range(7)]
+    assert statuses[:5] == [201] * 5
+    assert statuses[5:] == [429, 429]
+    # the budget is per-peer, not global: another peer still registers
+    assert state.register_rate_allows("another-peer") is True
+    assert state.register_rate_allows("testclient") is False
+
+
+def test_expired_dynamic_client_fails_closed(client: TestClient, state: OAuthState):
+    """TTL expiry kills the registration everywhere at once: authorize no
+    longer recognizes the client and token exchange refuses it."""
+    import dataclasses
+    import time as _time
+
+    dyn_id = _register(client).json()["client_id"]
+    live = state.dynamic_clients[dyn_id]
+    state.dynamic_clients[dyn_id] = dataclasses.replace(
+        live, expires_at=_time.time() - 1
+    )
+    assert state.is_dynamic_client(dyn_id) is False
+    response = _authorize(client, dyn_id, AIP_REDIRECT)
+    assert response.status_code == 401
+    assert response.json()["error"] == "invalid_client"
+    exchange = client.post(
+        "/oauth/token",
+        data={
+            "grant_type": "authorization_code",
+            "code": "unused",
+            "redirect_uri": AIP_REDIRECT,
+            "code_verifier": VERIFIER,
+            "client_id": dyn_id,
+        },
+    )
+    assert exchange.status_code == 401
+
+
+def test_register_reclaims_expired_capacity(client: TestClient):
+    """A registry full of expired entries self-heals: registration reclaims
+    expired slots instead of returning 429 forever (fill-up DoS backstop)."""
+    import dataclasses
+    import time as _time
+
+    from oauth_auth import OAuthState as _OS
+
+    capped = _OS(_config(), max_dynamic_clients=2)
+    capped_client = _build(capped)
+    first = _register(capped_client).json()["client_id"]
+    second = _register(capped_client).json()["client_id"]
+    assert _register(capped_client).status_code == 429  # capacity reached
+    for cid in (first, second):
+        live = capped.dynamic_clients[cid]
+        capped.dynamic_clients[cid] = dataclasses.replace(
+            live, expires_at=_time.time() - 1
+        )
+    reclaimed = _register(capped_client)
+    assert reclaimed.status_code == 201
+
+
+def test_cleanup_prunes_expired_dynamic_clients(client: TestClient, state: OAuthState):
+    import dataclasses
+    import time as _time
+
+    dyn_id = _register(client).json()["client_id"]
+    live = state.dynamic_clients[dyn_id]
+    state.dynamic_clients[dyn_id] = dataclasses.replace(
+        live, expires_at=_time.time() - 1
+    )
+    state.cleanup()
+    assert dyn_id not in state.dynamic_clients
+
+
+def test_purge_dynamic_client_round_trip(client: TestClient, state: OAuthState):
+    """Operator purge: removes the registration (idempotent), fails closed
+    immediately, and lists the registry with expiry visibility."""
+    dyn_id = _register(client).json()["client_id"]
+    listed = state.list_dynamic_clients()
+    assert [entry["client_id"] for entry in listed] == [dyn_id]
+    assert listed[0]["expired"] is False
+    assert listed[0]["expires_at"] > listed[0]["registered_at"]
+    assert state.purge_dynamic_client(dyn_id) is True
+    assert state.purge_dynamic_client(dyn_id) is False
+    response = _authorize(client, dyn_id, AIP_REDIRECT)
+    assert response.status_code == 401
+
+
+def test_import_rejects_non_registerable_redirects(client: TestClient):
+    """Restored registry data is re-validated against the chatgpt.com-family
+    allowlist — persisted junk is not resurrected."""
+    forged = [
+        {
+            "client_id": "dyn-forged",
+            "redirect_uris": ["https://evil.example.com/callback"],
+            "registered_at": 1,
+            "expires_at": 4102444800.0,
+        }
+    ]
+    fresh = OAuthState(_config())
+    assert fresh.import_dynamic_clients(forged) == 0
+    assert fresh.is_dynamic_client("dyn-forged") is False
+
+
+def test_import_bounds_legacy_entries_without_expiry(client: TestClient):
+    """Pre-TTL payloads (no expires_at) get a TTL from restore time instead of
+    living forever; a future expiry is preserved verbatim."""
+    legacy = [
+        {
+            "client_id": "dyn-legacy",
+            "redirect_uris": [AIP_REDIRECT],
+            "registered_at": 1,
+        }
+    ]
+    fresh = OAuthState(_config())
+    assert fresh.import_dynamic_clients(legacy) == 1
+    assert fresh.is_dynamic_client("dyn-legacy") is True
+    bound = fresh.dynamic_clients["dyn-legacy"].expires_at
+    import time as _time
+
+    assert _time.time() < bound <= _time.time() + 7 * 24 * 3600 + 5
+
+
+# -- review-fix regressions (independent_review 4f15d132) ------------------
+
+
+def test_dynamic_client_bearer_token_validates(client: TestClient, state: OAuthState):
+    """Review finding 1 (HIGH): dynamic-client access tokens must pass bearer
+    validation end-to-end. config.client_registered only knows static
+    clients, so every gate funneling through it (validate_access_token,
+    _decode_signed_access_token, _durable_access_token_valid) 401'd a
+    DCR-onboarded connector at /mcp — the failure mode DCR exists to fix,
+    resurfaced one leg later. The state-level gate accepts live dynamic
+    registrations and fails closed on expiry/purge.
+    """
+    import dataclasses
+    import time as _time
+    import urllib.parse
+
+    dyn_id = _register(client).json()["client_id"]
+    response = _authorize(client, dyn_id, AIP_REDIRECT, scope="hermes offline_access")
+    assert response.status_code == 302, response.text
+    code = urllib.parse.parse_qs(
+        urllib.parse.urlparse(response.headers["location"]).query
+    )["code"][0]
+    exchanged = _exchange(client, code, AIP_REDIRECT, client_id=dyn_id)
+    assert exchanged.status_code == 200, exchanged.text
+    access_token = exchanged.json()["access_token"]
+
+    # static baseline: the configured client still validates
+    assert state.config.client_registered(CLIENT_ID) is True
+    # the dynamic registration now validates too (was False pre-fix)
+    assert state.validate_access_token(access_token) is True
+
+    # fail closed: expiry kills the bearer leg as well
+    live = state.dynamic_clients[dyn_id]
+    state.dynamic_clients[dyn_id] = dataclasses.replace(
+        live, expires_at=_time.time() - 1
+    )
+    assert state.validate_access_token(access_token) is False
+
+
+def test_import_rejects_shadowing_oversized_and_non_ascii(client: TestClient, state: OAuthState):
+    """Review finding 7: import re-validation must match register's budget —
+    no static-id shadowing (dynamic-first authorize lookup), no >8 redirect
+    payload, and restored ids must survive ASCII compare_digest lookups.
+    """
+    payload = [
+        {  # (a) shadows the static client -> never imported
+            "client_id": CLIENT_ID,
+            "redirect_uris": [AIP_REDIRECT],
+            "registered_at": 1,
+        },
+        {  # (b) nine redirects exceeds the 1..8 budget enforced at register
+            "client_id": "dyn-oversized",
+            "redirect_uris": [f"https://chatgpt.com/aip/cb{i}" for i in range(9)],
+            "registered_at": 1,
+        },
+        {  # (c) non-ASCII id would TypeError inside compare_digest
+            "client_id": "dyn-\u5ba2\u6237\u7aef",
+            "redirect_uris": [AIP_REDIRECT],
+            "registered_at": 1,
+        },
+        {  # (d) valid entry imports
+            "client_id": "dyn-good",
+            "redirect_uris": [AIP_REDIRECT],
+            "registered_at": 1,
+        },
+    ]
+    assert state.import_dynamic_clients(payload) == 1
+    assert set(state.dynamic_clients) == {"dyn-good"}
+    assert state.is_dynamic_client(CLIENT_ID) is False  # static id unshadowed
+
+
+def test_register_rate_window_prunes_stale_peers(client: TestClient, state: OAuthState):
+    """Review finding 8: _register_hits grows unboundedly with distinct peer
+    keys; an expired window prunes stale peers so the map stays bounded."""
+    import time as _time
+
+    state._register_hits["stale-peer"] = (_time.time() - 3600.0, 1)
+    assert state.register_rate_allows("fresh-peer") is True
+    assert "stale-peer" not in state._register_hits
+    assert "fresh-peer" in state._register_hits
