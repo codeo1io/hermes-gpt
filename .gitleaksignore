@@ -241,3 +241,7 @@ fcae077d65916e1586d7c3e66557acdac5a84d2f:tests/agent/test_context_compressor.py:
 fd5cc6e1b471e05ea964a9a4c730c11219c3f73c:tests/run_agent/test_run_agent.py:generic-api-key:154
 fd5cc6e1b471e05ea964a9a4c730c11219c3f73c:tests/run_agent/test_run_agent.py:generic-api-key:174
 ff3c9848d44877da80b3c644b0066df923d7634f:tests/run_agent/test_overflow_overhead_aware_tokens.py:generic-api-key:74
+# Historical synthetic gateway fixtures surfaced after the cbd446/master merge.
+# Both are deliberate test-only values: approval redaction and media-deny key fixture.
+c080b2dc3ee672251cce6de4d002632f4027f9f8:tests/gateway/test_tui_approval_redaction.py:curl-auth-header:28
+2982122be7689bfdaf16254bf5adfcc4e1c64844:tests/gateway/test_platform_base.py:private-key:994

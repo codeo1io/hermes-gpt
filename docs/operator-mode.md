@@ -1,6 +1,6 @@
 # Operator Mode for Hermes GPT
 
-Operator Mode is the policy-gated control plane for trusted MCP clients such as ChatGPT. This document describes the current v0.11.0 behavior, including the durable Mission lifecycle, unified delegation lineage, live-event bus, and Fabric-backed cross-machine Swarm execution, plus the vNext slice-1 additive surfaces (MissionPlan DAG, derived capability-manifest / mission-ledger views, budget envelope, placement scoring, failure classification + recovery matrix, and the shadow/observe mission controller). The vNext surfaces are decision-only and documented further in [vnext-capability-manifest-and-mission-ledger.md](vnext-capability-manifest-and-mission-ledger.md) and [design/](design/).
+Operator Mode is the policy-gated control plane for trusted MCP clients such as ChatGPT. This document describes the current v0.12.0 behavior, including the durable Mission lifecycle, unified delegation lineage, live-event bus, and Fabric-backed cross-machine Swarm execution, plus the vNext slice-1 additive surfaces (MissionPlan DAG, derived capability-manifest / mission-ledger views, budget envelope, placement scoring, failure classification + recovery matrix, and the shadow/observe mission controller) and the vNext slice-2 gated execution rungs (budget D3 hard-block enforcement behind `HERMES_GPT_BUDGET_HARD_BLOCK=1`, and the controller L2 rung behind `HERMES_GPT_CONTROLLER_EXECUTE=1`). The slice-1 surfaces are decision-only; the slice-2 rungs are default-off, add no tools, and keep every existing surface byte-identical until their gates are armed. They are documented further in [vnext-capability-manifest-and-mission-ledger.md](vnext-capability-manifest-and-mission-ledger.md) and [design/](design/).
 
 For documentation authority and historical-artifact rules, see [docs/README.md](README.md).
 
@@ -170,6 +170,19 @@ Prompt-like text is represented by bounded metadata such as `prompt_len` and `pr
 Do not describe the unset state as deny-by-default. The implementation deliberately makes all read-only Mission surfaces available when the variable is absent.
 
 Mission Control requires only `read_only` authority and never needs direct apply mode.
+
+## Skill validation gates (plans and placement)
+
+Since the profile-aware skill-resolution slice, Mission Plan and placement surfaces enforce fail-closed skill validation in two stages. Canonical module: `operator_skill_resolution.py`.
+
+- **Stage 1 — plan create/validate and plan readiness:** every skill declared in a node's `capability_req.skills` must resolve somewhere (the global skills root or any profile's `skills/` directory). A declared skill that exists nowhere fails the operation with `skill_not_found`; plan readiness additionally requires every declared parent node to exist and be completed.
+- **Stage 2 — placement scoring:** `hermes_placement_score` hard-rejects an assignee profile that cannot resolve a required skill (`skill_not_resolvable_for_assignee`), listing the profiles where the skill is available. The check re-runs on every placement decision, so reassigning a node to a different profile revalidates before any mutation. The pure scoring core additionally hard-filters zero-skill targets when skills are required; Fabric-style targets with no skill list stay placeable for skill-less requirements.
+
+Skill names follow one shared grammar everywhere (resolver and executor alike): `^[a-z0-9][a-z0-9._-]*$`, at most 64 characters, matched against the raw string — whitespace-padded or upper-case names are rejected at stage 1 rather than normalized, so a name that passes validation is byte-identical to the name the skill executor will later run.
+
+The lower-case strings quoted above (`skill_not_found`, `skill_not_resolvable_for_assignee`) are the message-level prefixes raised by `operator_skill_resolution.py`. Tool-call error envelopes surface them under the `code` field in upper case: `SKILL_NOT_FOUND` from plan create/validate/readiness surfaces (`operator_mission_plan.py`), `SKILL_NOT_RESOLVABLE_FOR_ASSIGNEE` from placement scoring (`operator_placement.py`).
+
+`hermes_placement_candidates` returns the same candidate preview without the stage-2 assignee check (the scoring tool is the validating surface); controller personas (`owner`, `tony`) pass through stage 2 with local authority.
 
 ## Missions lifecycle (v0.9)
 
