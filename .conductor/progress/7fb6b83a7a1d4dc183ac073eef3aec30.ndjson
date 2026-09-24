@@ -1,0 +1,2 @@
+{"step":1,"ts":"2026-09-22T17:48:56Z","summary":"Commit gate: 986f4e791de4 (14 files +1173/-15) on conductor/run-9e0b97f5d86c; .conductor scratch excluded; digest still 4459e913","touched":[]}
+{"step":2,"ts":"2026-09-22T17:49:18Z","summary":"phase_result written: sha 986f4e791de4 + subject recorded","touched":[]}
