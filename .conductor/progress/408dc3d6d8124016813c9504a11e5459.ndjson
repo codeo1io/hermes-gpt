@@ -1,0 +1,5 @@
+{"step":1,"ts":"2026-09-22T16:34:15Z","summary":"roadmap phase start: read on-disk state, dedupe rm-026..029, add assess+research items","touched":[]}
+{"step":2,"ts":"2026-09-22T16:38:17Z","summary":"ROADMAP.md updated: dedupe rm-026..029, 6 status flips, signals refreshed, cycle-3 block rm-035..042 + digest","touched":["ROADMAP.md"]}
+{"step":6,"ts":"2026-09-23T17:12:00Z","summary":"phase_result written+validated to spool; roadmap integrity verified (0 dup active ids)","touched":["delegate-spool/408dc3d6d8124016813c9504a11e5459.json"]}
+{"step":7,"ts":"2026-09-23T17:22:00Z","summary":"renumbered cycle-3 items to rm-047..rm-054 (sibling e29c25913c00 owns rm-035..rm-046); cross-refs fixed","touched":["ROADMAP.md"]}
+{"step":8,"ts":"2026-09-23T17:26:00Z","summary":"phase_result rewritten with rm-047..rm-054 numbering; validated","touched":["delegate-spool/408dc3d6d8124016813c9504a11e5459.json"]}

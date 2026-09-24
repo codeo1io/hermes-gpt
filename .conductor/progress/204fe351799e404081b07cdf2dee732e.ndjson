@@ -1,0 +1,5 @@
+{"step":1,"ts":"2026-09-21T22:40:00Z","summary":"Targeted cmd uv run --extra dev pytest test_codex_pr63_remediation.py test_mcp_compat.py -> exit 0","touched":[]}
+{"step":2,"ts":"2026-09-21T22:55:00Z","summary":"Full -n 8 run 1: 1 FAILED test_operator_fabric_g4c cancel-timing test (untouched by B1); plain uv run lacks pytest, xdist undeclared","touched":[]}
+{"step":3,"ts":"2026-09-21T23:00:00Z","summary":"g4c test passes serially and under -n 8 file-only in same uv env -> parallel-interference flake, not a B1 regression","touched":[]}
+{"step":4,"ts":"2026-09-21T23:10:00Z","summary":"Full -n 8 rerun (uv --extra dev --with pytest-xdist): exit 0, zero FAILED lines","touched":[]}
+{"step":5,"ts":"2026-09-21T23:15:00Z","summary":"ci.yml yaml static check OK (7 jobs, gating, pins); removed uv side-effect uv.lock; no executable surface changed this turn","touched":["uv.lock"]}

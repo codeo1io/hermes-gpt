@@ -1,0 +1,3 @@
+{"step":1,"ts":"2026-09-22T16:29:00Z","summary":"research phase start: upstream/PyPI/MCP-spec/dep-scan axes defined from assess state","touched":[]}
+{"step":2,"ts":"2026-09-22T16:31:38Z","summary":"upstream/PyPI/standards scanned: PR#75(sibling fork,pyyaml/manifests), SEP-2468 iss, CIMD preferred, py3.10 EOL, RFC7592","touched":[]}
+{"step":3,"ts":"2026-09-22T16:32:46Z","summary":"research phase_result written+validated (7 evidence-backed candidates R1-R7); tree clean","touched":["/home/agent/.hermes/conductor-delegate-spool-infra-deploy/delegate/ca1f4abd9b174f449c4db4ec6320efef.json"]}

@@ -90,11 +90,17 @@ def test_invalid_toolset_fails_safely(monkeypatch):
         raise AssertionError("invalid toolset was accepted")
 
 
-def _readline_with_timeout(stream, seconds: float = 30.0) -> str:
-    # 30s deadline: the stdio server subprocess performs the full Hermes agent
-    # import at startup (heavy on cold caches/loaded CI runners); 8s raced
-    # real startup latency and flaked under load. This is an I/O wait
-    # deadline, not a safety assertion — a hang still fails the test.
+# I/O wait headroom for the stdio server subprocess: it performs the full Hermes
+# agent import at startup, which is heavy on cold caches and loaded parallel
+# runners. An 8s deadline flaked under machine load upstream; 30s still raced
+# cold-cache startup under xdist -n 4 at machine load ~19 (fresh venv, first
+# full-suite run). This is an I/O wait deadline, not a safety assertion — a
+# hang still fails the test. Override with HERMES_TEST_STDIO_BUDGET when
+# debugging a genuine hang.
+_STDIO_BUDGET = float(os.environ.get("HERMES_TEST_STDIO_BUDGET", "120"))
+
+
+def _readline_with_timeout(stream, seconds: float = _STDIO_BUDGET) -> str:
     result: list[str] = []
     worker = threading.Thread(target=lambda: result.append(stream.readline()), daemon=True)
     worker.start()

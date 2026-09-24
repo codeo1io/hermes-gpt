@@ -1,0 +1,5 @@
+{"step":1,"ts":"2026-09-23T17:05:00Z","summary":"rm-048 lifecycle implemented: rate limit, TTL, reclaim, purge, import re-validation","touched":["oauth_auth.py"]}
+{"step":2,"ts":"2026-09-23T17:06:00Z","summary":"rm-049+052: authorize ASCII guard, iss in redirects+metadata, comment/docstring fixes","touched":["oauth_auth.py"]}
+{"step":3,"ts":"2026-09-23T17:07:00Z","summary":"tests added: 7 lifecycle + 2 hardening/iss; oauth suites rc=0","touched":["test_oauth_dynamic_registration.py","test_oauth_auth.py"]}
+{"step":4,"ts":"2026-09-23T17:08:00Z","summary":"rm-050: gemini-spark knobs section + false no-DCR-claim fix + CHANGELOG Unreleased","touched":["docs/gemini-spark.md","CHANGELOG.md"]}
+{"step":5,"ts":"2026-09-23T17:20:00Z","summary":"validation: full suite [100%] 0-fail + batch rc=0 + ruff clean; phase_result spooled","touched":[]}

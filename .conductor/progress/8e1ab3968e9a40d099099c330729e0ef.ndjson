@@ -1,0 +1,2 @@
+{"step":1,"ts":"2026-09-22T17:48:25+00:00","summary":"gate semantics root-caused (KTD5 omitted-check uses declaration+store records, not covered_surfaces); fresh targeted rerun RC=0","touched":["/tmp/review-8e1ab396/targeted.log"]}
+{"step":2,"ts":"2026-09-22T17:49:13+00:00","summary":"phase_result re-emitted: test_oauth_auth.py declared+covered, digest a87c0799 verbatim (== current), JSON valid","touched":["/home/agent/.hermes/conductor-delegate-spool-infra-deploy/delegate/8e1ab3968e9a40d099099c330729e0ef.json"]}
