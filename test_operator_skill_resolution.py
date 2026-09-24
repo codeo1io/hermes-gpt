@@ -440,3 +440,56 @@ def test_plan_validate_accepts_resolvable_plan(skills_root: Path, monkeypatch):
     out = json.loads(plan.hermes_plan_validate(_dag("msn-skills", "dev", ["nested-review"])))
     assert out["success"] is True
     assert out["valid"] is True
+
+
+# --- rm-053 F1: grammar parity between resolver and executor -----------------
+#
+# assess F1 (run cbd4463370ee): the resolver used to strip skill names before
+# validating them, so a whitespace-padded declaration passed stage 1 + stage 2
+# and only failed later at the executor (operator_skills), which validates the
+# raw string. The fix removes the strip (fail-closed at the earliest gate) and
+# aligns both validators on the same pattern with the same match mode, so the
+# two grammars are byte-identical.
+
+_PADDLED_NAMES = [
+    " padded-skill",
+    "padded-skill ",
+    " padded-skill ",
+    "\tpadded-skill",
+    "padded-skill\n",
+    "padded skill",
+    "Padded-Skill",
+]
+
+_VALID_NAMES = ["padded-skill", "a", "global-skill", "dev-nested.nested_review-1"]
+
+
+@pytest.mark.parametrize("name", _PADDLED_NAMES)
+def test_grammar_parity_rejects_padded_and_cased_names(name: str):
+    # Both validators must reject: neither may accept what the other rejects.
+    with pytest.raises(ValueError):
+        sres.validate_skill_name(name)
+    with pytest.raises(ValueError):
+        operator_skills._validate_skill_name(name)
+
+
+@pytest.mark.parametrize("name", _VALID_NAMES)
+def test_grammar_parity_accepts_valid_names_unchanged(name: str):
+    # The resolver returns the name UNCHANGED (no silent normalization).
+    assert sres.validate_skill_name(name) == name
+    assert operator_skills._validate_skill_name(name) == name
+
+
+def test_resolver_no_longer_strips_before_validating():
+    # Regression guard for the exact assess-F1 mechanics: stripping would have
+    # turned " padded-skill " into a resolvable "padded-skill" here.
+    with pytest.raises(ValueError, match="padded-skill"):
+        sres.validate_skill_name(" padded-skill ")
+
+
+def test_plan_validate_rejects_padded_skill_declaration(skills_root, monkeypatch):
+    # End to end: a padded declaration now fails closed at stage 1 (schema
+    # validation), instead of passing validation and failing at dispatch time.
+    monkeypatch.setenv("HERMES_HOME", str(skills_root))
+    out = json.loads(plan.hermes_plan_validate(_dag("msn-padded", "dev", [" padded-skill"])))
+    assert out["success"] is False

@@ -44,7 +44,7 @@ plan validation fails closed on it rather than green-lighting a plan whose
 skills no assignee can run.
 
 Listings cap RESULT SIZE (``MAX_SKILL_ENTRIES_PER_ROOT``) and walks cap
-TRAVERSAL (``MAX_WALKED_ENTRIES`` directory entries per root) — a runaway
+TRAVERSAL (``MAX_WALKED_ENTRIES`` directories visited per root) — a runaway
 tree degrades to a partial, deterministic listing instead of hanging.
 Within one validation call each root is walked at most once.
 
@@ -71,7 +71,7 @@ SKILL_NAME_RE = operator_skills._VALID_NAME_RE
 MAX_SKILL_NAME_LENGTH = operator_skills._MAX_NAME_LENGTH
 
 # Bounds: MAX_SKILL_ENTRIES_PER_ROOT caps the RESULT SIZE of one root's
-# listing; MAX_WALKED_ENTRIES caps TRAVERSAL (directory entries visited per
+# listing; MAX_WALKED_ENTRIES caps TRAVERSAL (directories visited per
 # root) so a pathological tree degrades instead of hanging a validation.
 MAX_SKILL_ENTRIES_PER_ROOT = 2048
 MAX_WALKED_ENTRIES = 50_000
@@ -155,21 +155,23 @@ def validate_skill_name(name: Any) -> str:
     """Validate a skill name with the shared grammar (ValueError on bad).
 
     Same grammar and length cap as ``operator_skills`` (the executor): a
-    name that fails here is a name no profile can run.
+    name that fails here is a name no profile can run. The grammar is
+    enforced on the RAW string — whitespace-padded names are rejected, not
+    silently normalized — so a name that passes this gate is byte-identical
+    to the name the executor will later validate.
     """
     if not isinstance(name, str):
         raise TypeError("skill name must be a string")
-    stripped = name.strip()
-    if len(stripped) > MAX_SKILL_NAME_LENGTH:
+    if len(name) > MAX_SKILL_NAME_LENGTH:
         raise ValueError(
             f"skill name exceeds {MAX_SKILL_NAME_LENGTH} characters: {name!r}"
         )
-    if not SKILL_NAME_RE.fullmatch(stripped):
+    if not SKILL_NAME_RE.fullmatch(name):
         raise ValueError(
             "skill name must be lowercase alphanumerics with '.', '_' or '-' "
             f"(max {MAX_SKILL_NAME_LENGTH} chars): {name!r}"
         )
-    return stripped
+    return name
 
 
 def _walk_skill_names(root: Path) -> dict[str, Path]:
@@ -179,7 +181,7 @@ def _walk_skill_names(root: Path) -> dict[str, Path]:
     directory under the root containing ``SKILL.md`` declares a skill named
     after the directory. Bounded two ways — result size
     (``MAX_SKILL_ENTRIES_PER_ROOT``) and traversal
-    (``MAX_WALKED_ENTRIES`` directory entries) — and best-effort
+    (``MAX_WALKED_ENTRIES`` directories visited) — and best-effort
     (unreadable trees degrade to empty/partial).
     """
     names: dict[str, Path] = {}

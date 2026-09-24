@@ -73,7 +73,7 @@ def _validate_skill_name(name: str) -> str:
         raise ValueError("Skill name is required.")
     if len(name) > _MAX_NAME_LENGTH:
         raise ValueError(f"Skill name exceeds {_MAX_NAME_LENGTH} characters.")
-    if not _VALID_NAME_RE.match(name):
+    if not _VALID_NAME_RE.fullmatch(name):
         raise ValueError(
             f"Invalid skill name {name!r}. Use lowercase letters, numbers, "
             "hyphens, dots, and underscores. Must start with a letter or digit."
