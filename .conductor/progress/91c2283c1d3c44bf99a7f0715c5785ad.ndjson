@@ -1,0 +1,4 @@
+{"step":1,"ts":"2026-09-29T21:14:00Z","summary":"Impacted-tests run exposed 1 old-contract straggler: test_skill_discovery.py::test_skill_view_rejects_traversal","touched":[]}
+{"step":2,"ts":"2026-09-29T21:15:30Z","summary":"Migrated to ToolError contract (server.hermes_skill_view raises clean_error -> ToolError); suite green","touched":["test_skill_discovery.py"]}
+{"step":3,"ts":"2026-09-29T21:26:00Z","summary":"Targeted command green: 47-file impacted selection 1070 passed/2 skipped; ruff+py_compile clean","touched":[]}
+{"step":4,"ts":"2026-09-29T21:27:00Z","summary":"Result envelope written+validated (scope targeted, outcome passed, digest verbatim, risk low)","touched":[]}

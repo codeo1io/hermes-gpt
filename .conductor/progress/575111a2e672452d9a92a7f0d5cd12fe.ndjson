@@ -1,0 +1,3 @@
+{"step":1,"ts":"2026-09-30T12:47:10Z","summary":"inventoried open roadmap items (grep -id lines); verified rm-067 remainder open, rm-008/010 superseded","touched":[]}
+{"step":2,"ts":"2026-09-30T12:47:15Z","summary":"scored field (impact/risk/effort/deps/local-verifiability), selected batch B1 rm-077+rm-080+rm-067r+rm-082 (stretch rm-085/075)","touched":[]}
+{"step":3,"ts":"2026-09-30T12:47:20Z","summary":"wrote prioritization record .conductor/prioritize/575111a2...md with gates+exclusions; tracked tree untouched","touched":[".conductor/prioritize/575111a2e672452d9a92a7f0d5cd12fe.md"]}

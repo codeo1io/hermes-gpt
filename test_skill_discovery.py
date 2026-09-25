@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 import server
+from mcp_compat import ToolError
 
 
 def _skill(root: Path, name: str, description: str, *, manual: bool = False) -> dict[str, str]:
@@ -65,7 +66,7 @@ def test_skill_view_rejects_traversal(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "require_imports", lambda: None)
     monkeypatch.setattr(server, "discover_skills", lambda: [primary])
 
-    with pytest.raises(RuntimeError, match="file_path must be a relative path"):
+    with pytest.raises(ToolError, match="file_path must be a relative path"):
         server.hermes_skill_view("ce-plan", file_path="../secret.txt")
 
 

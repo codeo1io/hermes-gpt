@@ -53,7 +53,7 @@ import operator_oauth as op_oauth
 import operator_swarm as op_swarm
 import operator_recovery as op_recovery
 import operator_finance as op_finance
-from mcp_compat import HermesMCP as FastMCP
+from mcp_compat import HermesMCP as FastMCP, ToolError
 from versioning import VERSION
 
 
@@ -727,9 +727,20 @@ def discover_skills() -> list[dict[str, str]]:
     return sorted(skills, key=lambda item: (item["name"].lower(), item["path"].lower()))
 
 
-def clean_error(tool_name: str, exc: Exception) -> RuntimeError:
+def clean_error(tool_name: str, exc: Exception) -> Exception:
+    """Wrap a tool failure as the SDK's anticipated-failure type.
+
+    Since MCP Python SDK 2.1.0 (python-sdk #3314) the server hides the text
+    of unexpected tool exceptions: the client only sees a generic
+    ``Error executing tool <name>`` unless the handler raised ``ToolError``
+    or ``ResourceError``. Returning ``RuntimeError`` therefore stripped
+    every hermes tool's failure reason on the 2.x lane. ``ToolError`` keeps
+    its message client-visible on SDK 2 and is propagated verbatim on
+    SDK 1 (which still forwards all handler exception text), so both lanes
+    show ``<tool> failed: <reason>``.
+    """
     eprint(f"hermes-gpt: {tool_name} failed: {exc}")
-    return RuntimeError(f"{tool_name} failed: {exc}")
+    return ToolError(f"{tool_name} failed: {exc}")
 
 
 import_hermes()

@@ -42,6 +42,7 @@ from typing import Any, Protocol
 import operator_fleet as op_fleet
 import operator_job_supervisor as job_supervisor
 import operator_policy as op
+import operator_workspace as op_workspace
 import runner_confinement as confinement
 
 SCHEMA_VERSION = "0.6-runner.1"
@@ -82,13 +83,12 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
         path.parent.chmod(0o700)
     except OSError:
         pass
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
-    try:
-        tmp.chmod(0o600)
-    except OSError:
-        pass
-    tmp.replace(path)
+    # rm-067: unique staging + fsync via the shared durability helper; the
+    # old fixed ".tmp" name let concurrent runner processes clobber each
+    # other's staging file, and a crash could leave a truncated record.
+    op_workspace._atomic_write_text(
+        path, json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True), mode=0o600
+    )
 
 
 def _load_json(path: Path) -> dict[str, Any] | None:
@@ -774,9 +774,9 @@ class _LocalProcessBackend:
             # remain on disk, and leave only bounded failed metadata. Catch
             # broadly because wrappers/test doubles can fail before a child
             # process exists with exceptions other than OSError.
-            for path in (request_path, request_path.with_suffix(request_path.suffix + ".tmp")):
+            for leftover in (request_path, *request_path.parent.glob(f".{request_path.name}.*.tmp")):
                 try:
-                    path.unlink()
+                    leftover.unlink()
                 except OSError:
                     pass
             meta.update({

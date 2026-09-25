@@ -370,7 +370,7 @@ class OAuthState:
         self._register_hits: dict[str, tuple[float, int]] = {}
         self._hermes_root: Path | None = None
         self._epoch: int = 0
-        setattr(self, "_retired_refresh_to" + "kens", set())
+        self._retired_refresh_tokens: set[str] = set()
 
     def register_dynamic_client(self, redirect_uris: list[str]) -> DynamicClient:
         """Mint a public dynamic client; bounded, chatgpt.com-redirects only."""

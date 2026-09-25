@@ -15,6 +15,15 @@ except ImportError:
 else:
     SDK_V2 = True
 
+try:
+    # SDK 2 moved the "anticipated tool failure" type next to the renamed
+    # MCPServer (mcp.server.mcpserver); SDK 1 keeps it under fastmcp.
+    from mcp.server.mcpserver.exceptions import ToolError
+except ImportError:  # pragma: no cover - SDK 1 lane only
+    from mcp.server.fastmcp.exceptions import ToolError  # noqa: F401
+
+__all__ = ["HermesMCP", "ToolError"]
+
 
 def _offload_sync_tool(fn: Any) -> Any:
     """Wrap a sync tool handler in an async coroutine that runs it in a thread.

@@ -28,6 +28,7 @@ import pytest
 
 import mcp_compat
 import server
+from mcp_compat import ToolError
 
 
 def test_offload_wrapper_runs_sync_body_in_worker_thread():
@@ -149,5 +150,5 @@ def test_disabled_gate_still_raises_for_async_tools(monkeypatch):
     async def main():
         return await server.hermes_vision_analyze(image_url="https://example.com/x.png")
 
-    with pytest.raises(RuntimeError, match=server.ENABLE_VISION_ENV):
+    with pytest.raises(ToolError, match=server.ENABLE_VISION_ENV):
         asyncio.run(main())

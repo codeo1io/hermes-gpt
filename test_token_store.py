@@ -11,6 +11,7 @@ import pytest
 import oauth_auth as oa
 import operator_oauth as op_oauth
 import operator_policy as op
+import operator_workspace as operator_ws
 import token_store as ts
 
 
@@ -259,3 +260,136 @@ def test_restore_populates_after_restart(hermes_root):
     summary = fresh.restore_tokens(hermes_root)
     assert summary["restored"] == 2
     assert fresh.validate_access_token("tok-restart") is True
+
+
+# ---------------------------------------------------------------------------
+# rm-067 durability regression: unique-tmp + fsync atomic writes
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX fsync/file-mode semantics")
+def test_envelope_write_fsyncs_before_replace(hermes_root, monkeypatch):
+    """The durable-write standard requires fsync before the rename."""
+    calls: list[int] = []
+    real_fsync = os.fsync
+
+    def spying_fsync(fd: int) -> None:
+        calls.append(fd)
+        real_fsync(fd)
+
+    monkeypatch.setattr(operator_ws.os, "fsync", spying_fsync)
+    ts._write_envelope(hermes_root, "kid-regression", {"hello": "world"}, b"k" * 32)
+
+    assert calls, "envelope write did not fsync before replace"
+    assert ts.envelope_path(hermes_root).exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX fsync/file-mode semantics")
+def test_key_file_write_fsyncs_before_replace(hermes_root, monkeypatch):
+    """Master-key writes fsync too (crash cannot leave a truncated key)."""
+    calls: list[int] = []
+    real_fsync = os.fsync
+
+    def spying_fsync(fd: int) -> None:
+        calls.append(fd)
+        real_fsync(fd)
+
+    monkeypatch.setattr(operator_ws.os, "fsync", spying_fsync)
+    ts._write_key_file(hermes_root, b"k" * 32)
+
+    assert calls, "key write did not fsync before replace"
+    assert ts.key_file_path(hermes_root).exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows does not expose POSIX file modes")
+def test_key_file_mode_is_0600(hermes_root):
+    ts._write_key_file(hermes_root, b"k" * 32)
+    mode = os.stat(ts.key_file_path(hermes_root)).st_mode & 0o777
+    assert mode == 0o600
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows does not expose POSIX file modes")
+def test_envelope_file_mode_is_0600(hermes_root):
+    ts._write_envelope(hermes_root, "kid-regression", {"hello": "world"}, b"k" * 32)
+    mode = os.stat(ts.envelope_path(hermes_root)).st_mode & 0o777
+    assert mode == 0o600
+
+
+def test_failed_envelope_write_leaves_no_staging_file(hermes_root, monkeypatch):
+    """A failing write must remove its own staging file and keep the old data."""
+    ts._write_envelope(hermes_root, "kid-regression", {"generation": 1}, b"k" * 32)
+    before = ts.envelope_path(hermes_root).read_bytes()
+
+    def exploding_replace(src, dst):
+        raise OSError("simulated crash between staging and replace")
+
+    monkeypatch.setattr(operator_ws.os, "replace", exploding_replace)
+    with pytest.raises(OSError):
+        ts._write_envelope(hermes_root, "kid-regression", {"generation": 2}, b"k" * 32)
+
+    staging = [
+        p for p in (hermes_root / "secrets").glob(".*.tmp") if p.is_file()
+    ]
+    assert staging == [], f"staging files leaked: {staging}"
+    # The previous envelope survives the failed write, byte-for-byte.
+    assert ts.envelope_path(hermes_root).read_bytes() == before
+
+
+def test_concurrent_envelope_writes_do_not_clobber(hermes_root):
+    """Uniquely named staging files: parallel writers all land intact.
+
+    The old fixed ".tmp"/".new" staging names let two processes racing on
+    save_tokens clobber each other's staging file and corrupt the envelope.
+    """
+    import threading
+
+    errors: list[BaseException] = []
+
+    def writer(worker: int) -> None:
+        try:
+            for i in range(25):
+                ts._write_envelope(
+                    hermes_root,
+                    "kid-regression",
+                    {"worker": worker, "i": i},
+                    b"k" * 32,
+                )
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=writer, args=(w,)) for w in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert errors == [], f"concurrent envelope writes failed: {errors}"
+    staging = [
+        p for p in (hermes_root / "secrets").glob(".*.tmp") if p.is_file()
+    ]
+    assert staging == [], f"staging files leaked: {staging}"
+    # The final envelope is a complete, parseable envelope — never a torn
+    # interleaving of two writers' staging files.
+    payload = json.loads(ts.envelope_path(hermes_root).read_text(encoding="utf-8"))
+    assert "version" in payload and "ciphertext" in payload
+
+
+def test_rotation_failure_keeps_previous_key(hermes_root, monkeypatch):
+    """A failed rotation reports failure and leaves the old key active."""
+    first = ts._rotate_active_key(hermes_root)
+    assert first["outcome"] == "rotated"
+    old_key = ts.key_file_path(hermes_root).read_bytes()
+
+    def exploding_replace(src, dst):
+        raise OSError("simulated crash during rotation")
+
+    monkeypatch.setattr(operator_ws.os, "replace", exploding_replace)
+    result = ts._rotate_active_key(hermes_root)
+
+    assert result["outcome"] == "failed"
+    assert result["source"] == "keyfile"
+    assert ts.key_file_path(hermes_root).read_bytes() == old_key
+    staging = [
+        p for p in (hermes_root / "secrets").glob(".*.tmp") if p.is_file()
+    ]
+    assert staging == [], f"staging files leaked: {staging}"

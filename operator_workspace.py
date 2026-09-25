@@ -46,21 +46,30 @@ import operator_policy as op
 # ---------------------------------------------------------------------------
 
 
-def _atomic_write_text(path: Path, content: str) -> None:
+def _atomic_write_text(path: Path, content: str, mode: int | None = None) -> None:
     """Durably replace ``path`` with ``content``.
 
     The staging file is uniquely named (pid + random token) so concurrent
     writers to the same target never clobber each other's staging file, and
     it is fsynced before the rename so a crash cannot leave a truncated
-    target behind. A failed write removes its own staging file.
+    target behind. A failed write removes its own staging file. ``mode``
+    (e.g. ``0o600`` for key material) is applied to the staging file before
+    the rename, so the target never appears with looser permissions.
     """
+    _atomic_write_bytes(path, content.encode("utf-8"), mode=mode)
+
+
+def _atomic_write_bytes(path: Path, data: bytes, mode: int | None = None) -> None:
+    """Durably replace ``path`` with ``data`` (same contract as the text form)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
     try:
-        with open(tmp, "w", encoding="utf-8") as fh:
-            fh.write(content)
+        with open(tmp, "wb") as fh:
+            fh.write(data)
             fh.flush()
             os.fsync(fh.fileno())
+        if mode is not None:
+            os.chmod(tmp, mode)
         os.replace(tmp, path)
     except BaseException:
         tmp.unlink(missing_ok=True)
