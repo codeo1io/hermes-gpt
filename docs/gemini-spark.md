@@ -136,7 +136,7 @@ Functional check: ask Gemini to **list Hermes skills**. That exercises the read-
 
 ## Limitations
 
-- **No dynamic client registration.** There is no `registration_endpoint`, so the Client ID/Secret must be entered manually in Gemini under **Advanced features → Show more**. This is by design, not a misconfiguration.
+- **No dynamic client registration for this connector.** Google drives the Gemini connector as a manually configured confidential client, so the Client ID/Secret must be entered manually in Gemini under **Advanced features → Show more** — by design, not a misconfiguration. The dedicated-instance pattern additionally sets `HERMES_GPT_OAUTH_DCR=0`, so the instance stops advertising `registration_endpoint` altogether; the `/oauth/register` route itself keeps answering (the knob governs advertising only — see [OAuth behavior knobs](#oauth-behavior-knobs)).
 - **PKCE S256 works.** Only S256 is advertised and accepted; another `code_challenge_method` is rejected with `invalid_request`.
 - **Google-side errors can be opaque or transient.** An observed example is "Account linking is required to use this custom app. Try again." — retrying the connection is often sufficient.
 - **The user's browser must resolve the MCP hostname** during the authorize hop; the Google backend reaching the server is not enough.

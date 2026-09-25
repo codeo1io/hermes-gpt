@@ -1438,7 +1438,7 @@ def hermes_session_job_result(
 # ---------------------------------------------------------------------------
 
 
-def hermes_vision_analyze(image_url: str, question: str = "") -> str:
+async def hermes_vision_analyze(image_url: str, question: str = "") -> str:
     """Analyze an image using Hermes Agent vision. Env-gated."""
     try:
         require_imports()
@@ -1450,15 +1450,10 @@ def hermes_vision_analyze(image_url: str, question: str = "") -> str:
             raise RuntimeError(
                 "Vision tool is not available (import failed at startup)."
             )
-        import asyncio
-
         user_prompt = question if question else "Describe this image in detail."
-        result = asyncio.run(
-            vision_tool.vision_analyze_tool(
-                image_url=image_url, user_prompt=user_prompt
-            )
+        return await vision_tool.vision_analyze_tool(
+            image_url=image_url, user_prompt=user_prompt
         )
-        return result
     except Exception as exc:
         raise clean_error("hermes_vision_analyze", exc) from exc
 
@@ -1480,7 +1475,7 @@ def hermes_web_search(query: str, limit: int = 5) -> str:
         raise clean_error("hermes_web_search", exc) from exc
 
 
-def hermes_web_extract(
+async def hermes_web_extract(
     urls: List[str],
     char_limit: int | None = None,
 ) -> str:
@@ -1495,15 +1490,10 @@ def hermes_web_extract(
             raise RuntimeError(
                 "Web tool is not available (import failed at startup)."
             )
-        import asyncio
-
         kwargs = {}
         if char_limit is not None:
             kwargs["char_limit"] = char_limit
-        result = asyncio.run(
-            web_tool.web_extract_tool(urls=urls, **kwargs)
-        )
-        return result
+        return await web_tool.web_extract_tool(urls=urls, **kwargs)
     except Exception as exc:
         raise clean_error("hermes_web_extract", exc) from exc
 
@@ -3700,9 +3690,17 @@ def build_codex_mcp_server(
         imports_ready=imports_ready,
         gateway_snapshot=lambda: hermes_gateway_status(),
         gateway_diagnostics_callback=_codex_gateway_diagnostics,
-        vision_analyze=lambda image_path, prompt: hermes_vision_analyze(image_url=image_path, question=prompt),
+        # vision/web tools are native async tools; their Codex registry bodies are
+        # plain defs executed in worker threads (SDK 2 offloads them; SDK 1 goes
+        # through HermesMCP.add_tool's _offload_sync_tool), so bridging with
+        # asyncio.run is loop-safe here.
+        vision_analyze=lambda image_path, prompt: asyncio.run(
+            hermes_vision_analyze(image_url=image_path, question=prompt)
+        ),
         web_search=lambda query, limit: hermes_web_search(query=query, limit=limit),
-        web_extract=lambda urls, limit: hermes_web_extract(urls=urls, char_limit=limit),
+        web_extract=lambda urls, limit: asyncio.run(
+            hermes_web_extract(urls=urls, char_limit=limit)
+        ),
         cron_create_callback=lambda schedule, prompt, dry_run: hermes_cron_create(schedule=schedule, prompt=prompt, dry_run=dry_run),
         skill_create_callback=lambda name, content, dry_run: hermes_skill_create(name=name, content=content, dry_run=dry_run),
     )

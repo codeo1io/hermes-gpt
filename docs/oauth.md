@@ -70,6 +70,16 @@ HERMES_GPT_OAUTH_SCOPE=hermes
 
 Multiple exact redirect URIs may be comma-separated. Wildcards are not accepted. The issuer must use HTTPS except for an explicitly loopback-only test server.
 
+Two optional knobs tune client-facing authorization behavior:
+
+```text
+HERMES_GPT_OAUTH_PKCE_MODE=required
+HERMES_GPT_OAUTH_DCR=1
+```
+
+- `HERMES_GPT_OAUTH_PKCE_MODE` — `required` (default) or `optional`. `required` rejects every authorization request that arrives without an S256 `code_challenge`; `optional` additionally accepts requests without PKCE for clients that cannot supply one. Any other value fails startup validation.
+- `HERMES_GPT_OAUTH_DCR` — dynamic client registration (RFC 7591) is advertised and served by default: `registration_endpoint` appears in the authorization-server metadata and `POST /oauth/register` answers. Set `0` (or `false`/`off`/`no`) to stop advertising `registration_endpoint` for single confidential-client deployments (for example the Gemini Spark custom-app profile); the `/oauth/register` route itself keeps answering, and registrations remain bounded by a per-source rate window, a 64-client capacity, and a 7-day client TTL.
+
 The built-in OAuth boundary is available only with streamable HTTP (`--http`);
 legacy SSE is rejected when OAuth is enabled so discovery and resource binding
 cannot disagree.
@@ -111,6 +121,7 @@ HERMES_GPT_OAUTH_GEMINI_REDIRECT_URI=https://oauth-redirect.googleusercontent.co
 - The profile is off unless `HERMES_GPT_OAUTH_GEMINI_ENABLE` is exactly `1`; enabling it without all three `HERMES_GPT_OAUTH_GEMINI_*` values fails startup validation with a `ValueError` naming the missing variables.
 - `HERMES_GPT_OAUTH_GEMINI_REDIRECT_URI` accepts one or more exact HTTPS URIs, comma-separated, parsed exactly like the primary redirect URI. Wildcards are not accepted.
 - Both clients share the issuer, the resource, and the one configured `HERMES_GPT_OAUTH_SCOPE`; each keeps its own secret and its own exact-match redirect allowlist, and a client can only redirect to, or authenticate with, its own credentials.
+- Set `HERMES_GPT_OAUTH_DCR=0` for the no-advertised-DCR contract this profile's manual Client ID/Secret path expects (see [Gemini Spark custom app](gemini-spark.md)).
 - The primary `HERMES_GPT_OAUTH_CLIENT_ID` / `_CLIENT_SECRET` / `_REDIRECT_URI` values are unchanged and keep working.
 
 Setup, callback discovery, verification, and rollback: [Gemini Spark custom app](gemini-spark.md).

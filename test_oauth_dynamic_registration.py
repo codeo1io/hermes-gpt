@@ -181,7 +181,7 @@ def test_register_refuses_confidential_auth_method(client: TestClient):
 
 
 def test_register_rejects_malformed_payload(client: TestClient):
-    response = client.post("/oauth/register", data="not-json")
+    response = client.post("/oauth/register", content="not-json")
     assert response.status_code == 400
 
 
