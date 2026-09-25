@@ -1,0 +1,7 @@
+{"step":1,"ts":"2026-09-22T16:25:22Z","summary":"Research phase start: tree clean at 4b958379d6","touched":[".conductor/progress/a7f35f9775e64719a28ff2f4f39814c5.ndjson"]}
+{"step": 2, "ts": "2026-09-22T16:29:59Z", "summary": "Upstream unchanged at 7795aa3ce8; only PR #75 (fork B1 mirror, blocked) + issue #74 open; fork master advanced to a93aeb", "touched": []}
+{"step": 3, "ts": "2026-09-22T16:29:59Z", "summary": "Ecosystem: mcp 2.2.0 latest; starlette 1.6.0/fastapi 0.141.1/pydantic 2.13.5(+2.14b2)/pyyaml 6.0.3/uvicorn 0.53.0/httpx2", "touched": []}
+{"step": 4, "ts": "2026-09-22T16:29:59Z", "summary": "Spec 2026-07-28: RFC7591 DCR DEPRECATED -> Client ID Metadata Documents; RFC 9207 iss SHOULD; MRTR; tasks extension; Cac", "touched": []}
+{"step": 5, "ts": "2026-09-22T16:29:59Z", "summary": "Repo AS gaps grep-verified: no iss/9207, no metadata documents, no RFC7592; no structuredContent/outputSchema in MCP sur", "touched": []}
+{"step": 6, "ts": "2026-09-22T16:29:59Z", "summary": "SDK 2.2.0 ROADMAP: tasks ext #2806, DPoP SEP-1932, jwt-bearer unimplemented; pyproject requires-python >=3.10; rm-024/rm", "touched": []}
+{"step": 7, "ts": "2026-09-22T16:29:59Z", "summary": "Candidates compiled R-1a/b/c, R-2, R-3, R-4, R-5, R-6; phase_result JSON written to spool", "touched": []}

@@ -30,6 +30,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -367,20 +368,30 @@ def _read_jobs(profile_home: Path) -> list[dict[str, Any]]:
 
 
 def _write_jobs(profile_home: Path, jobs: list[dict[str, Any]]) -> None:
-    """Atomically write jobs.json. Creates cron dir if missing."""
+    """Atomically write jobs.json. Creates cron dir if missing.
+
+    The staging file is uniquely named (pid + random token) so concurrent
+    writers never clobber each other, and it is fsynced before the rename.
+    """
     cron_dir = _cron_dir(profile_home)
     cron_dir.mkdir(parents=True, exist_ok=True)
     target = _jobs_file(profile_home)
-    tmp = target.with_suffix(".json.tmp")
+    tmp = target.with_name(f".{target.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
     shape = _jobs_shape_cache.get(_jobs_shape_key(profile_home), "dict")
     payload: Any
     if shape == "list":
         payload = jobs
     else:
         payload = {"jobs": jobs}
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(payload, fh, indent=2, ensure_ascii=False)
-    os.replace(tmp, target)
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, ensure_ascii=False)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, target)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _hash_prompt(prompt: str | None) -> tuple[int, str]:

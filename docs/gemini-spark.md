@@ -1,6 +1,6 @@
 # Gemini Spark custom app
 
-Hermes GPT's built-in OAuth boundary can authenticate Google's consumer Gemini Apps **Custom apps for Spark** connector. Google drives that flow as a manually configured confidential client because this server advertises no dynamic client registration; the opt-in **Gemini Spark client profile** registers an additional confidential client that stays isolated from the primary client (for example the ChatGPT connector client).
+Hermes GPT's built-in OAuth boundary can authenticate Google's consumer Gemini Apps **Custom apps for Spark** connector. Google drives that flow as a manually configured confidential client; the ChatGPT-only dynamic registration surface ([dynamic client registration](oauth.md#dynamic-client-registration-chatgpt-apps-flow)) plays no part in it, and `HERMES_GPT_OAUTH_DCR=0` stops a dedicated instance from advertising it. The opt-in **Gemini Spark client profile** registers an additional confidential client that stays isolated from the primary client (for example the ChatGPT connector client).
 
 This guide covers the profile, both configuration patterns, callback discovery, verification, and rollback. The authorization server itself — scopes, PKCE, refresh rotation, and the durable token store — is documented in [OAuth and bearer authentication](oauth.md) and is not repeated here.
 

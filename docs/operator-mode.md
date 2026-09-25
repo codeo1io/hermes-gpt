@@ -104,6 +104,23 @@ $env:HERMES_GPT_OWNER_ACK="I_UNDERSTAND_THIS_CAN_MUTATE_MY_MACHINE"
 
 Configured `owner` authority is clamped unless the Owner activation and exact acknowledgement are present. Owner Mode still cannot access denied secret paths.
 
+### Owner command scratch directory
+
+On non-Windows hosts, before the Owner direct-command surface
+(`hermes_owner_run_command`) executes a command, the process's scratch
+environment (`TMPDIR`, `TEMP`, `TMP`) is pointed at a dedicated tree so
+pytest/tempfile/build scratch from delegated subprocesses lands in one
+janitorable place instead of shared `/tmp`:
+
+```text
+HERMES_GPT_OPERATOR_TMPDIR=<absolute-path>   # default: ~/.hermes/tmp/operator
+```
+
+The directory is created with mode `0700` (and re-chmodded `0700` if it
+already exists). It can be cleared safely while no owner command is running;
+nothing durable is stored there: entries older than 7 days are pruned
+automatically (best-effort, at most hourly per process).
+
 Do not use Owner Mode for a public, shared, or always-on connector.
 
 ## Dry-run and confirmation semantics

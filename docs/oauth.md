@@ -7,18 +7,34 @@ Hermes GPT remains local-first. Remote Operator or Owner access is supported onl
 The built-in authorization server is intentionally narrow:
 
 - one statically configured confidential client by default, plus optional additional named client profiles (see [Additional clients](#additional-clients-gemini-spark-profile));
+- a bounded registry of dynamically registered **public** clients for the
+  ChatGPT apps flow — never confidential clients, never secrets (see
+  [Dynamic client registration](#dynamic-client-registration-chatgpt-apps-flow));
 - exact HTTPS redirect-URI allowlisting;
 - client authentication on every authorization-code and refresh exchange;
 - **mandatory PKCE (RFC 7636): every authorization request must carry a
   valid `code_challenge` with `code_challenge_method=S256`, and every
   authorization-code exchange must present the matching verifier** — a code
   without a stored S256 challenge can never be exchanged, so a stolen or
-  intercepted code is useless without the verifier;
+  intercepted code is useless without the verifier. `HERMES_GPT_OAUTH_PKCE_MODE`
+  selects the policy: `required` (default) rejects every challenge-less
+  authorization request, while `optional` lets a **confidential** client
+  authorize without a challenge (its secret is still enforced at the token
+  endpoint). Public and dynamically registered clients always require PKCE
+  in both modes;
 - one configured Hermes resource scope (required on every issued token) plus the connector compatibility scopes `openid` and `offline_access`;
 - one-hour HMAC-signed access tokens (verifiable by any origin that shares the confidential client secret);
 - 30-day refresh tokens with rotation and replay rejection;
 - signed, five-minute stateless authorization codes plus bounded process-memory replay, access-token, and refresh-token stores;
-- no dynamic client registration, user accounts, persistent plaintext token database, or OpenID Provider claims.
+- every authorization redirect — success responses and error responses
+  alike — carries the issuer identifier as the `iss` query parameter
+  (RFC 9207), and the authorization-server metadata advertises
+  `authorization_response_iss_parameter_supported`, so a client can bind
+  an issued code (or an authorization error) to exactly this authorization
+  server;
+- no user accounts, no OpenID Provider claims, and no plaintext token
+  database: tokens (and the dynamic-client registry) live only in the
+  encrypted durable store described below.
 
 `openid` is accepted because ChatGPT may add it even with OIDC disabled. Hermes GPT does not advertise OpenID Provider metadata and does not issue ID tokens; `/.well-known/openid-configuration` is served as a public 404 (not an auth challenge) so clients that probe OIDC discovery with OIDC disabled do not mistake the connector for disconnected. Configure the ChatGPT connector with OIDC disabled.
 
@@ -99,6 +115,55 @@ HERMES_GPT_OAUTH_GEMINI_REDIRECT_URI=https://oauth-redirect.googleusercontent.co
 
 Setup, callback discovery, verification, and rollback: [Gemini Spark custom app](gemini-spark.md).
 
+## Dynamic client registration (ChatGPT apps flow)
+
+`POST /oauth/register` implements RFC 7591 dynamic client registration for
+the ChatGPT "apps flow" connector, which discovers
+`registration_endpoint` in `/.well-known/oauth-authorization-server`,
+registers an ephemeral client, and then authorizes with PKCE only:
+
+- **public clients only**: `token_endpoint_auth_method` must be `none`;
+  confidential methods are refused and **no client secret is ever issued** —
+  PKCE plus the redirect allowlist is the binding control;
+- **redirect allowlist**: 1 to 8 redirect URIs, each an absolute HTTPS URL
+  whose host is exactly `chatgpt.com`, `chat.openai.com`, or `openai.com`
+  (exact-host match — subdomains such as `app.sandbox.chatgpt.com` are
+  *rejected*), re-checked at authorization time;
+- **bounded and self-healing**: the registry holds at most 64 clients
+  (`MAX_DYNAMIC_CLIENTS`). Registrations carry a 7-day TTL
+  (`DYNAMIC_CLIENT_TTL_SECONDS`); `cleanup()` evicts expired registrations
+  (each new registration runs it first), and an expired client is treated as
+  unknown even before eviction, so an unauthenticated caller can exhaust the
+  registry only temporarily — never permanently. A connector whose client
+  expired simply re-registers;
+- **rate-bounded**: each peer (client IP) may register at most 5 times per
+  60 seconds (`REGISTER_RATE_LIMIT` / `REGISTER_RATE_WINDOW_SECONDS`, held
+  in process memory, so it resets on restart). Exceeding it returns
+  `429 temporarily_unavailable` with no partial state; the capacity cap and
+  the TTL above stay the durable bounds;
+- **operator surfaces**: the registry can be inventoried with
+  `OAuthState.list_dynamic_clients()` (client id, redirect URIs,
+  registration/expiry stamps, and an `expired` flag for not-yet-reclaimed
+  entries) and one entry removed with
+  `OAuthState.purge_dynamic_client(client_id)` (idempotent; a purged client
+  fails closed immediately). These are Python-level calls today — see
+  [OAuth behavior knobs](gemini-spark.md#oauth-behavior-knobs);
+- **persistence with revalidation**: the registry persists in the same
+  encrypted durable token store as the tokens (surviving restarts). On
+  restore, every persisted entry is revalidated at live-registration
+  parity — `dyn-` client-id prefix, 1–8 allowlisted HTTPS redirect
+  URIs, TTL, capacity — so a tampered store payload cannot smuggle in a
+  client (or redirect) that `/oauth/register` would refuse (the raw list
+  is capped at 8 entries pre-dedupe, so import is never looser).
+  Entries persisted before TTLs existed are granted a fresh TTL on
+  import, not immortality; duplicated ids are skipped, first wins.
+- **metadata gate**: `HERMES_GPT_OAUTH_DCR` controls whether the discovery
+  doc advertises `registration_endpoint`. Default `1` (advertise); `0`,
+  `false`, `off`, or `no` removes it from the metadata so DCR-probing
+  clients stop trying. The register endpoint itself still answers — the knob
+  is the compat/advertising switch. Set it to `0` when running the Gemini
+  Spark custom-app profile, whose platform contract is "no DCR".
+
 ## ChatGPT connector values
 
 Configure the connector using values derived from the issuer:
@@ -146,7 +211,9 @@ token store** so a server restart does not invalidate credentials:
   one transactional store; each row is AES-256-GCM ciphertext keyed by
   sha256(token value), so no token material is stored in plaintext. A
   flock-serialized mutation lock (`hermes_gpt_tokens.db.lock`) orders
-  issuance, rotation, and revocation across processes;
+  issuance, rotation, and revocation across processes. The dynamic-client
+  registry persists here too (client ids, redirect URIs, registration and
+  expiry timestamps only — no secrets, because dynamic clients have none);
 - retirement tombstones: rotated/revoked token hashes stay retired forever
   (past their original expiry), so a stale peer cache can never resurrect
   them; the revocation epoch lives in the store's metadata and is advanced
@@ -193,6 +260,9 @@ Hermes GPT fails closed when:
 - PKCE is supplied with a method other than S256 or the verifier does not match;
 - an authorization code or refresh token is unknown, expired, used, or replayed;
 - a refresh request attempts to increase scope;
+- the dynamic-client registry is full (`/oauth/register` answers
+  `429 temporarily_unavailable`) — this is bounded, not permanent: expired
+  registrations are evicted by their TTL on the next registration/cleanup;
 - a bounded credential store is full.
 
 Operator and Owner policy remains independent from transport authentication. Authenticating a connector does not activate mutations, direct mode, or Owner Mode.

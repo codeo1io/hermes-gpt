@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import time
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 from starlette.applications import Starlette
@@ -333,7 +335,6 @@ def test_legacy_static_client_flow_unchanged(client: TestClient):
     assert auth.status_code == 302, auth.text
     assert "code=" in auth.headers["location"]
 
-
 # -- rm-055: registration lifecycle (rate limit, TTL, reclaim, purge) -------
 
 
@@ -540,3 +541,196 @@ def test_register_rate_window_prunes_stale_peers(client: TestClient, state: OAut
     assert state.register_rate_allows("fresh-peer") is True
     assert "stale-peer" not in state._register_hits
     assert "fresh-peer" in state._register_hits
+
+
+# -- run 0c897417 cycle-3 B1 additions (import parity, DCR gate, RFC 9207 iss) --
+
+def test_import_applies_live_registration_parity(state: OAuthState):
+    """The persisted registry is operator-writable state: every imported
+    entry must pass the same validation as a live registration."""
+    payload = [
+        # a non-dyn id attempting to shadow the operator-provisioned client
+        {"client_id": CLIENT_ID, "redirect_uris": [AIP_REDIRECT]},
+        # redirects the register endpoint would refuse
+        {"client_id": "dyn-evil", "redirect_uris": ["https://evil.example.com/cb"]},
+        # more than the 8-URI live cap
+        {"client_id": "dyn-many", "redirect_uris": [AIP_REDIRECT] * 9},
+        # already expired
+        {
+            "client_id": "dyn-dead",
+            "redirect_uris": [AIP_REDIRECT],
+            "registered_at": 1.0,
+            "expires_at": 2.0,
+        },
+        # valid
+        {
+            "client_id": "dyn-good",
+            "redirect_uris": [AIP_REDIRECT],
+            "registered_at": 1.0,
+            "expires_at": time.time() + 3600.0,
+        },
+    ]
+    assert state.import_dynamic_clients(payload) == 1
+    assert set(state.dynamic_clients) == {"dyn-good"}
+
+
+
+def test_import_rejects_tampered_redirect_payload():
+    """A tampered store payload cannot smuggle in redirects the register
+    endpoint refuses (import parity with live registration)."""
+    probe = OAuthState(_config())
+    probe.import_dynamic_clients(
+        [
+            {
+                "client_id": "dyn-evil",
+                "redirect_uris": ["https://evil.example.com/cb"],
+                "expires_at": time.time() + 3600.0,
+            }
+        ]
+    )
+    assert not probe.is_dynamic_client("dyn-evil")
+    response = _authorize(_build(probe), "dyn-evil", "https://evil.example.com/cb")
+    assert response.status_code == 401
+
+
+
+def test_registry_ttl_survives_export_round_trip(client: TestClient, state: OAuthState):
+    dyn_id = _register(client).json()["client_id"]
+    bundle = state.export_dynamic_clients()
+    assert bundle[0]["expires_at"] > bundle[0]["registered_at"]
+    state2 = OAuthState(_config())
+    assert state2.import_dynamic_clients(bundle) == 1
+    assert state2.dynamic_clients[dyn_id].expires_at == bundle[0]["expires_at"]
+    assert "code=" in _authorize(_build(state2), dyn_id, AIP_REDIRECT).headers["location"]
+
+
+
+def test_metadata_dcr_gate_controls_registration_endpoint(monkeypatch):
+    from oauth_auth import OAUTH_DCR_ENV, authorization_metadata
+
+    def _metadata() -> dict:
+        app = Starlette(
+            routes=[
+                Route(
+                    "/.well-known/oauth-authorization-server",
+                    lambda request: authorization_metadata(request, OAuthState(_config())),
+                    methods=["GET"],
+                )
+            ]
+        )
+        probe = TestClient(app)
+        response = probe.get("/.well-known/oauth-authorization-server")
+        assert response.status_code == 200
+        return response.json()
+
+    monkeypatch.setenv(OAUTH_DCR_ENV, "0")
+    assert "registration_endpoint" not in _metadata()
+    monkeypatch.setenv(OAUTH_DCR_ENV, "1")
+    assert _metadata().get("registration_endpoint") == f"{ISSUER}/oauth/register"
+
+
+
+def test_authorize_redirect_carries_rfc9207_iss(client: TestClient):
+    """RFC 9207: the issuer identifier rides every authorization-code
+    redirect so the client can bind the code to the AS that issued it."""
+    dyn_id = _register(client).json()["client_id"]
+    dynamic = _authorize(client, dyn_id, AIP_REDIRECT)
+    static = _authorize(client, CLIENT_ID, REDIRECT_URI)
+    for response in (dynamic, static):
+        assert response.status_code == 302, response.text
+        query = parse_qs(urlparse(response.headers["location"]).query)
+        assert query["iss"] == [ISSUER]
+        assert query["code"]
+
+
+
+def test_authorize_error_redirect_carries_rfc9207_iss(client: TestClient):
+    """RFC 9207 §2: error responses are authorization responses too — the
+    iss parameter MUST ride the error redirect as well, so a client can
+    bind a failure (not just an issued code) to exactly this AS."""
+    response = client.get(
+        "/oauth/authorize",
+        params={
+            "response_type": "token",  # only code is supported
+            "client_id": CLIENT_ID,
+            "redirect_uri": REDIRECT_URI,
+            "scope": "hermes",
+            "state": "s1",
+            "code_challenge": CHALLENGE_S256,
+            "code_challenge_method": "S256",
+        },
+    )
+    assert response.status_code == 302, response.text
+    query = parse_qs(urlparse(response.headers["location"]).query)
+    assert query["error"] == ["unsupported_response_type"]
+    assert query["iss"] == [ISSUER]
+    assert query["state"] == ["s1"]
+    assert "code" not in query
+
+
+
+def test_metadata_advertises_iss_parameter_supported():
+    """RFC 9207 §2.3: an AS supporting iss on authorization responses MUST
+    advertise authorization_response_iss_parameter_supported=true in its
+    metadata; it is unconditional (iss is never omitted, not even for the
+    DCR-gated single-client profile)."""
+    from oauth_auth import authorization_metadata
+
+    def _metadata() -> dict:
+        app = Starlette(
+            routes=[
+                Route(
+                    "/.well-known/oauth-authorization-server",
+                    lambda request: authorization_metadata(request, OAuthState(_config())),
+                    methods=["GET"],
+                )
+            ]
+        )
+        probe = TestClient(app)
+        response = probe.get("/.well-known/oauth-authorization-server")
+        assert response.status_code == 200
+        return response.json()
+
+    assert _metadata()["authorization_response_iss_parameter_supported"] is True
+
+
+
+def test_import_dedupes_ids_and_never_overwrites(state: OAuthState):
+    """Import accounting is exact: a duplicated id inside one payload counts
+    once (first occurrence wins) and an id already in the registry never
+    silently replaces a live row's redirects or expiry."""
+    payload = [
+        {
+            "client_id": "dyn-dup",
+            "redirect_uris": [AIP_REDIRECT],
+            "registered_at": time.time() - 10,
+            "expires_at": time.time() + 3600.0,
+        },
+        # same id again with different (still allowlisted) redirects
+        {
+            "client_id": "dyn-dup",
+            "redirect_uris": ["https://openai.com/other/callback"],
+            "registered_at": time.time() - 5,
+            "expires_at": time.time() + 7200.0,
+        },
+    ]
+    assert state.import_dynamic_clients(payload) == 1
+    assert state.dynamic_clients["dyn-dup"].redirect_uris == (AIP_REDIRECT,)
+
+    # an id already registered live is not overwritten by an import
+    live = state.register_dynamic_client([AIP_REDIRECT])
+    before = state.dynamic_clients[live.client_id].redirect_uris
+    assert (
+        state.import_dynamic_clients(
+            [
+                {
+                    "client_id": live.client_id,
+                    "redirect_uris": ["https://openai.com/other/callback"],
+                    "registered_at": time.time(),
+                    "expires_at": time.time() + 3600.0,
+                }
+            ]
+        )
+        == 0
+    )
+    assert state.dynamic_clients[live.client_id].redirect_uris == before

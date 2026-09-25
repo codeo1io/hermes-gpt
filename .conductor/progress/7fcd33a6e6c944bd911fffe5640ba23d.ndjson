@@ -1,0 +1,3 @@
+{"step":1,"ts":"2026-09-22T17:51:22Z","summary":"KTD5 fix: verified tree byte-identical to b4233141 end-state, digest == dispatch","touched":[]}
+{"step":2,"ts":"2026-09-22T17:51:22Z","summary":"Targeted retest all 7 surfaces: 257P/1S/0F exit0, ruff+py_compile OK","touched":["/tmp/targeted-7fcd33a6.log"]}
+{"step":3,"ts":"2026-09-22T17:51:22Z","summary":"phase_result re-emitted: covered_surfaces names all 7, digest verbatim, changed_surfaces empty","touched":["delegate-spool"]}

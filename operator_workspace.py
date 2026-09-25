@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import shlex
 import shutil
 import time
@@ -46,11 +47,24 @@ import operator_policy as op
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
+    """Durably replace ``path`` with ``content``.
+
+    The staging file is uniquely named (pid + random token) so concurrent
+    writers to the same target never clobber each other's staging file, and
+    it is fsynced before the rename so a crash cannot leave a truncated
+    target behind. A failed write removes its own staging file.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as fh:
-        fh.write(content)
-    os.replace(tmp, path)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _backup_file(path: Path) -> Path | None:
@@ -120,12 +134,11 @@ def _read_gateway_state(state_path: Path) -> dict[str, Any]:
 
 
 def _read_gateway_pid_from_pid_file(pid_path: Path) -> int | None:
-    """Read gateway.pid as a bare integer or a JSON object with a "pid" key.
+    """Canonical gateway.pid parser (operator_diagnostics delegates here).
 
     Current Hermes Gateway versions write a JSON record here ({"pid": ...,
     "kind": ...}); older ones stored a raw PID. Returns None when absent,
     empty, or unparsable so callers fall back to gateway_state.json.
-    Mirrors operator_diagnostics._read_gateway_pid.
     """
     if not pid_path.exists():
         return None
@@ -948,6 +961,37 @@ def _command_touches_secrets(command: str) -> bool:
     return any(n in lower for n in needles)
 
 
+_OPERATOR_TMP_STALE_SECONDS = 7 * 24 * 60 * 60
+_TMPDIR_JANITOR_INTERVAL = 3600.0
+_janitor_last_run = 0.0
+
+
+def _janitor_operator_tmpdir(tmpdir: Path, *, now: float | None = None) -> int:
+    """Best-effort removal of scratch entries past the stale TTL (7 days).
+
+    Never raises: one undeletable stale path must not take down the owner
+    command that triggered the janitor. Returns the removed-entry count.
+    """
+    cutoff = (time.time() if now is None else now) - _OPERATOR_TMP_STALE_SECONDS
+    removed = 0
+    try:
+        entries = list(tmpdir.iterdir())
+    except OSError:
+        return 0
+    for entry in entries:
+        try:
+            if entry.lstat().st_mtime > cutoff:
+                continue
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry, ignore_errors=True)
+            else:
+                entry.unlink(missing_ok=True)
+            removed += 1
+        except OSError:
+            continue
+    return removed
+
+
 def _ensure_operator_tmpdir() -> Path:
     """Route owner-command scratch away from shared /tmp.
 
@@ -966,6 +1010,10 @@ def _ensure_operator_tmpdir() -> Path:
     except OSError:
         pass
     resolved = str(tmpdir.resolve())
+    global _janitor_last_run
+    if time.time() - _janitor_last_run >= _TMPDIR_JANITOR_INTERVAL:
+        _janitor_last_run = time.time()
+        _janitor_operator_tmpdir(Path(resolved))
     os.environ["TMPDIR"] = resolved
     os.environ["TEMP"] = resolved
     os.environ["TMP"] = resolved
