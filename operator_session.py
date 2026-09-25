@@ -16,6 +16,7 @@ from typing import Any
 from uuid import uuid4
 
 import operator_policy as op
+import atomic_write
 
 
 ENABLE_SESSION_CONTROL_ENV = "HERMES_GPT_ENABLE_SESSION_CONTROL"
@@ -63,10 +64,9 @@ def _redact(value: Any) -> Any:
 
 def _save(meta: dict[str, Any], hermes_root: Path | None = None) -> None:
     path, _ = _paths(meta["job_id"], hermes_root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_suffix(".tmp")
-    temp.write_text(json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
-    temp.replace(path)
+    atomic_write.atomic_write_text(
+        path, json.dumps(meta, indent=2, sort_keys=True), mode=0o600
+    )
 
 
 def _load(job_id: str, hermes_root: Path | None = None) -> dict[str, Any] | None:

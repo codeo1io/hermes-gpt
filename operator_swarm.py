@@ -83,6 +83,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import operator_policy as op
+import atomic_write
 import operator_fleet as op_fleet
 import operator_contract as contract_mod
 import operator_mission as mission
@@ -559,12 +560,11 @@ def _load_workflow(hermes_root: Path, workflow_id: str) -> dict[str, Any] | None
 
 def _save_workflow(hermes_root: Path, record: dict[str, Any]) -> None:
     path = _workflow_path(hermes_root, record["workflow_id"])
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # Operational state file (like codex-jobs). Never contains raw bodies on
-    # any surface; objective text is stored for contract rebuilds only.
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(record, ensure_ascii=False, sort_keys=True, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    atomic_write.atomic_write_text(
+        path,
+        json.dumps(record, ensure_ascii=False, sort_keys=True, indent=2),
+        mode=0o600,
+    )
 
 
 def _list_records(hermes_root: Path) -> list[dict[str, Any]]:

@@ -15,6 +15,7 @@ from typing import Any
 
 import operator_fabric as base
 import operator_policy as op
+from atomic_write import staging_path
 
 ARTIFACT_MANIFEST_SCHEMA = "hermes.fabric-artifact-manifest/v1"
 ARTIFACT_CHUNK_SCHEMA = "hermes.fabric-artifact-chunk/v1"
@@ -223,7 +224,7 @@ class PeerArtifactStore:
         target_dir = self.root / attempt["attempt_id"]
         target_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         target = target_dir / f"{artifact_id}.blob"
-        temp = target.with_suffix(".tmp")
+        temp = staging_path(target)
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
         fd = os.open(source, flags)
         digest = hashlib.sha256()
@@ -594,7 +595,7 @@ class CoordinatorArtifactStore:
         target_dir = self.root / attempt["attempt_id"]
         target_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         target = target_dir / f"{item['artifact_id']}.blob"
-        temp = target.with_suffix(".tmp")
+        temp = staging_path(target)
         digest = hashlib.sha256()
         offset = 0
         try:

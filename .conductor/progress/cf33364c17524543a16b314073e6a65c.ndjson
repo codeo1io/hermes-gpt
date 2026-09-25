@@ -1,0 +1,2 @@
+{"step":1,"ts":"2026-09-29T19:49:47Z","summary":"roadmap phase start: survey structure, id/track/status conventions, next free id","touched":[".conductor/progress/cf33364c17524543a16b314073e6a65c.ndjson"]}
+{"step":2,"ts":"2026-09-29T19:52:55Z","summary":"ROADMAP.md +57/-7: digest rm-076..082, 6 dated updates (rm-024/046/053/065/067/069), ids unique","touched":["ROADMAP.md",".conductor/progress/cf33364c17524543a16b314073e6a65c.ndjson"]}

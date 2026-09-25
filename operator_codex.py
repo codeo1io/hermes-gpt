@@ -18,6 +18,7 @@ from uuid import uuid4
 
 import operator_job_supervisor as job_supervisor
 import operator_policy as op
+import atomic_write
 
 ENABLE_CODEX_RUNNER_ENV = "HERMES_GPT_ENABLE_CODEX_RUNNER"
 ALLOW_CODEX_WRITE_ENV = "HERMES_GPT_ALLOW_CODEX_WRITE"
@@ -53,14 +54,9 @@ def _request_path(job_id: str, hermes_root: Path | None = None) -> Path:
 
 def _save_request(job_id: str, value: dict[str, Any], hermes_root: Path | None = None) -> None:
     path = _request_path(job_id, hermes_root)
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    temp = path.with_suffix(path.suffix + ".tmp")
-    temp.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
-    try:
-        temp.chmod(0o600)
-    except OSError:
-        pass
-    temp.replace(path)
+    atomic_write.atomic_write_text(
+        path, json.dumps(value, ensure_ascii=False), mode=0o600, private_dir=True
+    )
 
 
 def _safe_error(code: str, message: str, action: str) -> dict[str, Any]:
@@ -88,10 +84,9 @@ def _normalize_execution_mode(execution_mode: str) -> str | dict[str, Any]:
 
 def _save(meta: dict[str, Any], hermes_root: Path | None = None) -> None:
     path, _ = _paths(meta["job_id"], hermes_root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_suffix(".tmp")
-    temp.write_text(json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
-    temp.replace(path)
+    atomic_write.atomic_write_text(
+        path, json.dumps(meta, indent=2, sort_keys=True), mode=0o600
+    )
 
 
 def _load(job_id: str, hermes_root: Path | None = None) -> dict[str, Any] | None:

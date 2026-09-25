@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 import operator_fleet as op_fleet
+import atomic_write
 import operator_job_supervisor as job_supervisor
 import operator_policy as op
 import runner_confinement as confinement
@@ -77,18 +78,12 @@ def _cancel_path(task_id: str, hermes_root: Path | None = None) -> Path:
 
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    try:
-        path.parent.chmod(0o700)
-    except OSError:
-        pass
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
-    try:
-        tmp.chmod(0o600)
-    except OSError:
-        pass
-    tmp.replace(path)
+    atomic_write.atomic_write_text(
+        path,
+        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True),
+        mode=0o600,
+        private_dir=True,
+    )
 
 
 def _load_json(path: Path) -> dict[str, Any] | None:

@@ -28,6 +28,8 @@ from typing import Any
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+import atomic_write
+
 try:
     import fcntl as _fcntl
 except ImportError:  # Windows
@@ -121,17 +123,13 @@ def _key_from_file(hermes_root: Path) -> bytes | None:
 
 
 def _write_key_file(hermes_root: Path, key: bytes) -> None:
-    d = _secrets_dir(hermes_root)
-    d.mkdir(parents=True, exist_ok=True)
-    path = key_file_path(hermes_root)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_bytes(key)
-    os.chmod(tmp, 0o600)
-    tmp.replace(path)
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
+    # Secrets dir is 0700 and the staging file is created 0600 (O_EXCL),
+    # so the raw key is never world-readable in any window and never
+    # lands at a predictable leftover name; fsync-before-rename plus
+    # directory fsync make the rotation crash-durable.
+    atomic_write.atomic_write_bytes(
+        key_file_path(hermes_root), key, mode=0o600, private_dir=True
+    )
 
 
 def _rotate_active_key(hermes_root: Path) -> dict[str, Any]:
@@ -161,11 +159,7 @@ def _rotate_active_key(hermes_root: Path) -> dict[str, Any]:
     try:
         fresh = secrets.token_bytes(32)
         path = key_file_path(hermes_root)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".new")
-        tmp.write_bytes(fresh)
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
+        atomic_write.atomic_write_bytes(path, fresh, mode=0o600, private_dir=True)
     except Exception:
         return {"outcome": "failed", "source": "keyfile"}
     return {"outcome": "rotated", "source": "keyfile"}
@@ -237,17 +231,10 @@ def _write_envelope(hermes_root: Path, kid: str, plaintext: dict[str, Any], key:
         "ciphertext": _b64(ciphertext),
         "nonce": _b64(nonce),
     }
-    d = _secrets_dir(hermes_root)
-    d.mkdir(parents=True, exist_ok=True)
-    path = envelope_path(hermes_root)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(envelope, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.chmod(tmp, 0o600)
-    tmp.replace(path)
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
+    envelope_text = json.dumps(envelope, ensure_ascii=False, indent=2)
+    atomic_write.atomic_write_text(
+        envelope_path(hermes_root), envelope_text, mode=0o600, private_dir=True
+    )
 
 
 def save_tokens(hermes_root: Path, tokens: dict[str, Any]) -> dict[str, Any]:

@@ -104,3 +104,31 @@ distribution installed — the metadata test runs instead of skipping there).
   are additive and gated on the SDK pin lanes from rm-009 being green first.
 - **Rebase note (assess F10):** the campaign checkout `/work/projects/hermes-gpt` sits
   one docs-only merge behind `origin/master`; rebase before the next implement phase.
+
+## Cycle 4 — 2026-09-30: trustworthy-state hardening batch (campaign 12c24d07 cycle 1, run 041a92f6667d)
+
+**Run:** 041a92f6667d4952a09bda225728236d (repository-maintenance campaign 12c24d07e02440efb0adc0e7c51d8992, cycle 1)
+**Base:** 14530e3e79 (clean tree; integration of run e29c25913c00 — SDK-1 sync-tool offload, native-async web/vision tools, loop-safe Codex bridge)
+**Batch:** rm-077 + rm-067-remainder + rm-078 + rm-046 + rm-080, selected by prioritize 34aa4fb0 over the full open ledger with sibling-branch interlocks mapped; stretch rm-079/rm-082 not reached.
+
+**What landed (all pending commit gate — pre-review evidence):**
+- **rm-077** — new shared `atomic_write.py` (`atomic_write_text`/`atomic_write_bytes` + `ensure_private_dir`/`staging_path`: unique pid+token staging created 0o600 via `O_CREAT|O_EXCL`, fsync of file and dir with Windows-tolerant guards, `os.replace`); `token_store.py` adopts it at all three secret writes and creates the secrets dir 0o700 at first write — the world-readable window and fixed-`.tmp` stranding path are gone. New dir-mode/file-mode/no-window tests in `test_token_store.py`.
+- **rm-067-remainder** — all 12 ledger-listed fixed-`.tmp` sites converted to the shared helper, plus both `fabric_artifacts.py` streaming sites (:226/:597) discovered during adoption; `.env` read-modify-write serialized by `operator_config._EnvFileLock`; grep-verified zero fixed-name `.tmp` writes remain in non-test code. `operator_workspace._atomic_write_text` now delegates to the helper (duplicate implementation removed).
+- **rm-078** — `mcp_compat` sync-tool offload now runs through an explicit `anyio.CapacityLimiter` sized by `HERMES_GPT_TOOL_THREAD_LIMIT` (default 40 = anyio's prior implicit default, zero behavior delta) with a rate-limited saturation warning; wiring/parse/warn-rate tests added. Deferred: admission-control queue timeout.
+- **rm-046** — `test_package_docs.py` shipped-docs guard (wheel data-files ⊆ MANIFEST.in, no duplicate includes, explicit unshipped-allowlist) with `docs/runtime-checkout.md` pinned unshipped until its host-state hygiene is refreshed; MANIFEST.in completed (15 missing doc includes, 3 nonexistent includes corrected).
+- **rm-080** — `docs/env-vars.md`: 92 non-test `HERMES_GPT_*` knobs with AST-verified defaults and owning module; `test_env_vars_docs.py` pins doc↔code sync in both directions; registered in pyproject data-files, MANIFEST.in, and docs/README.md.
+
+**Validation (pre-review):** targeted gate exit 0 over all 17 changed surfaces; full-suite gate exit 0 (`uv run python -m pytest -q -n 8` through `local_validation_gate.py`, admitted workers=2 under host load) — 1618 passed + 2 skipped, zero F/E marks; `ruff check .` clean.
+
+**Lessons:**
+1. **Stale `*.egg-info/SOURCES.txt` poisons in-place sdist builds.** Editing MANIFEST.in and running `python -m build` in-place leaves egg-info residue that silently re-adds removed files to every later sdist; it cost a long bisect during targeted tests (the failure reproduced even on a clean-HEAD tree until the residue was found). Remove `hermes_gpt.egg-info/` — or build from a clean copy — before asserting package contents. `tools/check_package_hygiene.py` builds in-place and shares this latent exposure; it should adopt a clean-copy build.
+2. **The engine's impacted-tests gate catches packaging regressions the focused suites miss** — two real failures surfaced only there: `atomic_write` missing from `[tool.setuptools] py-modules` (unimportable in the installed wheel) and host-state hygiene docs entering the sdist.
+3. **Env-knob audits need an AST pass, not grep.** Regex undercounts multi-line reads (38 names vs 90) and raw grep overcounts (96, including test-only); the AST pass is the authoritative 92.
+4. **Emit before the envelope expires.** The first targeted_tests attempt completed all work but lost its phase_result to the 3600s delegate timeout after exhaustive bisect forensics. Validate, fix, emit — do not spend the clock proving what already passed.
+
+**Next-cycle candidates (concrete, with context):**
+- **rm-076 (compatibility 125)** — 3-way skill-resolution reconciliation: the fork's 324-line FS-projection resolver vs upstream master 42ec9f10ec's 585-line loader-probe rewrite (`skill_view(..., preprocess=False)` — never-execute invariant) vs the two unlanded sibling branches (`conductor/run-cbd4463370ee` grammar-parity slice, `conductor/run-edd9fb12b6a4` earlier canonical impl). Build the reconciliation matrix before adopting.
+- **Adjudicate the unlanded `conductor/run-d4c4dc76f3b0` "Q3 repair pack"** (2026-09-13, 16 files: token_store env-wins key precedence + `_delete_keyring_key`, ui_security redaction shield, fleet reads, token rotation) — verified NOT in HEAD, disposition unrecorded; adopt-by-content vs supersession. rm-077's landed hunks deliberately stayed off its territory.
+- **rm-079** — ruff dev-pin bump to `>=0.16,<0.17` (one line; 0.16.9 current at the 2026-09-30 probe).
+- **rm-024** — Python 3.10 EOL was T-31d at cycle time; schedule the floor bump.
+- **Narrow remainders** — `_ensure_operator_tmpdir` still sets process-global env from worker threads (rm-045 fold: scope to subprocess argv/env); the Windows tmpdir path; `docs/runtime-checkout.md` host-state refresh then de-allowlist.

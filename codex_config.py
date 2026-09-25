@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import operator_policy as op_policy
+import atomic_write
 from codex_core import (
     CODEX_TOOLSET_ENV,
     CODEX_TOOLSETS,
@@ -164,14 +165,10 @@ def _write_direct(path: Path, argv: list[str], name: str = SERVER_NAME, toolset:
         return {"changed": False, "backup": None}
     path.parent.mkdir(parents=True, exist_ok=True)
     backup = _backup(path)
-    temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(updated, encoding="utf-8", newline="\n")
-    try:
-        read_config(temporary)
-        temporary.replace(path)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
+    # Stage uniquely, validate the staged TOML, then publish (rm-067).
+    atomic_write.atomic_write_text(
+        path, updated, mode=0o644, validate=read_config
+    )
     return {"changed": True, "backup": str(backup) if backup else None, "replaced_existing_entry": removed}
 
 
@@ -237,15 +234,12 @@ def uninstall(*, project: bool = False, cwd: Path | None = None, name: str = SER
     if not removed:
         return {"ok": True, "changed": False, "config_path": str(path), "message": f"No {name} entry exists."}
     backup = _backup(path)
-    temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(updated, encoding="utf-8", newline="\n")
-    try:
-        if updated.strip():
-            read_config(temporary)
-        temporary.replace(path)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
+    atomic_write.atomic_write_text(
+        path,
+        updated,
+        mode=0o644,
+        validate=(lambda staged: read_config(staged)) if updated.strip() else None,
+    )
     return {"ok": True, "changed": True, "config_path": str(path), "backup": str(backup) if backup else None, "removed": name}
 
 

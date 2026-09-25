@@ -60,6 +60,58 @@ def test_store_file_mode_is_0600(hermes_root):
     assert mode == 0o600
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows does not expose POSIX file modes")
+def test_secrets_dir_is_0700_and_key_file_0600(hermes_root, monkeypatch):
+    """rm-077: the secrets dir itself must be private, and the raw master
+    key must never exist at a permissive mode or a predictable temp name."""
+    monkeypatch.setattr(ts, "_store_key_in_keyring", lambda _key: False)
+    monkeypatch.setattr(ts, "_key_from_keyring", lambda: None)
+    os.chmod(hermes_root / "secrets", 0o755)  # simulate a pre-existing loose dir
+    key, _, source = ts._resolve_key(hermes_root)
+    assert source == "keyfile"
+    assert os.stat(hermes_root / "secrets").st_mode & 0o777 == 0o700
+    key_path = ts.key_file_path(hermes_root)
+    assert key_path.exists()
+    assert os.stat(key_path).st_mode & 0o777 == 0o600
+    assert key_path.read_bytes() == key
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows does not expose POSIX file modes")
+def test_no_fixed_name_tmp_files_remain_after_writes(hermes_root, monkeypatch):
+    monkeypatch.setattr(ts, "_store_key_in_keyring", lambda _key: False)
+    monkeypatch.setattr(ts, "_key_from_keyring", lambda: None)
+    ts._write_key_file(hermes_root, b"k" * 32)
+    ts._rotate_active_key(hermes_root)
+    ts._write_envelope(hermes_root, "kid", {"a": 1}, b"k" * 32)
+    names = {p.name for p in (hermes_root / "secrets").iterdir()}
+    for forbidden in (
+        "hermes_gpt_token_key.tmp",
+        "hermes_gpt_token_key.new",
+        "hermes_gpt_tokens.json.tmp",
+    ):
+        assert forbidden not in names
+    # every leftover (if any) must be a private, uniquely-named staging file
+    for leftover in names - {"hermes_gpt_token_key", "hermes_gpt_tokens.json"}:
+        assert os.stat(hermes_root / "secrets" / leftover).st_mode & 0o777 == 0o600
+
+
+def test_failed_rotation_keeps_old_key_intact(hermes_root, monkeypatch):
+    monkeypatch.setattr(ts, "_store_key_in_keyring", lambda _key: False)
+    monkeypatch.setattr(ts, "_key_from_keyring", lambda: None)
+    ts._write_key_file(hermes_root, b"o" * 32)
+    before = ts.key_file_path(hermes_root).read_bytes()
+
+    def exploding_write(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(ts.atomic_write, "atomic_write_bytes", exploding_write)
+    result = ts._rotate_active_key(hermes_root)
+    assert result == {"outcome": "failed", "source": "keyfile"}
+    assert ts.key_file_path(hermes_root).read_bytes() == before
+    # no staging debris from the failed write
+    assert [p.name for p in (hermes_root / "secrets").iterdir()] == ["hermes_gpt_token_key"]
+
+
 def test_windows_store_lock_uses_one_byte_region(hermes_root, monkeypatch):
     calls = []
 

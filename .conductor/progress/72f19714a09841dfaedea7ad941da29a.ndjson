@@ -1,0 +1,2 @@
+{"step":1,"ts":"2026-09-29T19:43:13Z","summary":"research phase start: deps inventory + remotes + roadmap open items","touched":[".conductor/progress/72f19714a09841dfaedea7ad941da29a.ndjson"]}
+{"step":2,"ts":"2026-09-29T19:46:42Z","summary":"evidence gathered: upstream +8 commits (5 skill-resolution on master), PyPI collision, ruff pin stale, spec/deps current","touched":[".conductor/progress/72f19714a09841dfaedea7ad941da29a.ndjson"]}

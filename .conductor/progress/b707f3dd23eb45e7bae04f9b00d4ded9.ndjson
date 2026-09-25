@@ -1,0 +1,11 @@
+{"step":1,"ts":"2026-09-29T20:07:20Z","summary":"implement opened in run worktree 14530e3e79; batch rm-077/067r/078/046/080","touched":[]}
+{"step":2,"ts":"2026-09-29T20:09:56Z","summary":"atomic_write.py helper + 9 tests; concurrency race test green","touched":["atomic_write.py","test_atomic_write.py"]}
+{"step":3,"ts":"2026-09-29T20:11:02Z","summary":"rm-077: token_store 3 sites on atomic_write (0700 dir, 0600 O_EXCL, fsync); 4 new tests green","touched":["token_store.py","test_token_store.py"]}
+{"step":4,"ts":"2026-09-29T20:12:43Z","summary":"rm-067r: 12 sites adopted atomic_write; _ENV_WRITE_LOCK + _TMPDIR_LOCK added","touched":["operator_config.py","codex_config.py","operator_swarm.py","operator_session.py","operator_codex.py","operator_runners.py","operator_workspace.py"]}
+{"step":8,"ts":"2026-09-29T20:16:52Z","summary":"rm-078: explicit CapacityLimiter + HERMES_GPT_TOOL_THREAD_LIMIT knob + rate-limited saturation warning in mcp_compat","touched":["mcp_compat.py"]}
+{"step":9,"ts":"2026-09-29T20:18:33Z","summary":"rm-078 tests: knob default/malformed parse, limiter wiring, rate-limited saturation warn - 19/19 green","touched":["test_mcp_compat.py"]}
+{"step":10,"ts":"2026-09-29T20:20:36Z","summary":"rm-080: wrote docs/env-vars.md - 93 HERMES_GPT_* knobs grouped with exact code defaults","touched":["docs/env-vars.md"]}
+{"step":10,"ts":"2026-09-29T20:23:36Z","summary":"rm-046+rm-080 done: MANIFEST 15 docs, pyproject+README rows, guard tests, CHANGELOG","touched":["MANIFEST.in","pyproject.toml","docs/README.md","docs/env-vars.md","test_package_docs.py","test_env_vars_docs.py","CHANGELOG.md"]}
+{"step":11,"ts":"2026-09-29T20:27:27Z","summary":"fabric_artifacts 226/597 streaming sites converted to unique staging; final battery green","touched":["fabric_artifacts.py","atomic_write.py"]}
+{"step":12,"ts":"2026-09-29T20:28:58Z","summary":"phase_result JSON written+validated to delegate spool; implement phase closed","touched":["/home/agent/.hermes/conductor-delegate-spool-infra-deploy/delegate/b707f3dd23eb45e7bae04f9b00d4ded9.json"]}
+{"step":12,"ts":"2026-09-29T20:29:06Z","summary":"phase_result JSON written+validated to delegate spool; implement phase closed","touched":["/home/agent/.hermes/conductor-delegate-spool-infra-deploy/delegate/b707f3dd23eb45e7bae04f9b00d4ded9.json"]}
