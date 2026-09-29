@@ -258,3 +258,60 @@ def test_composed_websocket_reuses_server_bearer_boundary(hermes_root: Path, mon
         ) as ws:
             ws.send_json({"action": "ping"})
             assert ws.receive_json()["type"] == "pong"
+
+
+# ── rm-080: read_since cursor high-watermark semantics ─────────────────────
+
+
+def test_read_since_advances_cursor_to_high_watermark_when_no_more_matches(hermes_root):
+    """A non-truncated filtered page advances the cursor past non-matching events.
+
+    Pre-fix, the clamp ``max(next, min(high, next))`` was a tautology and the
+    per-poll ``MAX(seq)`` query was dead work: filtered streams rescanned
+    every non-matching row above the last match on each poll.
+    """
+    live.publish_event(topic="t1", kind="k", subject_type="s", subject_id="a", source="test", payload={}, hermes_root=hermes_root)
+    live.publish_event(topic="t2", kind="k", subject_type="s", subject_id="b", source="test", payload={}, hermes_root=hermes_root)
+    c = live.publish_event(topic="t1", kind="k", subject_type="s", subject_id="c", source="test", payload={}, hermes_root=hermes_root)
+
+    events, next_cursor = live.read_since(0, topic="t2", hermes_root=hermes_root)
+    assert len(events) == 1
+    # The page is not truncated: every row above the last match is known
+    # non-matching, so the cursor advances to the global high watermark.
+    assert next_cursor == c["seq"]
+
+    events2, next_cursor2 = live.read_since(next_cursor, topic="t2", hermes_root=hermes_root)
+    assert events2 == []
+    assert next_cursor2 == c["seq"]
+
+
+def test_read_since_truncated_page_keeps_cursor_at_last_match(hermes_root):
+    """A full page never advances past its last delivered match.
+
+    Otherwise a client could skip un-fetched matching events entirely.
+    """
+    seqs = [
+        live.publish_event(topic="t1", kind="k", subject_type="s", subject_id=f"s{i}", source="test", payload={}, hermes_root=hermes_root)["seq"]
+        for i in range(3)
+    ]
+    events, next_cursor = live.read_since(0, topic="t1", limit=2, hermes_root=hermes_root)
+    assert len(events) == 2
+    assert next_cursor == seqs[1]  # NOT the high watermark: the page may be truncated
+
+    events2, _ = live.read_since(next_cursor, topic="t1", limit=2, hermes_root=hermes_root)
+    assert len(events2) == 1  # the third matching event is still delivered
+
+
+def test_read_since_no_match_advances_cursor(hermes_root):
+    """With zero matches, the cursor still advances to the high watermark."""
+    live.publish_event(topic="t1", kind="k", subject_type="s", subject_id="a", source="test", payload={}, hermes_root=hermes_root)
+    b = live.publish_event(topic="t1", kind="k", subject_type="s", subject_id="b", source="test", payload={}, hermes_root=hermes_root)
+
+    events, next_cursor = live.read_since(0, topic="other", hermes_root=hermes_root)
+    assert events == []
+    assert next_cursor == b["seq"]
+    # And a later matching event above the watermark is still delivered.
+    c = live.publish_event(topic="other", kind="k", subject_type="s", subject_id="c", source="test", payload={}, hermes_root=hermes_root)
+    events2, _ = live.read_since(next_cursor, topic="other", hermes_root=hermes_root)
+    assert [e["seq"] for e in events2] == [c["seq"]]
+

@@ -263,14 +263,27 @@ def read_since(
             args.append(value)
     args.append(limit)
     with _connect(path, write=False) as db:
+        # rm-080: read the high watermark BEFORE the filtered page. Both
+        # statements run as separate read snapshots; taking `high` first
+        # keeps the advance conservative — a row inserted between the two
+        # statements either appears in the page (delivered, cursor follows
+        # it) or sits above `high` (cursor stops short of it, next poll
+        # rescans it). It can never be skipped.
+        high = db.execute("SELECT COALESCE(MAX(seq),0) FROM live_events").fetchone()[0]
         rows = db.execute(
             f"SELECT * FROM live_events WHERE {' AND '.join(clauses)} ORDER BY seq ASC LIMIT ?",
             tuple(args),
         ).fetchall()
-        high = db.execute("SELECT COALESCE(MAX(seq),0) FROM live_events").fetchone()[0]
     events = [_row_event(row) for row in rows]
     next_cursor = events[-1]["seq"] if events else cursor
-    return events, max(next_cursor, min(int(high or 0), next_cursor))
+    if len(events) < limit:
+        # The page is not truncated, so every row above the last match in
+        # this snapshot is non-matching — advance the cursor to the high
+        # watermark instead of rescanning those rows on every poll. On a
+        # truncated page the cursor stays on the last delivered match so
+        # no matching event is skipped.
+        next_cursor = max(next_cursor, int(high or 0))
+    return events, next_cursor
 
 
 def high_watermark(hermes_root: Path | None = None) -> int:
@@ -353,7 +366,10 @@ async def _websocket_endpoint(
     try:
         while True:
             try:
-                events, next_cursor = read_since(
+                # rm-076: read_since does blocking sqlite work (connect
+                # plus two queries) — keep it off the serving event loop.
+                events, next_cursor = await asyncio.to_thread(
+                    read_since,
                     cursor,
                     mission_id=mission_id,
                     topic=topic,

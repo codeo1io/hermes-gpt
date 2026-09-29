@@ -687,3 +687,32 @@ def test_mission_profile_summary_uses_state_pid_for_json_pid_file(hermes_root):
     )
     summary = om._profile_summary("default", hermes_root, [])
     assert summary.get("gateway_running") is True
+
+
+# ── rm-078: UI mount health surfaces in doctor ─────────────────────────────
+
+
+def test_doctor_warns_on_recorded_ui_mount_failure(hermes_root, clean_env, audit_override):
+    """A recorded ui_mount failure is a WARN, not silence."""
+    op.audit_record(
+        tool="ui_mount",
+        level="read_only",
+        apply_mode="direct",
+        dry_run=False,
+        success=False,
+        summary="UI mount skipped: ImportError: import of ui_api halted",
+        error="ImportError: import of ui_api halted",
+    )
+    parsed = json.loads(od.hermes_operator_doctor(profile="default", hermes_root=hermes_root))
+    check = parsed["checks"]["ui_mount"]
+    assert check["status"] == od.STATUS_WARN
+    assert check["code"] == "UI_MOUNT_FAILED"
+    assert "UI mount" in check["message"]
+
+
+def test_doctor_ui_mount_check_passes_without_failures(hermes_root, clean_env, audit_override):
+    """No recorded ui_mount failure -> PASS."""
+    parsed = json.loads(od.hermes_operator_doctor(profile="default", hermes_root=hermes_root))
+    check = parsed["checks"]["ui_mount"]
+    assert check["status"] == od.STATUS_PASS
+    assert check["code"] == "UI_MOUNT_HEALTHY"

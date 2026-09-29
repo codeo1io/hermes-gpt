@@ -558,3 +558,77 @@ def test_action_cron_run_long_running_dispatched_202(client, monkeypatch, tmp_pa
     assert calls and calls[0]["job_id"] == "j1"
     assert calls[0]["dry_run"] is False
     assert calls[0]["hermes_root"]  # resolved server-side, never client-supplied
+
+
+def test_ui_mount_failure_is_operator_visible(tmp_path, monkeypatch):
+    """rm-078: a failed UI mount must not degrade to a single stderr line.
+
+    With the UI explicitly enabled, a broken ``ui_api`` import keeps the
+    MCP-only server booting but now records an audit entry, publishes a live
+    event, and surfaces as a doctor WARN.
+    """
+    import sys
+
+    import operator_diagnostics
+    import operator_events
+    import server
+
+    home = tmp_path / "home"
+    (home / "profiles" / "default").mkdir(parents=True)
+    # The audit-log path resolution prefers <HERMES_HOME>/logs once it exists.
+    (home / "logs").mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_GPT_UI_ENABLED", "1")
+    # Make `import ui_api` fail exactly as a broken/unbuilt install would.
+    monkeypatch.setitem(sys.modules, "ui_api", None)
+
+    # Pin the audit log explicitly: ``audit_record`` honors any audit override
+    # still set by an earlier test in this xdist worker (several operator test
+    # files set overrides), while the events reader below always reads
+    # <hermes_root>/logs — pinning keeps write and read on the same file
+    # regardless of ambient state.
+    import operator_policy as op_policy
+
+    op_policy.set_audit_log_override(
+        home / "logs" / "hermes_gpt_operator_audit.jsonl"
+    )
+    try:
+        built = server.build_server(http=True)
+        app = server.build_asgi_app(built, http=True)
+        # Server still boots MCP-only: the full middleware stack serves requests.
+        from starlette.testclient import TestClient
+
+        with TestClient(app) as client:
+            assert client.get("/").status_code in (200, 400, 401, 403, 404)
+
+        envelope = json.loads(
+            operator_events.hermes_events_query(limit=20, hermes_root=home)
+        )
+        # The mount failure is queryable in Mission Control via the audit source
+        # (kind=tool_call, tool ref=ui_mount, status error); the live-events source
+        # is push-only, so it is asserted directly below via read_since.
+        audit_hits = [
+            e
+            for e in envelope["events"]
+            if e.get("kind") == "tool_call"
+            and "ui_mount" in e.get("refs", [])
+            and e.get("status_after") == "error"
+        ]
+        assert audit_hits, envelope["events"]
+
+        import operator_live_events
+
+        live_events, _ = operator_live_events.read_since(0, hermes_root=home)
+        assert any(
+            e.get("kind") == "ui_mount_failed" and e.get("source") == "server"
+            for e in live_events
+        )
+
+        doctor = json.loads(
+            operator_diagnostics.hermes_operator_doctor(profile="default", hermes_root=home)
+        )
+        check = doctor["checks"]["ui_mount"]
+        assert check["status"] == operator_diagnostics.STATUS_WARN
+        assert check["code"] == "UI_MOUNT_FAILED"
+    finally:
+        op_policy.set_audit_log_override(None)

@@ -262,3 +262,41 @@ def test_events_calls_are_audited(hermes_root, tmp_path):
         assert all(r["changed"] is False for r in records)  # read-only
     finally:
         op.set_audit_log_override(None)
+
+
+# ── rm-079: boundary filtering on both event surfaces ─────────────────────
+
+
+def test_query_and_tail_warn_and_report_only_allowed_sources(hermes_root, monkeypatch):
+    """Both surfaces filter once at the boundary, warn, and report truthfully.
+
+    Pre-fix, only the query path warned (about a subset computed just for the
+    warning), the tail path never warned, and both envelopes listed sources
+    in ``sources_queried`` that the allowlist had actually prevented from
+    being queried.
+    """
+    _seed_all_sources(hermes_root)
+    monkeypatch.setenv(ev.EVENTS_ALLOWED_SOURCES_ENV, "audit")
+
+    tail = json.loads(ev.hermes_events_tail(limit=5, hermes_root=hermes_root))
+    assert tail["sources_queried"] == ["audit"]
+    assert any("dropped by allowlist" in w for w in tail["warnings"])
+
+    query = json.loads(ev.hermes_events_query(limit=5, hermes_root=hermes_root))
+    assert query["sources_queried"] == ["audit"]  # truthful: not EVENT_SOURCES
+    assert query["sources_allowed"] == ["audit"]
+    assert any("dropped by allowlist" in w for w in query["warnings"])
+
+
+def test_query_and_tail_do_not_warn_without_allowlist(hermes_root, monkeypatch):
+    """No allowlist restriction -> no warning noise on either surface."""
+    _seed_all_sources(hermes_root)
+    monkeypatch.delenv(ev.EVENTS_ALLOWED_SOURCES_ENV, raising=False)
+
+    tail = json.loads(ev.hermes_events_tail(limit=5, hermes_root=hermes_root))
+    assert set(tail["sources_queried"]) == set(ev.EVENT_SOURCES)
+    assert tail["warnings"] == []
+
+    query = json.loads(ev.hermes_events_query(limit=5, hermes_root=hermes_root))
+    assert set(query["sources_queried"]) == set(ev.EVENT_SOURCES)
+    assert query["warnings"] == []
