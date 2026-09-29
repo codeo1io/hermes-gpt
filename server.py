@@ -3091,22 +3091,18 @@ def _signal_ui_mount_failure(exc: Exception) -> None:
     """Make a failed UI mount operator-visible.
 
     The UI is opt-in, but an explicitly-enabled UI failing to mount used to be
-    visible only as a single stderr line. Emit an audit record and a live
-    event so ``hermes_events_query``, Mission Control and ``doctor`` surface
-    the degraded UI. Both signals are best-effort: reporting a failed mount
-    must never prevent the MCP-only server from starting.
+    visible only as a single stderr line. Emit the durable ui_mount state
+    marker plus an audit record and a live event so ``hermes_events_query``,
+    Mission Control and ``doctor`` surface the degraded UI. rm-093: the
+    state marker is doctor's authority — unlike the audit tail it survives
+    audit churn and rotation. All signals are best-effort: reporting a
+    failed mount must never prevent the MCP-only server from starting.
     """
     detail = f"{exc.__class__.__name__}: {exc}"
     try:
-        op_policy.audit_record(
-            tool="ui_mount",
-            level="read_only",
-            apply_mode="direct",
-            dry_run=False,
-            success=False,
-            summary=f"UI mount skipped: {detail[:200]}",
-            error=detail[:300],
-        )
+        # rm-093: one policy helper writes the persistent marker AND the
+        # audit record (Mission Control / events surfaces).
+        op_policy.record_ui_mount_failure(exc)
     except Exception:  # noqa: BLE001
         eprint("ui mount failure audit record could not be written")
     try:
@@ -3190,7 +3186,10 @@ def build_asgi_app(server: FastMCP, *, http: bool) -> Any:
             return oauth_auth.authorization_metadata(request, oauth_state)
 
         async def authorize(request: Request) -> Response:
-            return oauth_auth.authorize(request, oauth_state)
+            # rm-092: authorize() is sync and reads the durable store while
+            # issuing the code; the offloaded wrapper keeps that IO off the
+            # serving loop.
+            return await oauth_auth.authorize_async(request, oauth_state)
 
         async def token(request: Request) -> JSONResponse:
             return await oauth_auth.token(request, oauth_state)
@@ -3222,9 +3221,17 @@ def build_asgi_app(server: FastMCP, *, http: bool) -> Any:
             import ui_api
 
             routes.extend(ui_api.routes())
+            # rm-093: a successful mount is durable doctor evidence too —
+            # it clears any earlier failed-mount marker (best-effort).
+            op_policy.write_ui_mount_state("healthy")
         except Exception as exc:  # noqa: BLE001
             eprint(f"UI mount skipped: {exc.__class__.__name__}: {exc}")
             _signal_ui_mount_failure(exc)
+    else:
+        # rm-093: UI not enabled — record that so a stale failure marker
+        # from an earlier run does not keep warning about a surface that
+        # is no longer enabled (best-effort, never blocks startup).
+        op_policy.write_ui_mount_state("disabled")
     # v0.9 live-event delivery is read-only and remains behind the same outer
     # Bearer/OAuth middleware as MCP and the browser UI.
     routes.extend(

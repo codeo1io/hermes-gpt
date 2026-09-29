@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -848,72 +849,91 @@ class OAuthState:
         nonce = item["nonce"]
         if nonce in self.used_auth_codes or item.get("expires_at", 0) <= time.time():
             raise OAuthError("invalid_grant", "Invalid, expired, or already used authorization code.")
-        if item.get("client_id") != client_id or item.get("redirect_uri") != redirect_uri:
-            raise OAuthError("invalid_grant", "Authorization code validation failed.")
-        challenge = item.get("code_challenge", "")
-        # PKCE verification is mode-dependent. "required" (default): a code
-        # without a stored S256 challenge (e.g. issued before PKCE
-        # enforcement, or by a bypassed authorize path) can never be exchanged
-        # — fail closed instead of skipping verification. "optional": a
-        # challenge-less code (pre-2026-08-31 compat) is only redeemable by a
-        # confidential client — the token endpoint authenticates it with the
-        # client_secret (see _authenticate_client / the ``confidential``
-        # argument); a public/secretless client must always redeem via PKCE.
-        if not challenge and (self.config.pkce_mode != "optional" or not confidential):
-            raise OAuthError("invalid_grant", "Authorization code validation failed.")
-        if challenge:
-            if not _valid_pkce_verifier(code_verifier) or not hmac.compare_digest(_s256(code_verifier), challenge):
-                raise OAuthError("invalid_grant", "Authorization code validation failed.")
-
-        scope = self.normalize_scope(item["scope"])
-        self._require_capacity(self.used_auth_codes, self.max_auth_codes, "Authorization-code replay cache")
-        self._require_capacity(self.access_tokens, self.max_access_tokens, "Access-token")
-        self._require_capacity(self.refresh_tokens, self.max_refresh_tokens, "Refresh-token")
-
-        access_value, access_item = self._new_access_token(
-            client_id=client_id,
-            scope=scope,
-            resource=item["resource"],
-        )
-        response: dict[str, Any] = {
-            "access_token": access_value,
-            "token_type": "Bearer",
-            "expires_in": ACCESS_TOKEN_TTL_SECONDS,
-            "scope": scope,
-        }
-        # 2026-09-06 outage fix: EVERY code exchange now issues a refresh
-        # token. The connector's scheme flow authorizes scope=hermes (no
-        # offline_access), so its credential could never self-heal after a
-        # client-side eviction — the connector then 401-loops forever.
-        # Refresh tokens are bound to the client and rotated on every use;
-        # issuing one unconditionally cannot escalate scope (a narrowed
-        # refresh request is still subset-checked at exchange time).
-        refresh_value, refresh_item = self._new_refresh_token(client_id=client_id, scope=scope)
-        response["refresh_token"] = refresh_value
-
-        self.used_auth_codes[nonce] = {"expires_at": item["expires_at"]}
-        self.access_tokens[access_value] = access_item
-        if refresh_item is not None:
-            self.refresh_tokens[refresh_value] = refresh_item
-        # Durable persistence is part of the exchange contract in server
-        # mode: never hand out credentials that were not durably committed.
+        # Review fix (rm-092): the token endpoint runs exchange bodies on
+        # worker threads (asyncio.to_thread), so the single-use replay guard
+        # must be an atomic reservation -- check-then-act let two racing
+        # exchanges of one code both pass the membership check above and
+        # both mint single-use credentials. setdefault is the one-step
+        # claim; identity comparison distinguishes "we won" from "taken",
+        # and the reservation carries the final entry shape so cleanup()
+        # keeps treating it as a live record.
+        reservation = {"expires_at": item["expires_at"]}
+        if self.used_auth_codes.setdefault(nonce, reservation) is not reservation:
+            raise OAuthError("invalid_grant", "Invalid, expired, or already used authorization code.")
         try:
-            _run_persist_hook_strict(self, "authorization_code")
-        except OAuthError:
-            self.access_tokens.pop(access_value, None)
+            if item.get("client_id") != client_id or item.get("redirect_uri") != redirect_uri:
+                raise OAuthError("invalid_grant", "Authorization code validation failed.")
+            challenge = item.get("code_challenge", "")
+            # PKCE verification is mode-dependent. "required" (default): a code
+            # without a stored S256 challenge (e.g. issued before PKCE
+            # enforcement, or by a bypassed authorize path) can never be exchanged
+            # — fail closed instead of skipping verification. "optional": a
+            # challenge-less code (pre-2026-08-31 compat) is only redeemable by a
+            # confidential client — the token endpoint authenticates it with the
+            # client_secret (see _authenticate_client / the ``confidential``
+            # argument); a public/secretless client must always redeem via PKCE.
+            if not challenge and (self.config.pkce_mode != "optional" or not confidential):
+                raise OAuthError("invalid_grant", "Authorization code validation failed.")
+            if challenge:
+                if not _valid_pkce_verifier(code_verifier) or not hmac.compare_digest(_s256(code_verifier), challenge):
+                    raise OAuthError("invalid_grant", "Authorization code validation failed.")
+
+            scope = self.normalize_scope(item["scope"])
+            self._require_capacity(self.used_auth_codes, self.max_auth_codes, "Authorization-code replay cache")
+            self._require_capacity(self.access_tokens, self.max_access_tokens, "Access-token")
+            self._require_capacity(self.refresh_tokens, self.max_refresh_tokens, "Refresh-token")
+
+            access_value, access_item = self._new_access_token(
+                client_id=client_id,
+                scope=scope,
+                resource=item["resource"],
+            )
+            response: dict[str, Any] = {
+                "access_token": access_value,
+                "token_type": "Bearer",
+                "expires_in": ACCESS_TOKEN_TTL_SECONDS,
+                "scope": scope,
+            }
+            # 2026-09-06 outage fix: EVERY code exchange now issues a refresh
+            # token. The connector's scheme flow authorizes scope=hermes (no
+            # offline_access), so its credential could never self-heal after a
+            # client-side eviction — the connector then 401-loops forever.
+            # Refresh tokens are bound to the client and rotated on every use;
+            # issuing one unconditionally cannot escalate scope (a narrowed
+            # refresh request is still subset-checked at exchange time).
+            refresh_value, refresh_item = self._new_refresh_token(client_id=client_id, scope=scope)
+            response["refresh_token"] = refresh_value
+
+            # The nonce has been reserved atomically above (review fix): the
+            # reservation already holds the final used-code entry.
+            self.access_tokens[access_value] = access_item
             if refresh_item is not None:
-                self.refresh_tokens.pop(refresh_value, None)
+                self.refresh_tokens[refresh_value] = refresh_item
+            # Durable persistence is part of the exchange contract in server
+            # mode: never hand out credentials that were not durably committed.
+            try:
+                _run_persist_hook_strict(self, "authorization_code")
+            except OAuthError:
+                self.access_tokens.pop(access_value, None)
+                if refresh_item is not None:
+                    self.refresh_tokens.pop(refresh_value, None)
+                raise
+            except Exception as exc:
+                self.access_tokens.pop(access_value, None)
+                if refresh_item is not None:
+                    self.refresh_tokens.pop(refresh_value, None)
+                raise OAuthError(
+                    "temporarily_unavailable",
+                    "Token persistence failed; no credentials were issued.",
+                    status_code=503,
+                ) from exc
+            return response
+        except BaseException:
+            # A failed exchange must not burn the code: release the
+            # reservation so the client can retry (e.g. corrected verifier).
+            if self.used_auth_codes.get(nonce) is reservation:
+                del self.used_auth_codes[nonce]
             raise
-        except Exception as exc:
-            self.access_tokens.pop(access_value, None)
-            if refresh_item is not None:
-                self.refresh_tokens.pop(refresh_value, None)
-            raise OAuthError(
-                "temporarily_unavailable",
-                "Token persistence failed; no credentials were issued.",
-                status_code=503,
-            ) from exc
-        return response
 
     def validate_refresh_token_grant(self, refresh_token: str, client_id: str) -> dict[str, Any]:
         """Validate a refresh grant against the authoritative durable envelope.
@@ -964,59 +984,80 @@ class OAuthState:
         if not set(scope.split()).issubset(original_scope.split()):
             raise OAuthError("invalid_scope", "Requested scope exceeds the originally granted scope.")
 
-        self._require_capacity(self.access_tokens, self.max_access_tokens, "Access-token")
-        access_value, access_item = self._new_access_token(
-            client_id=client_id,
-            scope=scope,
-            resource=self.config.resource,
-        )
-        rotated_value, rotated_item = self._new_refresh_token(client_id=client_id, scope=scope)
+        # Review fix (rm-092): standalone (no durable root) rotation also
+        # runs on worker threads; consume the presented token atomically
+        # (pop-as-claim, restore on failure) instead of check-then-act --
+        # two racing rotations of one token used to both succeed. The
+        # durable lane keeps exchange_commit as its single atomic gate.
+        claimed: dict[str, Any] | None = None
+        if self._hermes_root is None:
+            claimed = self.refresh_tokens.pop(refresh_token, None)
+            if claimed is None:
+                raise OAuthError("invalid_grant", "Invalid, expired, or already used refresh token.")
+        try:
+            self._require_capacity(self.access_tokens, self.max_access_tokens, "Access-token")
+            access_value, access_item = self._new_access_token(
+                client_id=client_id,
+                scope=scope,
+                resource=self.config.resource,
+            )
+            rotated_value, rotated_item = self._new_refresh_token(client_id=client_id, scope=scope)
 
-        if self._hermes_root is not None:
-            # Atomic consume+issue: the presented refresh token is retired
-            # and its replacements published in ONE transaction, so racing
-            # peers cannot both spend the same token.
-            import token_store
+            if self._hermes_root is not None:
+                # Atomic consume+issue: the presented refresh token is retired
+                # and its replacements published in ONE transaction, so racing
+                # peers cannot both spend the same token.
+                import token_store
 
-            try:
-                token_store.exchange_commit(
-                    self._hermes_root,
-                    source_epoch=self._epoch,
-                    presented_kind="refresh",
-                    presented_value=refresh_token,
-                    issue={
-                        token_store.issue_key("access", access_value): _durable_record("access", access_value, access_item),
-                        token_store.issue_key("refresh", rotated_value): _durable_record("refresh", rotated_value, rotated_item),
-                    },
-                )
-            except token_store.TokenStoreError as exc:
-                # Revoked/stale/spent: the exchange fails without publishing.
-                self.refresh_tokens.pop(refresh_token, None)
-                self.access_tokens.pop(access_value, None)
-                self._sync_epoch_for_fresh_grant()
-                raise OAuthError(
-                    "invalid_grant",
-                    "Refresh token could not be durably exchanged.",
-                ) from exc
-        self.refresh_tokens.pop(refresh_token, None)
-        self._retired_refresh_tokens.add(refresh_token)
-        self.refresh_tokens[rotated_value] = rotated_item
-        self.access_tokens[access_value] = access_item
-        return {
-            "access_token": access_value,
-            "token_type": "Bearer",
-            "expires_in": ACCESS_TOKEN_TTL_SECONDS,
-            "refresh_token": rotated_value,
-            "scope": scope,
-        }
+                try:
+                    token_store.exchange_commit(
+                        self._hermes_root,
+                        source_epoch=self._epoch,
+                        presented_kind="refresh",
+                        presented_value=refresh_token,
+                        issue={
+                            token_store.issue_key("access", access_value): _durable_record("access", access_value, access_item),
+                            token_store.issue_key("refresh", rotated_value): _durable_record("refresh", rotated_value, rotated_item),
+                        },
+                    )
+                except token_store.TokenStoreError as exc:
+                    # Revoked/stale/spent: the exchange fails without publishing.
+                    self.refresh_tokens.pop(refresh_token, None)
+                    self.access_tokens.pop(access_value, None)
+                    self._sync_epoch_for_fresh_grant()
+                    raise OAuthError(
+                        "invalid_grant",
+                        "Refresh token could not be durably exchanged.",
+                    ) from exc
+            self.refresh_tokens.pop(refresh_token, None)
+            self._retired_refresh_tokens.add(refresh_token)
+            self.refresh_tokens[rotated_value] = rotated_item
+            self.access_tokens[access_value] = access_item
+            return {
+                "access_token": access_value,
+                "token_type": "Bearer",
+                "expires_in": ACCESS_TOKEN_TTL_SECONDS,
+                "refresh_token": rotated_value,
+                "scope": scope,
+            }
+        except BaseException:
+            # A failed standalone rotation must not burn the presented
+            # token: restore the claim so the client can retry.
+            if claimed is not None:
+                self.refresh_tokens.setdefault(refresh_token, claimed)
+            raise
 
     def _durable_access_token_valid(self, token_value: str) -> bool:
         """Validate bearer presence against the authoritative durable envelope.
 
-        A clustered peer may not have the token in process memory, so a cache
-        miss is resolved by reading the shared durable store. Conversely, once
-        revocation removes that envelope, an already-cached token is rejected
-        immediately instead of being resurrected solely from its MAC.
+        A clustered peer may not have the token in process memory, so every
+        server-mode call resolves against the shared durable store — there is
+        no in-memory shortcut: a MAC plus a cached record alone is never
+        enough. Conversely, once revocation removes that envelope, an
+        already-cached token is rejected immediately instead of being
+        resurrected solely from its MAC. Serving-loop callers run this via
+        ``asyncio.to_thread`` (rm-092) because the lookup opens a fresh
+        sqlite connection (busy_timeout=15000) per request.
         """
         if self._hermes_root is None:
             item = self.access_tokens.get(token_value)
@@ -1364,18 +1405,27 @@ class BearerAuthMiddleware:
         headers = {key.lower(): value for key, value in scope.get("headers") or []}
         authorization = headers.get(b"authorization", b"").decode("latin-1")
         supplied = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
-        if not validate_bearer_token(supplied, self.state, static_token=expected_static):
-            challenge = "Bearer"
-            if self.state is not None:
-                metadata = f"{self.state.config.issuer}/.well-known/oauth-protected-resource"
-                challenge = f'Bearer realm="hermes-gpt", resource_metadata="{metadata}"'
-            response = JSONResponse(
-                {"error": "unauthorized"},
-                status_code=401,
-                headers={"WWW-Authenticate": challenge},
-            )
-            await response(scope, receive, send)
-            return
+        # rm-092: the static-bearer compare is pure CPU and stays on the
+        # loop; the OAuthState lane resolves the durable revocation envelope
+        # through sqlite (fresh connection, busy_timeout=15000) on every
+        # authenticated request, so it is offloaded per the rm-076 pattern —
+        # a contended store must stall one request, never the whole loop
+        # (this __call__ is also the WS handshake path).
+        if not validate_bearer_token(supplied, None, static_token=expected_static):
+            if self.state is None or not await asyncio.to_thread(
+                self.state.validate_access_token, supplied
+            ):
+                challenge = "Bearer"
+                if self.state is not None:
+                    metadata = f"{self.state.config.issuer}/.well-known/oauth-protected-resource"
+                    challenge = f'Bearer realm="hermes-gpt", resource_metadata="{metadata}"'
+                response = JSONResponse(
+                    {"error": "unauthorized"},
+                    status_code=401,
+                    headers={"WWW-Authenticate": challenge},
+                )
+                await response(scope, receive, send)
+                return
         await self.app(scope, receive, send)
 
 
@@ -1580,7 +1630,10 @@ async def register_client(request: Request, state: OAuthState) -> JSONResponse:
         if not isinstance(redirect_uris, list):
             raise OAuthError("invalid_redirect_uri", "redirect_uris must be a JSON array.")
         client = state.register_dynamic_client(redirect_uris)
-        _run_persist_hook(state, "register_client")
+        # rm-092: the persist hook writes the durable store (save_tokens +
+        # commit_tokens under flock); offload so /oauth/register cannot
+        # stall the serving loop.
+        await asyncio.to_thread(_run_persist_hook, state, "register_client")
         return JSONResponse(client.as_public_dict(), status_code=201)
     except OAuthError as exc:
         return _error_response(exc)
@@ -1648,6 +1701,19 @@ def _authenticate_client(request: Request, form: dict[str, list[str]], state: OA
     return client.client_id
 
 
+async def authorize_async(request: Request, state: OAuthState) -> JSONResponse | RedirectResponse:
+    """Async serving wrapper for the sync authorize body.
+
+    authorize() is synchronous and issuing a code reads the durable
+    revocation epoch (sqlite3.connect with busy_timeout=15000); a serving
+    loop that calls it inline blocks every concurrent request for as long
+    as the store read blocks. Serving mounts must use this wrapper.
+    """
+    # Review fix (rm-092 remainder): offload the sync body to a worker
+    # thread, mirroring the token() endpoint's exchange offloads below.
+    return await asyncio.to_thread(authorize, request, state)
+
+
 async def token(request: Request, state: OAuthState) -> JSONResponse:
     try:
         content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
@@ -1676,8 +1742,12 @@ async def token(request: Request, state: OAuthState) -> JSONResponse:
         if grant_type not in {"authorization_code", "refresh_token"}:
             raise OAuthError("unsupported_grant_type", "The requested grant type is not supported.")
         client_id = _authenticate_client(request, form, state)
+        # rm-092: exchanges read+write the durable store (durable lookup,
+        # exchange_commit under flock, busy_timeout); keep them off the
+        # serving loop per the rm-076 pattern.
         if grant_type == "authorization_code":
-            response = state.exchange_authorization_code(
+            response = await asyncio.to_thread(
+                state.exchange_authorization_code,
                 code=_form_value(form, "code"),
                 client_id=client_id,
                 redirect_uri=_form_value(form, "redirect_uri"),
@@ -1688,7 +1758,8 @@ async def token(request: Request, state: OAuthState) -> JSONResponse:
             refresh_token = _form_value(form, "refresh_token")
             if not refresh_token:
                 raise OAuthError("invalid_request", "refresh_token is required.")
-            response = state.exchange_refresh_token(
+            response = await asyncio.to_thread(
+                state.exchange_refresh_token,
                 refresh_token=refresh_token,
                 client_id=client_id,
                 requested_scope=_form_value(form, "scope"),

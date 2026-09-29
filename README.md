@@ -326,7 +326,7 @@ Do not silently substitute one name for the other when generating tool calls.
 
 When Hermes already has authenticated peers in its local A2A registry, Hermes GPT can route bounded work to named peers through `hermes_fleet_*`.
 
-Callers cannot provide arbitrary peer URLs or bearer tokens. Real dispatch remains constrained by Operator level, direct mode, confirmation, the local registry, and the server-controlled fleet authority manifest. See [Operator Mode](docs/operator-mode.md#fleet-routing-through-the-local-a2a-registry).
+Callers cannot provide arbitrary peer URLs or bearer tokens. Real dispatch remains constrained by Operator level, direct mode, confirmation, the local registry, and the server-controlled fleet authority manifest. See [Operator Mode](docs/operator-mode.md#fleet-routing-through-the-local-a2a-registry). This peer's own attested identity and advertised URL come from the `HERMES_GPT_FLEET_PEER_NAME` / `HERMES_GPT_FLEET_PEER_URL` knobs (plus `HERMES_GPT_FLEET_PEER_VERSION` and the `HERMES_GPT_HOST` / `HERMES_GPT_PORT` URL fallbacks); local runner executable overrides use `HERMES_GPT_PI_EXE`, `HERMES_GPT_OMX_EXE`, and `HERMES_GPT_OPENCODE_EXE` — defaults and gate semantics in [Operator Mode](docs/operator-mode.md#fleet-peer-identity-and-advertised-url).
 
 ## Security invariants
 

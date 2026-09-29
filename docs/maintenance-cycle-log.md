@@ -211,3 +211,119 @@ pre-existing environment skips; ruff clean. 14 tracked files changed,
 - **Candidate hardening:** autouse fixture resetting `set_audit_log_override`;
   additive py3.13 CI lane (ci edits were prohibited in-cycle); the two
   environment-dependent skips in the full suite remain unowned.
+
+## Cycle 5 — 2026-10-01 — "Close your own assess findings: OAuth loop, durable doctor signals, knob docs"
+
+Run `0aa75ea44f934b47acd316c4f5882eb5` (repository-maintenance
+`c027a743b2df415eb0c9da700b7435b3`, cycle 2) against worktree at `caf60018d2`
+(run-0aa75ea44f93-0aa75ea4, branch conductor/run-0aa75ea44f93). Phases: assess →
+research → roadmap → prioritize → stewardship → implement → targeted tests →
+full tests → compound. All outcomes below are pre-review: the batch is
+implemented and locally verified but uncommitted, awaiting the fold and commit
+gates. Cycle 4's batch landed at `bb9c68fb`/`80bd0f524d`; this cycle's assess ran
+adversarially against that landed state and selected what it missed. Two phases
+arrived as 429 envelope re-deliveries whose prior on-disk work was audited and
+adopted (assess spool 97dfe594 intact; implement tree audited line-by-line
+against the stewardship contract and RED-proven via `git stash` of the source
+files), not redone.
+
+### What the cycle did
+
+- **rm-092 (P115)** — closed the rm-076 remainder: the OAuth surface was the
+  one remaining on-loop blocking lane (`BearerAuthMiddleware.__call__` — also
+  the WS handshake path — `/oauth/token` exchanges, `register_client`'s
+  persist hook; a fresh sqlite connection with busy_timeout=15000 per
+  authenticated request). All offloaded via `asyncio.to_thread` per the
+  rm-076 pattern; static-bearer compare stays on-loop (pure CPU). The
+  durable-validation docstring was corrected, not gated: the
+  no-in-memory-shortcut design is deliberate cluster revocation correctness.
+  Two lock-contention regression tests hold the durable store lock in a
+  background thread — both fail against the pre-fix code.
+- **rm-093 (P65)** — made the ui_mount health signal durable: the rm-078
+  failure record lived in a bounded `audit_tail(limit=50)` scan, so churn
+  evicted it and rotation hid it forever (doctor false-PASS while the UI was
+  down). Now a persistent `ui-mount-state.json` marker
+  (`operator_policy` :1065-1143) is doctor's authority — `failed` written on
+  mount failure, `healthy`/`disabled` written at boot clearing stale failure —
+  with the audit-tail scan kept only for pre-marker servers' history and a
+  `UI_MOUNT_CHECK_UNAVAILABLE` fallback. Four regression tests (churn,
+  rotation, marker-without-audit, healthy/disabled states); churn + rotation
+  were red pre-fix.
+- **rm-094 (P50)** — documented the fleet/runner env knobs
+  (`HERMES_GPT_FLEET_PEER_NAME/URL/VERSION`, `HERMES_GPT_HOST/PORT` fallback,
+  `HERMES_GPT_PI_EXE/OMX_EXE/OPENCODE_EXE`) in `docs/operator-mode.md` with a
+  README pointer, plus `test_env_knob_docs.py`: a drift guard scanning every
+  shipped module for literal `HERMES_GPT_*` names, requiring each to be
+  documented or on the explicit 20-entry reviewed `_UNDOCUMENTED_BACKLOG`
+  (the backlog itself fails when it goes stale). Structural fix stays open as
+  rm-088 (typed knob registry).
+
+Verification (pre-review): every one of the 6 new regression tests proven red
+pre-fix by stashing only the 4 source files; targeted
+`run_repo_impacted_tests.py --mode fast --jobs 8` (50-file selection) exit 0,
+1271 passed / 2 skipped in 63.29s (both skips identified and pre-existing:
+Windows-only command, HERMES_HTTP_TEST smoke); full gate
+(`local_validation_gate.py --shell-command 'python -m pytest -q'`) exit 0
+(envelope result-983149-329885774.json; 1612 progress dots, 4 skip marks, zero
+FAILED/ERROR lines); `ruff check .` clean; validation digest
+`validation:v1:9729ae37…9c53c1` declared verbatim and re-derived
+byte-identical after the full gate. 9 files (8 modified +588/−57 and the new
+guard test), all uncommitted.
+
+### Prevention rules established
+
+1. **A landed "every X" fix needs a census pin.** rm-076's acceptance said
+   EVERY blocking store call; the OAuth lane shipped green underneath it.
+   Universality claims in acceptance criteria get a mechanical census
+   (grep/import-graph over the claimed surface, ideally a guard test) — an
+   example list is not evidence of completeness.
+2. **Health evidence must be at least as durable as the condition it
+   reports.** A signal derived from a bounded recent-records scan decays with
+   ordinary traffic and dies at rotation. Health checks read persistent state
+   or probe live, and their tests cover BOTH churn-eviction AND the rotation
+   boundary — both were red pre-fix here.
+3. **Docs drift is a defect class with a cheap guard.** Scan shipped modules
+   for the knob namespace; require each name in docs or on a reviewed backlog
+   that itself fails when stale (`test_env_knob_docs.py` is the pattern). The
+   guard fires in both directions.
+4. **A docstring is a claim.** Build the mechanism or fix the claim in the
+   same change — a docstring implying a cache gate that never existed is how
+   the next assessment misses the real path (here: the real defect was
+   loop-blocking, solved by offload, with the design intent stated plainly).
+5. **Audit-and-adopt beats redo for voided prior attempts.** RED-prove prior
+   on-disk work via `git stash` of the source files only (the new tests must
+   fail against pre-fix code) instead of discarding it. And write the
+   phase_result JSON before the final message — the envelope can die while the
+   work sits complete (three envelope failures this run).
+6. **Sibling runs reimplement the same defect under different ids.** This
+   cycle's rm-093 has an unlanded twin (run-a7e57044's rm-087
+   UI_MOUNT_FAILURE_MARKER, same base); landing gates dedupe by defect
+   content, not id, and the roadmap rider records the twin in place.
+
+### Local toolchain notes (small, reusable)
+
+- Counts recover only with `-o addopts=` — repo `addopts="-q"` stacks with a
+  CLI `-q` into `-qq` and suppresses the summary line (reconfirmed at both
+  validation gates; standing cycle-3 rule).
+- The gate envelope's own digest carries `digest_base: 'unknown'` by
+  construction; the fold-gate policy re-derivation over the tree is the
+  authoritative identity check — identical digests across two dispatches
+  prove the tree unchanged between them (zero-cost identity check, cycle-4
+  note).
+
+### Context left for the next cycle
+
+- **Landing duties:** review target = the 9-file implement delta + the
+  compound artifacts (ROADMAP riders/flips, CHANGELOG Unreleased bullets,
+  this entry); render footer stays last. Land ONE ui_mount durable-marker
+  implementation (this run's rm-093 `ui-mount-state.json` vs run-a7e57044's
+  rm-087); reconcile run-b665941020's shutdown-bound batch whose server.py
+  :3126 lifespan edit abuts this run's :3221-3231 marker hunks; renumber
+  sibling rm-085..rm-115 blocks at integration.
+- **Headliner unchanged:** upstream Autopilot (PR #82, tip f4151d972, 9
+  commits) still unadopted; v0.13.0 still untagged (2026-09-30) — re-probe
+  tags. rm-085 + rm-081 should land as ONE catch-up batch.
+- **Suggested order:** rm-085/rm-081 catch-up → rm-086 drift probe (fourth
+  consecutive hand-probe this week) → rm-088 typed knob registry (rm-094's
+  guard + 20-entry backlog is its seed) → rm-087 backup/restore → rm-089
+  metrics → rm-090 audit hash chain.

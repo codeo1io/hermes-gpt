@@ -20,6 +20,7 @@ import os
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -570,15 +571,58 @@ def _check_last_audit_record() -> dict[str, Any]:
         )
 
 
+def _parse_iso_timestamp(value: Any) -> datetime | None:
+    """Best-effort ISO-8601 parse for marker/audit timestamps (None-safe)."""
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed
+
+
 def _check_ui_mount() -> dict[str, Any]:
-    """WARN when the audit log records a failed UI mount (rm-078).
+    """WARN when the UI failed to mount (rm-078; persistent signal rm-093).
 
     An explicitly-enabled UI that failed to mount is a degraded operator
-    surface: the server writes an ``ui_mount`` audit record and a live event
-    when mounting fails, so doctor can surface it from the audit log.
+    surface. rm-093: the authoritative signal is the persistent ui_mount
+    state marker written at server startup -- one small record beside the
+    audit log that survives audit churn and rotation. The audit scan below
+    is a generation-spanning fallback (active log + archived ``.1``) so
+    failures recorded by pre-marker servers stay visible instead of
+    silently aging out of a bounded tail window.
     """
+    marker = op.read_ui_mount_state()
+    if marker is not None and marker.get("status") == "failed":
+        error = marker.get("error") or marker.get("summary") or "unknown error"
+        return _check_result(
+            status=STATUS_WARN,
+            layer="ui",
+            code="UI_MOUNT_FAILED",
+            message=(
+                "The browser UI is enabled but failed to mount: "
+                f"{error}"
+            ),
+            suggested_action=(
+                "Check the server log for the ui_api import error; the UI "
+                "assets may be missing or not built. A later successful "
+                "mount (or running with the UI disabled) clears this signal."
+            ),
+            extra={
+                "audit_log_path": str(op.audit_log_path()),
+                "ui_mount_state_path": str(op.ui_mount_state_path()),
+                "last_ui_mount_failure_timestamp": marker.get("timestamp"),
+            },
+        )
     try:
-        records = op.audit_tail(limit=50)
+        failures = [
+            rec
+            for rec in op.iter_audit_for_tool("ui_mount")
+            if not rec.get("success", True)
+        ]
     except Exception as exc:
         return _check_result(
             status=STATUS_UNSUPPORTED,
@@ -590,25 +634,90 @@ def _check_ui_mount() -> dict[str, Any]:
             ),
             suggested_action="Check audit log path and permissions; see last_audit_record check.",
         )
-    for rec in records:
-        if rec.get("tool") == "ui_mount" and not rec.get("success", True):
+    if failures:
+        rec = failures[-1]  # oldest-first scan: newest failure last
+        marker_status = marker.get("status") if marker is not None else None
+        if marker_status in ("healthy", "disabled"):
+            # Review fix (rm-093): a recorded healthy/disabled marker is the
+            # newer authority for THIS server's startup state -- historical
+            # audit failures must not keep the doctor WARNed forever. A
+            # failure record that POSTDATES the marker (fleet peers sharing
+            # one root: newest writer wins) still WARNs.
+            marker_ts = _parse_iso_timestamp(marker.get("timestamp"))
+            failure_ts = _parse_iso_timestamp(rec.get("timestamp"))
+            if failure_ts is not None and (
+                marker_ts is None or failure_ts > marker_ts
+            ):
+                return _check_result(
+                    status=STATUS_WARN,
+                    layer="ui",
+                    code="UI_MOUNT_FAILED",
+                    message=(
+                        "The browser UI is enabled but failed to mount: "
+                        f"{rec.get('summary') or rec.get('error') or 'unknown error'} "
+                        f"(recorded after the current {marker_status} state marker)"
+                    ),
+                    suggested_action=(
+                        "Check the server log for the ui_api import error; the UI "
+                        "assets may be missing or not built. A later successful "
+                        "mount (or running with the UI disabled) clears this signal."
+                    ),
+                    extra={
+                        "audit_log_path": str(op.audit_log_path()),
+                        "ui_mount_state_path": str(op.ui_mount_state_path()),
+                        "last_ui_mount_failure_timestamp": rec.get("timestamp"),
+                        "ui_mount_state_status": marker_status,
+                    },
+                )
+            if marker_status == "disabled":
+                return _check_result(
+                    status=STATUS_PASS,
+                    layer="ui",
+                    code="UI_MOUNT_HEALTHY",
+                    message=(
+                        "The browser UI is disabled; the latest startup recorded "
+                        f"no mount attempt (marker timestamp {marker.get('timestamp')})."
+                    ),
+                    suggested_action="No action needed.",
+                    extra={
+                        "audit_log_path": str(op.audit_log_path()),
+                        "ui_mount_state_path": str(op.ui_mount_state_path()),
+                        "ui_mount_state_status": marker_status,
+                    },
+                )
             return _check_result(
-                status=STATUS_WARN,
+                status=STATUS_PASS,
                 layer="ui",
-                code="UI_MOUNT_FAILED",
+                code="UI_MOUNT_HEALTHY",
                 message=(
-                    "The browser UI is enabled but failed to mount: "
-                    f"{rec.get('summary') or rec.get('error') or 'unknown error'}"
+                    "The browser UI mounted successfully "
+                    f"(marker timestamp {marker.get('timestamp')}); earlier audit "
+                    "failures predate that success."
                 ),
-                suggested_action=(
-                    "Check the server log for the ui_api import error; the UI "
-                    "assets may be missing or not built."
-                ),
+                suggested_action="No action needed.",
                 extra={
                     "audit_log_path": str(op.audit_log_path()),
-                    "last_ui_mount_failure_timestamp": rec.get("timestamp"),
+                    "ui_mount_state_path": str(op.ui_mount_state_path()),
+                    "ui_mount_state_status": marker_status,
                 },
             )
+        return _check_result(
+            status=STATUS_WARN,
+            layer="ui",
+            code="UI_MOUNT_FAILED",
+            message=(
+                "The browser UI is enabled but failed to mount: "
+                f"{rec.get('summary') or rec.get('error') or 'unknown error'}"
+            ),
+            suggested_action=(
+                "Check the server log for the ui_api import error; the UI "
+                "assets may be missing or not built."
+            ),
+            extra={
+                "audit_log_path": str(op.audit_log_path()),
+                "last_ui_mount_failure_timestamp": rec.get("timestamp"),
+            },
+        )
     return _check_result(
         status=STATUS_PASS,
         layer="ui",
