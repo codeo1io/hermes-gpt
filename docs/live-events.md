@@ -35,6 +35,12 @@ Event IDs are idempotent. Consumers should persist the returned cursor and resum
 
 The initial v0.9 producers are first-class Mission lifecycle changes and Swarm operator actions. Producer failure is deliberately non-fatal: publishing a wake-up event cannot roll back or modify the authoritative transaction that produced it.
 
+The server itself is also a producer: a browser-UI mount failure while the UI is explicitly enabled emits `ui_mount_failed` (source `server`) alongside its audit record, so a degraded UI is observable without reading server logs.
+
+### Cursor semantics
+
+`read_since` and the WebSocket poll loop advance the returned cursor to the delivered event's `seq`. When topic/kind/mission filters are active, a page that is not truncated by `limit` additionally advances the cursor to the current high watermark: every event past the last match is known not to match, so rescanning it on the next poll would be dead work. A page truncated by `limit` never advances past its last delivered match, so no event can be skipped after a reconnect.
+
 ## Retention
 
 The live-event journal is bounded. `HERMES_GPT_LIVE_EVENT_RETENTION` controls the retained row count within the implementation hard cap. Retention affects notification history only; it never removes the underlying Mission/Swarm/Fabric evidence stores.

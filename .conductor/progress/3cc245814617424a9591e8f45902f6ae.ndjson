@@ -1,0 +1,5 @@
+{"step":1,"ts":"2026-09-29T20:50:07Z","summary":"ran engine targeted_command (impacted runner, uv lane): 2 failures in my implement-phase tests","touched":[test_ui_ops.py,test_ui_chat.py]}
+{"step":2,"ts":"2026-09-29T20:50:07Z","summary":"diagnosed: uv venv lacks httpx (loop-stall test) + leaked set_audit_log_override across xdist workers (mount test)","touched":[]}
+{"step":3,"ts":"2026-09-29T20:50:07Z","summary":"fixed: dependency-free raw-ASGI caller replaces httpx; mount test pins audit override to home/logs with try/finally reset","touched":[test_ui_chat.py,test_ui_ops.py]}
+{"step":4,"ts":"2026-09-29T20:50:07Z","summary":"pairings re-verified green (swarm/mission/ui_chat + ui_ops); full targeted command exit=0","touched":[]}
+{"step":5,"ts":"2026-09-29T20:50:07Z","summary":"final: 144/144 junit-verified, ruff clean; digest declared verbatim (manifest unchanged — edits touched only pre-listed surfaces)","touched":[]}

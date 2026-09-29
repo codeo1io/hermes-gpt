@@ -3087,6 +3087,42 @@ def _register_fleet_local_card() -> None:
         pass
 
 
+def _signal_ui_mount_failure(exc: Exception) -> None:
+    """Make a failed UI mount operator-visible.
+
+    The UI is opt-in, but an explicitly-enabled UI failing to mount used to be
+    visible only as a single stderr line. Emit an audit record and a live
+    event so ``hermes_events_query``, Mission Control and ``doctor`` surface
+    the degraded UI. Both signals are best-effort: reporting a failed mount
+    must never prevent the MCP-only server from starting.
+    """
+    detail = f"{exc.__class__.__name__}: {exc}"
+    try:
+        op_policy.audit_record(
+            tool="ui_mount",
+            level="read_only",
+            apply_mode="direct",
+            dry_run=False,
+            success=False,
+            summary=f"UI mount skipped: {detail[:200]}",
+            error=detail[:300],
+        )
+    except Exception:  # noqa: BLE001
+        eprint("ui mount failure audit record could not be written")
+    try:
+        op_live_events.publish_event(
+            topic="system",
+            kind="ui_mount_failed",
+            subject_type="server",
+            subject_id="ui",
+            source="server",
+            payload={"error": detail[:300]},
+            hermes_root=_default_hermes_root(),
+        )
+    except Exception:  # noqa: BLE001
+        eprint("ui mount failure live event could not be published")
+
+
 def build_asgi_app(server: FastMCP, *, http: bool) -> Any:
     oauth_state = getattr(server, "_hermes_oauth_state", None)
     if oauth_state is not None and not http:
@@ -3188,6 +3224,7 @@ def build_asgi_app(server: FastMCP, *, http: bool) -> Any:
             routes.extend(ui_api.routes())
         except Exception as exc:  # noqa: BLE001
             eprint(f"UI mount skipped: {exc.__class__.__name__}: {exc}")
+            _signal_ui_mount_failure(exc)
     # v0.9 live-event delivery is read-only and remains behind the same outer
     # Bearer/OAuth middleware as MCP and the browser UI.
     routes.extend(

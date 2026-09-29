@@ -667,9 +667,12 @@ def _error(status: int, code: str, message: str) -> JSONResponse:
 # ── Route handlers ────────────────────────────────────────────────────────
 
 async def _handle_sessions_list(request: Request) -> Response:
-    db = _session_db()
+    # rm-076: SessionDB does blocking sqlite work under a shared lock that
+    # turn workers also take — offload so the serving loop never stalls.
+    db = await asyncio.to_thread(_session_db)
     try:
-        rows = db.list_sessions_rich(
+        rows = await asyncio.to_thread(
+            db.list_sessions_rich,
             source="webui",
             order_by_last_active=True,
             compact_rows=True,
@@ -684,8 +687,12 @@ async def _handle_sessions_list(request: Request) -> Response:
 
 
 async def _handle_sessions_create(request: Request) -> Response:
-    db = _session_db()
-    session_id = _create_session(db, model=_resolve_model(), profile=_ui_profile())
+    # rm-076: session creation touches sqlite (schema + insert) and the
+    # model resolution reads the Hermes config — both blocking.
+    db = await asyncio.to_thread(_session_db)
+    session_id = await asyncio.to_thread(
+        _create_session, db, model=await asyncio.to_thread(_resolve_model), profile=_ui_profile()
+    )
     return _ok({"session_id": session_id, "title": ""})
 
 
@@ -693,11 +700,14 @@ async def _handle_session_messages(request: Request) -> Response:
     session_id = request.path_params.get("session_id", "")
     if not session_id:
         return _error(400, "BAD_REQUEST", "session_id is required")
-    db = _session_db()
-    if not _session_exists(db, session_id):
+    # rm-076: existence check + message page read are blocking sqlite.
+    db = await asyncio.to_thread(_session_db)
+    if not await asyncio.to_thread(_session_exists, db, session_id):
         return _error(404, "NOT_FOUND", "session not found")
     try:
-        rows = db.get_messages(session_id, include_compacted=True, limit=MESSAGE_PAGE_LIMIT)
+        rows = await asyncio.to_thread(
+            db.get_messages, session_id, include_compacted=True, limit=MESSAGE_PAGE_LIMIT
+        )
     except Exception as exc:
         logger.warning("ui_chat: message read failed: %s", exc)
         return _error(500, "INTERNAL", "Failed to load messages")
@@ -718,19 +728,25 @@ async def _handle_chat_post(request: Request) -> Response:
     session_id = str(body.get("session_id") or "").strip() or None
     profile = str(body.get("profile") or "").strip() or None
     effective_profile = profile or _ui_profile()
-    model = _resolve_model()
+    # rm-076: config read, session create/lookup and the turn lease are
+    # all blocking sqlite/config work shared with turn worker threads.
+    model = await asyncio.to_thread(_resolve_model)
 
-    db = _session_db()
+    db = await asyncio.to_thread(_session_db)
     if session_id is None:
-        session_id = _create_session(db, model=model, profile=effective_profile)
-    elif not _session_exists(db, session_id):
+        session_id = await asyncio.to_thread(
+            _create_session, db, model=model, profile=effective_profile
+        )
+    elif not await asyncio.to_thread(_session_exists, db, session_id):
         return _error(404, "NOT_FOUND", "session not found")
 
     if _active_turn_count() >= _max_concurrent():
         return _error(429, "RATE_LIMITED", "Too many concurrent chat turns")
 
     holder = f"webui-{os.getpid()}-{uuid.uuid4().hex[:12]}"
-    if not db.try_acquire_session_turn_lease(session_id, holder, ttl_seconds=300.0):
+    if not await asyncio.to_thread(
+        db.try_acquire_session_turn_lease, session_id, holder, ttl_seconds=300.0
+    ):
         return _error(409, "TURN_IN_PROGRESS", "A turn is already running for this session")
 
     turn = Turn(session_id=session_id, turn_id=f"t-{uuid.uuid4().hex[:12]}", holder=holder)

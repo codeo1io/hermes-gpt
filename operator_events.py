@@ -509,6 +509,21 @@ def _events_envelope(
     }
 
 
+def _allowed_sources_queried(sources: list[str], warnings: list[str]) -> list[str]:
+    """Filter sources through the allowlist once, at the boundary (rm-079).
+
+    ``_collect`` keeps ``_source_allowed`` as its enforcement point, but the
+    envelope must report what was actually queried, and both the query and
+    tail surfaces must warn when the allowlist drops anything — previously
+    only the query path warned, and its envelope listed unqueried sources.
+    """
+    allowed = [s for s in sources if _source_allowed(s)]
+    dropped = len(sources) - len(allowed)
+    if dropped:
+        warnings.append(f"{dropped} source(s) dropped by allowlist")
+    return allowed
+
+
 def hermes_events_query(
     source: str = "",
     subject_id: str = "",
@@ -537,9 +552,7 @@ def hermes_events_query(
     if source and source not in EVENT_SOURCES:
         warnings.append(f"unknown source {source!r}")
         sources = []
-    queried = [s for s in sources if _source_allowed(s)]
-    if len(queried) < len(sources):
-        warnings.append("some sources filtered by allowlist")
+    sources = _allowed_sources_queried(sources, warnings)
 
     events = _collect(root, sources=sources, since=since, until=until, subject_id=subject_id, kind=kind)
     _audit_events_call(
@@ -562,11 +575,14 @@ def hermes_events_tail(limit: int = 20, hermes_root: Path | None = None) -> str:
     except (TypeError, ValueError):
         limit = 20
 
-    events = _collect(root, sources=EVENT_SOURCES)
+    tail_warnings: list[str] = []
+    tail_sources = _allowed_sources_queried(list(EVENT_SOURCES), tail_warnings)
+
+    events = _collect(root, sources=tail_sources)
     _audit_events_call(
         tool,
         success=True,
         summary=f"events tail count={len(events)}",
         extra={"count": len(events)},
     )
-    return json.dumps(_events_envelope(tool=tool, events=events, limit=limit, sources=list(EVENT_SOURCES), warnings=[], trace_id=tid), ensure_ascii=False, indent=2)
+    return json.dumps(_events_envelope(tool=tool, events=events, limit=limit, sources=tail_sources, warnings=tail_warnings, trace_id=tid), ensure_ascii=False, indent=2)

@@ -535,3 +535,88 @@ def test_sse_delta_redacted_exactly_once():
     turn2 = ui_chat.Turn(session_id="p", turn_id="p-once", holder="h")
     turn2.publish("token", {"delta": "already [REDACTED_GITHUB_TOKEN] here"})
     assert json.dumps([e[2] for e in turn2.events]).count("[REDACTED_GITHUB_TOKEN]") == 1
+
+
+async def _asgi_call(app, method, path, query=b""):
+    """Minimal dependency-free ASGI client (the uv dev env has no httpx)."""
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": method,
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": query,
+        "headers": [(b"content-length", b"0")],
+        "scheme": "http",
+        "server": ("test", 80),
+        "client": ("test", 1234),
+    }
+    status: dict[str, int] = {}
+    body = bytearray()
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            status["code"] = message["status"]
+        elif message["type"] == "http.response.body":
+            body.extend(message.get("body", b""))
+
+    await app(scope, receive, send)
+    return status.get("code", 0), bytes(body)
+
+
+def test_session_endpoints_do_not_stall_event_loop_under_sessiondb_lock(app):
+    """rm-076 regression: blocking SessionDB work must run off the event loop.
+
+    While another thread holds the shared SessionDB lock, a concurrent
+    request that touches no database must still complete quickly. Before the
+    asyncio.to_thread offload, POST /api/sessions ran create_session's sqlite
+    work (and its lock acquisition) directly on the serving loop and froze
+    every other request until the lock was released.
+    """
+    import asyncio
+
+    db = ui_chat._session_db()
+    lock_held = threading.Event()
+    release = threading.Event()
+
+    def hold_lock() -> None:
+        with db._lock:
+            lock_held.set()
+            release.wait(_THREAD_BUDGET)
+
+    async def scenario() -> None:
+        holder = threading.Thread(target=hold_lock, daemon=True)
+        holder.start()
+        assert lock_held.wait(5.0)
+        try:
+            # POST /api/sessions blocks inside create_session until the
+            # lock is released — post-fix inside an offloaded worker.
+            create = asyncio.create_task(_asgi_call(app, "POST", "/api/sessions"))
+            await asyncio.sleep(0.2)  # let the request reach the handler
+
+            # DB-free probe: unknown session + turn -> 404 from the
+            # in-memory replay buffer. On pre-fix code the loop is frozen
+            # inside create_session and this wait_for times out.
+            probe_status, _ = await asyncio.wait_for(
+                _asgi_call(
+                    app,
+                    "GET",
+                    "/api/chat/stream",
+                    query=b"session_id=nope&turn_id=nope",
+                ),
+                timeout=5.0,
+            )
+            assert probe_status == 404
+
+            release.set()
+            create_status, create_body = await asyncio.wait_for(create, timeout=10.0)
+            assert create_status == 200
+            assert json.loads(create_body)["data"]["session_id"]
+        finally:
+            release.set()
+
+    asyncio.run(scenario())

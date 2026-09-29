@@ -570,6 +570,54 @@ def _check_last_audit_record() -> dict[str, Any]:
         )
 
 
+def _check_ui_mount() -> dict[str, Any]:
+    """WARN when the audit log records a failed UI mount (rm-078).
+
+    An explicitly-enabled UI that failed to mount is a degraded operator
+    surface: the server writes an ``ui_mount`` audit record and a live event
+    when mounting fails, so doctor can surface it from the audit log.
+    """
+    try:
+        records = op.audit_tail(limit=50)
+    except Exception as exc:
+        return _check_result(
+            status=STATUS_UNSUPPORTED,
+            layer="ui",
+            code="UI_MOUNT_CHECK_UNAVAILABLE",
+            message=(
+                "Audit log could not be read to check UI mount health: "
+                f"{exc.__class__.__name__}."
+            ),
+            suggested_action="Check audit log path and permissions; see last_audit_record check.",
+        )
+    for rec in records:
+        if rec.get("tool") == "ui_mount" and not rec.get("success", True):
+            return _check_result(
+                status=STATUS_WARN,
+                layer="ui",
+                code="UI_MOUNT_FAILED",
+                message=(
+                    "The browser UI is enabled but failed to mount: "
+                    f"{rec.get('summary') or rec.get('error') or 'unknown error'}"
+                ),
+                suggested_action=(
+                    "Check the server log for the ui_api import error; the UI "
+                    "assets may be missing or not built."
+                ),
+                extra={
+                    "audit_log_path": str(op.audit_log_path()),
+                    "last_ui_mount_failure_timestamp": rec.get("timestamp"),
+                },
+            )
+    return _check_result(
+        status=STATUS_PASS,
+        layer="ui",
+        code="UI_MOUNT_HEALTHY",
+        message="No recorded UI mount failures.",
+        suggested_action="No action needed.",
+    )
+
+
 def _check_connector_api_bridge(profile_home: Path) -> dict[str, Any]:
     """Best-effort connector check. Always reports UNSUPPORTED because hermes-gpt
     does not implement a connector re-registration API or health endpoint.
@@ -634,6 +682,7 @@ def hermes_operator_doctor(
             "skills_registry": _check_skills_registry(profile_home),
             "operator_policy": _check_operator_policy(profile, hermes_root),
             "last_audit_record": _check_last_audit_record(),
+            "ui_mount": _check_ui_mount(),
             "connector_api_bridge": _check_connector_api_bridge(profile_home),
         }
 

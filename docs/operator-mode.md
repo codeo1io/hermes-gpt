@@ -484,6 +484,8 @@ Read-only deep health check across the Operator surface. Checks include gateway 
 
 Gateway state is fail-closed: `hermes_operator_doctor` never reports the gateway as healthy on a heartbeat file alone. A heartbeat with no live gateway PID fails with `GATEWAY_PID_MISSING`; a dead PID fails with `GATEWAY_DEAD_PID`; an unreachable gateway fails with `GATEWAY_UNREACHABLE`. Stale heartbeat files surface as `GATEWAY_STALE_HEARTBEAT` warnings.
 
+The browser UI mount is checked too: when the UI is explicitly enabled (`HERMES_GPT_UI_ENABLED=1`) but its route mount fails (for example a broken or missing `ui_api` module), the failure is recorded as an audit record and a `ui_mount_failed` live event at boot, and the doctor reports it as `UI_MOUNT_FAILED` (`WARN`) instead of the server silently degrading to MCP-only with a single log line.
+
 Status vocabulary:
 
 - `PASS`
