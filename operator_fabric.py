@@ -1405,6 +1405,54 @@ class FabricPeerService:
             },
         }
 
+    def _claim_conflict_domain(
+        self,
+        db: sqlite3.Connection,
+        conflict_domain: str,
+        attempt_id: str,
+        now: str,
+    ) -> None:
+        """Atomically claim a write-conflict domain for an accepted attempt.
+
+        Any ACTIVE claim blocks the accept (peer semantics: claims held by
+        the same attempt also block, because idempotent replays return before
+        reaching this point). BEGIN IMMEDIATE takes the database write lock
+        before the ownership read so two peers -- or a peer and a coordinator
+        -- cannot both observe "no active claim" and both INSERT OR REPLACE
+        (the second writer would silently steal the domain). The lock is only
+        taken when the caller is not already inside a transaction.
+
+        Not shared with ``fabric_write_guard.WriteClaims.acquire``: that
+        helper writes coordinator columns (epoch, execution_unit_*,
+        release_proof) and is idempotent for the owning attempt, while this
+        peer store's write_claims rows carry neither epoch nor execution-unit
+        columns and must block any ACTIVE claim regardless of holder.
+        """
+        own_tx = not db.in_transaction
+        if own_tx:
+            db.execute("BEGIN IMMEDIATE")
+        try:
+            claim = db.execute(
+                "SELECT * FROM write_claims WHERE conflict_domain=?",
+                (conflict_domain,),
+            ).fetchone()
+            if claim is not None and claim["state"] == "ACTIVE":
+                raise FabricError(
+                    "FABRIC_WRITE_OWNERSHIP_BLOCKED",
+                    "peer write conflict domain already has an active claim",
+                )
+            db.execute(
+                "INSERT OR REPLACE INTO write_claims"
+                "(conflict_domain,attempt_id,state,acquired_at,released_at) VALUES(?,?,?,?,NULL)",
+                (conflict_domain, attempt_id, "ACTIVE", now),
+            )
+            if own_tx:
+                db.execute("COMMIT")
+        except BaseException:
+            if own_tx and db.in_transaction:
+                db.execute("ROLLBACK")
+            raise
+
     def _accept(
         self,
         request: dict[str, Any],
@@ -1456,19 +1504,8 @@ class FabricPeerService:
 
             auth_class = envelope["authorization"]["class"]
             if _AUTH_RANK[auth_class] >= _AUTH_RANK["reversible_write"]:
-                claim = db.execute(
-                    "SELECT * FROM write_claims WHERE conflict_domain=?",
-                    (mapping.conflict_domain,),
-                ).fetchone()
-                if claim is not None and claim["state"] == "ACTIVE":
-                    raise FabricError(
-                        "FABRIC_WRITE_OWNERSHIP_BLOCKED",
-                        "peer write conflict domain already has an active claim",
-                    )
-                db.execute(
-                    "INSERT OR REPLACE INTO write_claims"
-                    "(conflict_domain,attempt_id,state,acquired_at,released_at) VALUES(?,?,?,?,NULL)",
-                    (mapping.conflict_domain, envelope["attempt_id"], "ACTIVE", now),
+                self._claim_conflict_domain(
+                    db, mapping.conflict_domain, envelope["attempt_id"], now
                 )
 
             db.execute(

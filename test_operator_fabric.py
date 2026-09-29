@@ -474,6 +474,164 @@ def test_write_claim_blocks_second_write_in_same_conflict_domain(tmp_path, monke
     assert exc.value.code == "FABRIC_WRITE_OWNERSHIP_BLOCKED"
 
 
+def test_write_claim_acquire_is_atomic_across_connections(tmp_path):
+    # rm-141: claim take-over must be atomic at the database level so two
+    # processes on separate connections cannot both observe "no active
+    # claim" and both believe they own the conflict domain. Pre-fix, the
+    # SELECT and INSERT OR REPLACE ran as separate autocommit statements
+    # and the second writer silently replaced the first.
+    import sqlite3
+
+    import fabric_write_guard
+
+    db_path = tmp_path / "fabric.sqlite3"
+    claims = fabric_write_guard.WriteClaims(db_path)
+    for trial in range(25):
+        domain = f"workspace:repo/{trial}"
+        barrier = threading.Barrier(2)
+        outcomes: list[tuple[str, object]] = []
+
+        def attempt(idx: int, domain: str = domain, barrier: threading.Barrier = barrier) -> None:
+            conn = sqlite3.connect(db_path, timeout=30, isolation_level=None)
+            conn.row_factory = sqlite3.Row
+            try:
+                barrier.wait(timeout=30)
+                epoch = claims.acquire(
+                    conn,
+                    conflict_domain=domain,
+                    attempt_id=f"attempt-{trial}-{idx}",
+                    unit_id="unit-rm-141",
+                )
+                outcomes.append(("ok", epoch))
+            except fabric.FabricError as exc:
+                outcomes.append((exc.code, None))
+            finally:
+                conn.close()
+
+        threads = [threading.Thread(target=attempt, args=(idx,)) for idx in (1, 2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+
+        codes = [code for code, _ in outcomes]
+        assert sorted(codes) == [
+            "FABRIC_WRITE_OWNERSHIP_BLOCKED",
+            "ok",
+        ], f"trial {trial}: both acquirers raced to ownership: {codes}"
+        row = (
+            sqlite3.connect(db_path)
+        )
+        row.row_factory = sqlite3.Row
+        row = row.execute(
+            "SELECT attempt_id, epoch FROM write_claims WHERE conflict_domain=?",
+            (domain,),
+        ).fetchone()
+        assert row is not None and row["attempt_id"] in {
+            f"attempt-{trial}-1",
+            f"attempt-{trial}-2",
+        }
+
+
+def test_write_claim_acquire_is_idempotent_for_same_attempt(tmp_path):
+    import sqlite3
+
+    import fabric_write_guard
+
+    db_path = tmp_path / "fabric.sqlite3"
+    claims = fabric_write_guard.WriteClaims(db_path)
+    conn = sqlite3.connect(db_path, timeout=30, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        first = claims.acquire(
+            conn,
+            conflict_domain="workspace:repo",
+            attempt_id="attempt-a",
+            unit_id="unit-x",
+        )
+        second = claims.acquire(
+            conn,
+            conflict_domain="workspace:repo",
+            attempt_id="attempt-a",
+            unit_id="unit-x",
+        )
+    finally:
+        conn.close()
+    assert first == second == 1
+
+
+def test_write_claim_acquire_joins_caller_transaction(tmp_path):
+    # A caller that already opened BEGIN IMMEDIATE keeps ownership of the
+    # transaction: acquire must not commit or roll back on its own.
+    import sqlite3
+
+    import fabric_write_guard
+
+    db_path = tmp_path / "fabric.sqlite3"
+    claims = fabric_write_guard.WriteClaims(db_path)
+    conn = sqlite3.connect(db_path, timeout=30, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        epoch = claims.acquire(
+            conn,
+            conflict_domain="workspace:repo",
+            attempt_id="attempt-a",
+            unit_id="unit-x",
+        )
+        assert conn.in_transaction is True
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+    verify = sqlite3.connect(db_path)
+    verify.row_factory = sqlite3.Row
+    row = verify.execute(
+        "SELECT attempt_id, epoch, state FROM write_claims WHERE conflict_domain=?",
+        ("workspace:repo",),
+    ).fetchone()
+    verify.close()
+    assert row is not None
+    assert row["attempt_id"] == "attempt-a"
+    assert row["epoch"] == epoch
+    assert row["state"] == "ACTIVE"
+
+
+def test_peer_accept_concurrent_claims_single_owner(tmp_path, monkeypatch):
+    # rm-141 peer path: two peer-store instances (two service processes)
+    # sharing one database file must not both accept write work in the same
+    # conflict domain.
+    first = service(tmp_path, monkeypatch)
+    second = service(tmp_path, monkeypatch)
+    envelopes = []
+    for idx in (1, 2):
+        value = contract(tmp_path, auth_class="reversible_write")
+        value["task_id"] = f"task-fabric-{idx}"
+        envelopes.append(envelope_for(first, value))
+
+    barrier = threading.Barrier(2)
+    outcomes: list[str] = []
+
+    def accept(idx: int) -> None:
+        svc = first if idx == 1 else second
+        barrier.wait(timeout=30)
+        try:
+            svc.handle(
+                accept_request(envelopes[idx - 1]),
+                "Bearer 0123456789abcdef0123456789abcdef",
+            )
+            outcomes.append("ok")
+        except fabric.FabricError as exc:
+            outcomes.append(exc.code)
+
+    threads = [threading.Thread(target=accept, args=(idx,)) for idx in (1, 2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert sorted(outcomes) == ["FABRIC_WRITE_OWNERSHIP_BLOCKED", "ok"]
+
+
 def test_peer_restart_uses_durable_journal(tmp_path, monkeypatch):
     observed = []
     first_service = service(tmp_path, monkeypatch, observed=observed)

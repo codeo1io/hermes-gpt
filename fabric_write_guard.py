@@ -218,33 +218,52 @@ class WriteClaims:
         attempt_id: str,
         unit_id: str,
     ) -> int:
-        claim = db.execute(
-            "SELECT * FROM write_claims WHERE conflict_domain=?",
-            (conflict_domain,),
-        ).fetchone()
-        if claim is not None and claim["state"] == "ACTIVE":
-            if claim["attempt_id"] == attempt_id:
-                return int(claim["epoch"] or 0)
-            raise base.FabricError(
-                "FABRIC_WRITE_OWNERSHIP_BLOCKED",
-                "peer write conflict domain already has an active claim",
+        # Claim take-over must be atomic across connections and processes:
+        # BEGIN IMMEDIATE takes the database write lock before the ownership
+        # read, so two concurrent acquirers cannot both observe "no active
+        # claim" and both INSERT OR REPLACE (the second writer would silently
+        # steal the domain from the first). When the caller already manages a
+        # transaction we join it instead of opening a nested one.
+        own_tx = not db.in_transaction
+        if own_tx:
+            db.execute("BEGIN IMMEDIATE")
+        try:
+            claim = db.execute(
+                "SELECT * FROM write_claims WHERE conflict_domain=?",
+                (conflict_domain,),
+            ).fetchone()
+            if claim is not None and claim["state"] == "ACTIVE":
+                if claim["attempt_id"] == attempt_id:
+                    epoch = int(claim["epoch"] or 0)
+                    if own_tx:
+                        db.execute("COMMIT")
+                    return epoch
+                raise base.FabricError(
+                    "FABRIC_WRITE_OWNERSHIP_BLOCKED",
+                    "peer write conflict domain already has an active claim",
+                )
+            epoch = int(claim["epoch"] or 0) + 1 if claim is not None else 1
+            db.execute(
+                "INSERT OR REPLACE INTO write_claims"
+                "(conflict_domain,attempt_id,state,acquired_at,released_at,epoch,execution_unit_kind,execution_unit_id,release_proof)"
+                " VALUES(?,?,?,?,NULL,?,?,?,NULL)",
+                (
+                    conflict_domain,
+                    attempt_id,
+                    "ACTIVE",
+                    base._now(),
+                    epoch,
+                    "systemd-user-unit",
+                    unit_id,
+                ),
             )
-        epoch = int(claim["epoch"] or 0) + 1 if claim is not None else 1
-        db.execute(
-            "INSERT OR REPLACE INTO write_claims"
-            "(conflict_domain,attempt_id,state,acquired_at,released_at,epoch,execution_unit_kind,execution_unit_id,release_proof)"
-            " VALUES(?,?,?,?,NULL,?,?,?,NULL)",
-            (
-                conflict_domain,
-                attempt_id,
-                "ACTIVE",
-                base._now(),
-                epoch,
-                "systemd-user-unit",
-                unit_id,
-            ),
-        )
-        return epoch
+            if own_tx:
+                db.execute("COMMIT")
+            return epoch
+        except BaseException:
+            if own_tx and db.in_transaction:
+                db.execute("ROLLBACK")
+            raise
 
     def state(self, attempt: sqlite3.Row) -> str:
         if attempt["write_epoch"] is None:

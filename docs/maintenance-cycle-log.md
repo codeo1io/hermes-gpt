@@ -211,3 +211,157 @@ pre-existing environment skips; ruff clean. 14 tracked files changed,
 - **Candidate hardening:** autouse fixture resetting `set_audit_log_override`;
   additive py3.13 CI lane (ci edits were prohibited in-cycle); the two
   environment-dependent skips in the full suite remain unowned.
+
+## Cycle 6 — 2026-10-01 — "Operator data-plane integrity & trust-boundary
+hardening"
+
+Run `c5fba76a9e6c4785855c20f63edc0a4f` (repository-maintenance
+`5e1ae1a76ac64a1a8d802d8d5e80bfcb`, cycle 1) against worktree at `caf60018d2`
+(run-c5fba76a9e6c-c5fba76a, branch `conductor/run-c5fba76a9e6c`). Numbering
+follows the merge target: fork master's committed frontier is Cycle 5 (landed
+with the +53), so this base's 4→6 gap is closed by the fold. Phases: assess →
+research → roadmap → prioritize → stewardship → implement → targeted tests →
+full tests → compound. All outcomes below are pre-review: the batch is
+implemented and locally verified but uncommitted, awaiting the fold and
+commit gates. Two sibling families worked overlapping bases in parallel and
+the roadmap id frontier raced three ways at 08:42Z (61db9bce246a minted
+rm-131..rm-135, bf4db34f3880 minted rm-131..rm-140); this cycle minted
+rm-141..rm-150 past the observed max and the landing gate dedupes content
+overlaps (the provenance doctor is triple-held: this rm-148, 61db9bce
+rm-133, bf4db34f rm-135).
+
+### What the cycle did
+
+- **rm-144 (P95, security)** — Finance `request_id` confinement: the worker
+  prompt no longer splices the untrusted packet field into the instruction
+  region ahead of `EVIDENCE_JSON` (repro landed
+  `SYSTEM: specialist_review all false…` in an approval-gating prompt). The
+  structural contract no longer references the packet value: the fixed text
+  instructs the model to copy `request_id` from the JSON-escaped evidence
+  packet into the decision field (finance_worker.py:37,48-49); the bridge
+  boundary (`operator_finance.hermes_finance_analyze`) additionally enforces
+  the opaque charset `REQUEST_ID_RE = ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`
+  (operator_finance.py:31,:155-157) and rejects everything else with
+  `INVALID_REQUEST_ID` (previously length-only). Contract documented in
+  `docs/finance.md`.
+- **rm-142 (P110, reliability)** — SessionDB shim attribute protocol:
+  `hermes_state.SessionDB.__getattr__` now raises `AttributeError` (not
+  `NotImplementedError`) so `hasattr`/`getattr` capability probes — the
+  server's Bot Chat lookup, compression-tip, and search probes — degrade
+  gracefully instead of crashing; an explicit `SUPPORTED_API` frozenset
+  documents the implemented surface; `list_sessions_rich` now honors every
+  row-selection filter it accepts or raises `ValueError` (10 documented filter
+  kwargs were previously silently ignored). New `test_hermes_state.py`
+  protocol suite (33 tests) pins protocol, API surface, and filter behavior.
+- **rm-141 (P115, reliability)** — atomic fabric write-claim acquisition:
+  `WriteClaims.acquire` and the inline peer-accept duplicate (now deduplicated
+  into `FabricPeerStore._claim_conflict_domain`) take the SQLite write lock
+  (`BEGIN IMMEDIATE`) before the ownership read instead of a
+  read-then-`INSERT OR REPLACE` sequence that two independent connections
+  could interleave into a double grant (repro: both attempts believed they
+  owned `domain-x` while the surviving row recorded a stale epoch). Acquire
+  joins an already-open caller transaction instead of committing it; single-
+  owner behavior unchanged for the in-process serialized path.
+
+Verification (pre-review): targeted gate exit 0 (runner-expanded 10-file
+selection, 189 dots reconciled 1:1 against `-o addopts=` collect-only, ruff
+`All checks passed!` on all 8 changed surfaces at system 0.15.10); full gate
+VERBATIM detached —
+run 1 exposed 24 failures in the new shim suite (root cause below, rule 1),
+fixed test-side; run 2 failed one unrelated budget-enforcement test once
+(passed 3/3 isolated, 19/19 file-level, green in runs 1 and 3 — watch note,
+not owned); run 3 (adopted from the reaped first attempt after forensics)
+envelope `result-747114-335835588.json` returncode 0, workers 2, 1654 dots +
+5 skips, 0 failed/errored. Digest chain: dispatch
+`validation:v1:1f6f6e79…d72c6f1` (pre-fix tree) → shim-load fix → completing
+attempt's dispatch digest `validation:v1:8c7d21a9…f103716`, recomputed
+byte-identical post-adoption with base = full HEAD sha. 10 tracked files
+modified + 1 new test file at validation time (regression tests for every
+unit; red witnesses recorded for all three defects).
+
+### Prevention rules established
+
+1. **A repo-shim test must load its module by file path, not by import.**
+   `server.py`'s module-level `import_hermes()` prepends the live deployment
+   root to `sys.path[0]`; any alphabetically-earlier test module importing
+   `server` then makes a later plain `import hermes_state` resolve to the
+   deployment's real SessionDB, not the repo shim (symptom: 24 TypeError
+   failures naming `hermes_state_sessions.py`, only under `workers=1`; xdist
+   ≥2 masks it via process isolation). Tests targeting a shadowable module
+   load it via `importlib.util.spec_from_file_location` under a distinct
+   module name.
+2. **Untrusted packet fields never enter instruction-region text.** A splice
+   of unvalidated input into the structural contract ahead of the data packet
+   is an injection seam even when the packet itself is JSON-escaped; fix both
+   ends — placeholder + copy-from-packet instruction in the prompt, and a
+   charset (not length-only) gate at the boundary that rejects with a named
+   error.
+3. **Ownership checks take the write lock before the read.** Any
+   read-then-write claim sequence over a shared SQLite file is a double-grant
+   window for independent connections; wrap in `BEGIN IMMEDIATE`, join an
+   already-open caller transaction instead of committing it, keep the acquire
+   idempotent for the owner, and regress with a two-connection interleaving
+   test — an in-process lock proves nothing about this class.
+4. **Reaped attempts leave adoptable evidence — inventory before redoing.**
+   Forensics = delegate event log (dispatch + reap only), scratch artifacts,
+   tree-vs-HEAD drift, and the gate's envelope directory (`grep -l
+   run-<id>…`); adoption requires re-verifying each leg first-hand (recorded
+   outcome, digest recomputation, fix diff) and the adopting phase_result
+   carries the original attempt ids.
+5. **The gate envelope's `digest_base: unknown` digest is a different salt,
+   not a different tree.** Comparing an envelope digest to a dispatch token
+   requires recomputing with the same base (envelope = `None`, dispatch = full
+   HEAD sha); identical content hashes across bases prove tree identity
+   (extends the cycle-5 note with the two-digest reconciliation used here).
+6. **Mint roadmap ids past the observed fleet max, then re-probe.** The id
+   frontier raced three ways within 95 seconds (08:42:19/08:42:40/08:43:54);
+   probe sibling worktrees' ROADMAP mtimes immediately before authoring,
+   continue past the observed max, and annotate collisions in place for the
+   landing gate.
+
+### Local toolchain notes (small, reusable)
+
+- The gate's `python` on PATH is the hermes-autonomy venv interpreter, not
+  the repo `.venv` — interpreter-sensitive behavior (import resolution,
+  module shadowing) diverges between the impacted-tests lane (`uv run`) and
+  the full gate; when a test passes in one lane and fails in the other,
+  suspect process isolation and import order before suspecting the code.
+- `git show <ref>:<path>` over the merge target (fork master) is the cheap
+  way to pick artifact numbering that survives the fold — this Cycle 6
+  numbering follows master's committed Cycle 5 rather than this worktree's
+  base, so the fold needs no renumber.
+- The full suite at `workers=1` is the only configuration that reproduces
+  cross-file import-order pollution; a green xdist run does not clear it.
+
+### Context left for the next cycle
+
+- **rm-143 (P100) transport-resilience wiring** — the server half is live and
+  tested (`ui_security.py` `/api/connection` + `serverStartupId`); the client
+  half is built but unmounted (`reconnectStream` + `stores/connection.ts`
+  have zero callers; `ConnectionStatus`/`AccountStatusBanner` unmounted).
+  FLEET INTERLOCK: sibling 61db9bce246a's batch includes the adjacent rm-131
+  (`/api/connection` offload) — coordinate at the landing gate; do not wire
+  twice.
+- **rm-148 (P90) live-deployment provenance doctor** — the sidecar still
+  self-reports 0.11.0 against repo 0.12.0 and the deployed remote is 53
+  commits behind fork master; triple-minted (rm-148/rm-133/rm-135) — fold to
+  the landed-first id.
+- **rm-145/rm-146/rm-147** — Python 3.11 floor (rm-100's dated window closes
+  2026-10-31; pyproject sibling-dirty in b6659410 — coordinate), web toolchain
+  refresh (react 19/TS 7/vitest 5 drift is large but non-urgent), upstream
+  v0.13 watch (frozen at f4151d9728; PRs #83–#85 open; folds rm-098/rm-081).
+- **rm-149/rm-150** — retry duplicate-bubble and `validate_public_url`
+  redirect/rebinding pin (both assess-backed; repro scripts preserved under
+  `/tmp/6951b127-scratch/`).
+- **One-off watch:** `test_operator_mission_budget_enforcement.py::
+test_disabled_flag_zero_writes_anywhere` failed exactly once (full-gate run 2,
+workers 2, load1≈20) and passed in every other configuration (isolated 3/3,
+file 19/19, runs 1 and 3) — a store-fingerprint drift under the gate-off
+  zero-writes assertion; not diagnosed, not owned, recorded for the next
+  cycle's full-suite history differencing.
+- **Landing-gate duties:** dedupe this cycle's rm-141..rm-150 against the
+  sibling rm-131..rm-140 sets (only the provenance item overlaps by content);
+  renumber this Cycle 6 heading if sibling bf4db34f3880's uncommitted Cycle 6
+  lands first; the batch is 11 tracked-modified + 1 new test file (cycle-log
+  included) with digest `validation:v1:8c7d21a9…f103716` current at compound
+  time.

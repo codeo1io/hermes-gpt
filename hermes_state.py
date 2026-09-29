@@ -11,10 +11,24 @@ distributions).
 Behavioral notes:
 - The schema is intentionally the narrow set the chat UI exercises:
   ``create_session``, ``append_message``, ``get_messages``, ``list_sessions_rich``,
-  ``get_session``, ``try_acquire_session_turn_lease``, and
-  ``release_session_turn_lease``.
-- The full ``SessionDB`` API is **not** implemented.  Any code that calls
-  unimplemented methods will fail fast with ``NotImplementedError``.
+  ``get_session``, ``try_acquire_session_turn_lease``,
+  ``refresh_session_turn_lease``, and ``release_session_turn_lease``.
+- The full ``SessionDB`` API is **not** implemented, and unimplemented names
+  follow the standard Python attribute protocol: access raises
+  ``AttributeError`` — never ``NotImplementedError`` — so ``hasattr``
+  capability probes (the server's Bot Chat lookup, compression-tip, and
+  search probes) return ``False`` and ``getattr(name, default)`` returns the
+  default instead of crashing.  ``SessionDB.SUPPORTED_API`` lists every
+  implemented method, and calling an unimplemented method still fails fast
+  — at attribute lookup time, with that ``AttributeError``.
+- ``list_sessions_rich`` honors every row-selection filter it accepts or
+  raises ``ValueError`` — no filter is silently ignored.  Selection filters
+  that need schema data this shim does not carry (``cwd_prefix``,
+  ``search_query``, ``session_key``, ``include_children`` plus the
+  archived/pinned/hidden flags) raise ``ValueError`` when asked to select
+  rows the schema cannot express; the presentation flags ``compact_rows``
+  and ``project_compression_tips`` are accepted no-ops (rows are always the
+  same narrow column set and never carry compression tips).
 - ``source='webui'`` sessions are filtered by ``list_sessions_rich`` exactly as
   the chat UI expects.
 - This is **not** a drop-in replacement for the real SessionDB; it is a runtime
@@ -73,6 +87,21 @@ CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestam
 
 class SessionDB:
     """Minimal session store implementing the chat-UI subset of SessionDB."""
+
+    # rm-142: explicit capability surface. A real class attribute, so probing
+    # it never goes through __getattr__ and never raises.
+    SUPPORTED_API = frozenset(
+        {
+            "create_session",
+            "append_message",
+            "get_messages",
+            "get_session",
+            "list_sessions_rich",
+            "try_acquire_session_turn_lease",
+            "refresh_session_turn_lease",
+            "release_session_turn_lease",
+        }
+    )
 
     def __init__(self, db_path: Optional[Path] = None, read_only: bool = False) -> None:
         if db_path is None:
@@ -234,6 +263,57 @@ class SessionDB:
         include_hidden: bool = False,
         **kwargs: Any,
     ) -> List[Dict[str, Any]]:
+        """Return sessions filtered by every supported selection filter.
+
+        rm-142 contract: every row-selection kwarg either takes effect or
+        raises ``ValueError`` — nothing is silently ignored (unknown kwargs
+        included).  Presentation flags (``compact_rows``,
+        ``project_compression_tips``) are accepted no-ops: rows are always
+        the same narrow column set (the sessions table's columns) and never
+        carry compression tips.  Selection filters that need schema data
+        this shim does not have (archived / pinned / hidden state,
+        parent-child linkage, cwd, session_key, or searchable message
+        content) raise ``ValueError`` when asked to do anything the schema
+        cannot express; their defaults are honored vacuously (no archived,
+        pinned, hidden, or child sessions exist in this schema).
+        """
+        if cwd_prefix is not None:
+            raise ValueError(
+                "SessionDB shim cannot filter by cwd_prefix: sessions carry no cwd column"
+            )
+        if include_children:
+            raise ValueError(
+                "SessionDB shim cannot include child sessions: no parent/child linkage exists"
+            )
+        if include_archived:
+            raise ValueError(
+                "SessionDB shim cannot include archived sessions: no archived data exists"
+            )
+        if archived_only:
+            raise ValueError(
+                "SessionDB shim cannot list archived-only sessions: no archived data exists"
+            )
+        if search_query is not None:
+            raise ValueError(
+                "SessionDB shim cannot search message content: no searchable text index exists"
+            )
+        if include_pinned:
+            raise ValueError(
+                "SessionDB shim cannot include pinned sessions: no pinned data exists"
+            )
+        if session_key is not None:
+            raise ValueError(
+                "SessionDB shim cannot filter by session_key: no session_key data exists"
+            )
+        if include_hidden:
+            raise ValueError(
+                "SessionDB shim cannot include hidden sessions: no hidden data exists"
+            )
+        if kwargs:
+            unknown = ", ".join(sorted(kwargs))
+            raise ValueError(
+                f"SessionDB shim does not support list_sessions_rich filter(s): {unknown}"
+            )
         clauses = ["1=1"]
         params: List[Any] = []
         if source is not None:
@@ -328,7 +408,12 @@ class SessionDB:
             self._conn().commit()
 
     def __getattr__(self, name: str) -> Any:
-        # Fail closed on any SessionDB method the chat UI does not exercise.
-        raise NotImplementedError(
-            f"hermes_gpt SessionDB shim does not implement '{name}'"
+        # rm-142: missing attributes must follow the Python protocol so
+        # capability probes degrade instead of crashing:
+        #   hasattr(db, name) -> False, getattr(db, name, default) -> default.
+        # Calling an unimplemented method still fails fast — here, at lookup
+        # time. Probe SessionDB.SUPPORTED_API for the implemented surface.
+        raise AttributeError(
+            f"hermes_gpt SessionDB shim does not implement '{name}' "
+            "(supported: see SessionDB.SUPPORTED_API)"
         )
