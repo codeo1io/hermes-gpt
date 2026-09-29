@@ -908,4 +908,98 @@ Batch B1 "OAuth Surface Truth & Registry Lifecycle" implemented in worktree run-
 - acceptance: correlation-only scope — accept and echo incoming traceparent into operator audit records and live events for MCP tool calls and delegation/codex dispatch (no full OTel SDK adoption); tests assert presence and passthrough; docs note the convention
 - evidence: new tests; sample audit/live-event records carrying trace ids; docs updated
 
+<!-- cycle-5 additions below: run b665941020024956b7fca47ce2b28813 (assess 3a6f12e044de4a83952eacb3f64c5e97, research 38da61c915da42cd8069cf2479600f71) — authored 2026-10-01 against HEAD caf60018d2; new ids continue at rm-102, unique through rm-101 across the fleet's unmerged lineages (runs 0aa75ea44f93 and 1a6beebac21c hold unlanded cycle-5 blocks minting rm-085..rm-094 and rm-095..rm-101 in their worktrees) and through rm-084 on disk at this HEAD (fleet invariant; this block starts past that ceiling so the landing gate needs no renumbering here — overlap items are same-defect convergences, folded/deduped at the gate per the landed-first convention), render footer stays last -->
+
+## Cycle 5 research digest — run b665941020024956b7fca47ce2b28813 (2026-10-01; repository-maintenance cycle 1)
+
+Base: clean worktree run-b66594102002-b6659410 at HEAD caf60018d2 (the integration merge that landed run bb9c68fb's cycle-4 batch, ids rm-076..rm-084 above). Baseline re-verified by this run's assess (attempt 3a6f12e0): focused lanes green in the worktree venv (test_ui_chat, test_oauth_auth, test_operator_live_events, test_operator_diagnostics, test_ui_security; logs under /tmp/b6659410-assess/) on py3.10 / mcp 2.2.0 / starlette 1.3.1. Twelve findings: 3 new (turn lease never renewed; no graceful-shutdown bound; docs/README authority-map release-row drift) + 9 verified remainders (rm-076 OAuth exchange/persist remainder, rm-080's empty-page cursor adoption gap, py3.10 asyncio.TimeoutError alias, ui_ops fire-and-forget dispatch + duplicate cron runs, doctor ui_mount tail false-PASS, token_store key-file perms + WAL sidecars, 28/90 env knobs undocumented, starlette undeclared, GET-only fabric/mission surfaces confirmed clean — clean-bill record kept so later phases do not re-litigate).
+
+External evidence probed 2026-10-01 (research attempt 38da61c9, artifact /tmp/b6659410-research/2026-10-01-repository-extensions-ideation.md): upstream asimons81 master tip f4151d9728 = PR #82 merged 2026-09-30 ("Autopilot (v0.13) — durable, default-off Mission runtime"); fork gap exactly 9 commits and caf60018d2 is NOT an ancestor, so adoption is a true merge — scope 58 files +11252/−112 (new test_ui_autopilot.py +261, ui_missions.py +81); v0.13.0 STILL UNTAGGED (highest tag v0.12.0); PRs #83/#84 open (v0.13 docs/site prep; #83 corrects release-note test_ui_chat and branch-state claims) and #85 open (configurable file backups, touches fork-owned operator_workspace.py + docs/operator-mode.md); issue #74 closed, PR #76 closed unmerged. OSV querybatch: 0 vulnerabilities on all 8 installed pins. PyPI hermes-gpt 0.12.0 live (release-record claims truthful). ruff 0.16.9 latest vs pin >=0.15,<0.16. starlette 1.7.0 latest vs 1.3.1 in-env (transitive via mcp[cli], undeclared); anyio 4.15.1 vs 4.14.2 in-env; mcp 2.2.0 current and in range. Python 3.10 EOL 2026-10-31 (30 days). No Python lockfile tracked (.gitignore:5 ignores uv.lock; CI installs pip install -e ".[dev]" at ci.yml:63,126,141).
+
+Id note: rm-102..rm-115 are assigned past the highest sibling-minted id (rm-101, run 1a6beeba's unlanded block) to keep the fleet id space collision-free. Known same-defect convergences with sibling unlanded blocks: rm-104~rm-092, rm-107~rm-096, rm-108~rm-099, rm-109~rm-100, rm-110~rm-095, rm-112~rm-094, rm-103~rm-098 — treat titles+signals as canonical and fold at the landing gate per the landed-first convention. First-minted by this run: rm-102 (turn-lease renewal), rm-105 (graceful-shutdown bound), rm-106 (bounded dispatch registry + cron dedupe), rm-111 (doctor live-state check), rm-113 (authority-map rows), rm-114 (token_store atomic perms), rm-115 (upstream-gap watch).
+
+### Renew the chat turn lease for long turns (wire the dead refresh API)
+- id: `rm-102` | track: reliability | priority: 125.0 | status: candidate
+- signals: conductor.run-b6659410:assess-F1 (HIGH), ui_chat.py:748 acquires try_acquire_session_turn_lease(ttl_seconds=300.0); hermes_state.py:309-315 refresh_session_turn_lease exists with ZERO callers (grep across *.py exit 1 — dead code); _run_turn releases only at completion (ui_chat.py:596); rm-076 comment block at :731-734 shows the same invariant-aware fix pattern already in file
+- acceptance: the turn worker renews the lease on an interval well under the TTL (e.g. every 60s) for the live turn, with renewal failure triggering the existing turn-abort path; a regression test runs a turn longer than the TTL against a stub clock (or short-TTL fixture) and asserts (a) a second acquire for the same session stays rejected, (b) the lease is still held at turn end; hermes_state refresh API gains a caller or is deleted (no dead code left)
+- evidence: diff (ui_chat.py + hermes_state.py); new long-turn regression test red pre-fix / green post-fix; test_ui_chat.py full lane green
+
+### Adopt upstream v0.13 Autopilot (gated on the v0.13.0 tag)
+- id: `rm-103` | track: compatibility | priority: 95.0 | status: candidate (tag-gated)
+- signals: conductor.run-b6659410:research-R2, git ls-remote upstream tip f4151d9728 (PR #82 merged 2026-09-30, durable default-off Mission runtime); gap 9 commits, caf60018d2 not an ancestor (true merge), scope 58 files +11252/−112; v0.13.0 UNTAGGED; #83/#84 open (release-notes corrections incl. test_ui_chat claims; site refresh); #85 open touching fork-owned operator_workspace.py (file-backup configuration meshes/conflicts with the fork's copy)
+- acceptance: merge upstream master once v0.13.0 is tagged AND #83's release-notes corrections land (moving target until then — same deferral rationale as prior cycles); conflicts resolved on operator_workspace.py/test_operator_workspace.py against #85's direction; upstream's new test_ui_autopilot.py green on both SDK lanes; CHANGELOG records the adoption; product invariants re-checked (Autopilot default-off must not change loopback/read-only defaults)
+- evidence: integration merge record; rev-list count == 0 post-merge; full suite green on both SDK lanes; CHANGELOG diff
+
+### Offload OAuth token persist/exchange off the serving loop (rm-076 remainder)
+- id: `rm-104` | track: reliability | priority: 80.0 | status: candidate
+- signals: conductor.run-b6659410:assess (verified remainder of rm-076), oauth_auth.py:1651 async token endpoint and :1523 register_client call sync token-store sqlite persist (_run_persist_hook :1583 -> :901); token_store.py:372-376 busy_timeout=15000 — worst-case 15s loop stall; the asyncio.to_thread pattern is established in-file at ui_chat.py:731-748
+- acceptance: every blocking token-store/persist call reachable from async OAuth handlers runs via asyncio.to_thread; a loop-stall regression test in the rm-076 shape (hold the store lock in a background thread, assert a concurrent request completes within a bound) covers the OAuth path; test_oauth_auth.py green
+- evidence: diff showing offloads only (no wire-behavior change); new regression test red pre-fix / green post-fix; oauth lane green
+
+### Bound graceful shutdown and drain live SSE/WS connections
+- id: `rm-105` | track: reliability | priority: 75.0 | status: candidate
+- signals: conductor.run-b6659410:assess-F2 (MEDIUM), server.py:3802 and :3866 uvicorn.run call sites pass no timeout_graceful_shutdown and install no signal/lifespan hook (grep across non-test code: zero add_signal_handler/lifespan/shutdown-drain matches); live SSE loop ui_chat.py:609-626 and WS loop operator_live_events.py:357+ have no drain path — SIGTERM waits unbounded until supervisor SIGKILL, skipping lease release and audit flush
+- acceptance: both uvicorn.run sites set timeout_graceful_shutdown (bounded, e.g. 10s) and a lifespan/shutdown hook cancels SSE/WS loops and flushes audit state on exit; a test drives shutdown with an open SSE or WS connection and asserts the server exits within the bound with connections closed and leases released; uvicorn range >=0.30 supports the kwarg (verified in-repo range)
+- evidence: diff (server.py + loop cancellation); new shutdown test with timing assertion; server/test_server lanes green
+
+### Bounded tool-dispatch registry with cron dedupe and completion audit
+- id: `rm-106` | track: reliability | priority: 70.0 | status: candidate
+- signals: conductor.run-b6659410:assess, ui_ops.py:621 threading.Thread(daemon=True) fire-and-forget dispatch: no registry, no concurrency bound, no completion record (only dispatch-time success); duplicate concurrent hermes_cron_run executions observed; corroborated by open runbook docs/solutions/mcp-cron-create-dead-jobs.md (status: workaround, date_resolved: null)
+- acceptance: dispatches register in a bounded registry (structure + cap) before launch, per-job in-flight dedupe for cron reruns (second trigger while running is rejected or queued by explicit policy), and completion state is written on finish (success/failure/abandoned) so doctor and the runbook can distinguish dead from slow; the mcp-cron-create-dead-jobs runbook gains a resolution or points at the registry; tests cover dedupe, cap enforcement, and completion records incl. the thread-crash path
+- evidence: diff (ui_ops.py + registry module or in-file); tests red pre-fix for the duplicate-cron case; runbook status update; test_ui_ops.py green
+
+### Admission control for the mission-events long-poll
+- id: `rm-107` | track: reliability | priority: 65.0 | status: candidate
+- signals: conductor.run-b6659410:research-R6, ui_missions.py:25 _MAX_WAIT_MS=25_000 and :109-118 mission_events long-poll runs hermes_live_events_since via run_in_threadpool for up to 25s per request with no limiter (grep: no CapacityLimiter in non-test code); starlette's AnyIO worker pool defaults to 40 tokens — ~40 quiet-stream polls pin the pool for 25s each and stall every other threadpool endpoint (incl. the offloaded rm-076/rm-104 work)
+- acceptance: a capacity limiter (or equivalent semaphore sized by explicit rationale) bounds concurrent long-polls; over-limit requests get a bounded wait or immediate empty response per documented policy, not an unbounded queue; a test saturates the bound with stub streams and asserts a non-mission threadpool endpoint still completes within a bound; docs/live-events.md or operator-mode notes the bound and the policy
+- evidence: diff; saturation test red pre-fix (endpoint stalls) / green post-fix; docs note; test lane green
+
+### Declare starlette+anyio and record the lockfile decision
+- id: `rm-108` | track: packaging | priority: 60.0 | status: candidate (decision)
+- signals: conductor.run-b6659410:research-R7, 9 first-party modules import starlette directly (server.py, ui_chat.py, ui_missions.py, ui_ops.py, operator_live_events.py, ...) but pyproject dependencies declare neither starlette nor anyio; in-env resolution is starlette 1.3.1 only via mcp[cli] transitive (latest 1.7.0) — any upstream reshuffle breaks first-party installs; .gitignore:5 ignores uv.lock and CI installs from ranges (ci.yml:63,126,141) — a deliberate posture, not an accident, so the lockfile half is a recorded decision, not a drive-by
+- acceptance: starlette and anyio declared in pyproject dependencies with ranges consistent with the mcp floor; a fresh `pip install -e .` in a clean venv imports the server with only declared deps (no transitive accident), asserted by a CI check or documented dev-container step; the lockfile decision is recorded in docs (README packaging section or CONTRIBUTING): EITHER track uv.lock for the app surface, adopt a PEP 751 pylock export, or document range-only posture with rationale
+- evidence: pyproject diff; clean-venv install/import check output; decision note diff; CI green
+
+### Raise the Python floor to 3.11 before 3.10 EOL (dated)
+- id: `rm-109` | track: packaging | priority: 55.0 | status: candidate (decision, dated)
+- signals: conductor.run-b6659410:research-R8, pyproject requires-python >=3.10 while endoflife.date puts 3.10 EOL at 2026-10-31 (30 days out at authoring); operator_live_events.py:396 `except TimeoutError` misses asyncio.TimeoutError on 3.10 (alias only on 3.11+) — the floor bump retires that defect class; tomli <3.11 conditional dependency drops with the floor; mcp 2.2.0 classifiers already cover 3.11-3.14
+- acceptance: requires-python raised to >=3.11 (with a 3.13 CI lane per rm-024 precedent), tomli conditional removed, CHANGELOG records the drop with a release-note rationale for 3.10 users; OR the 3.10 lane is explicitly re-affirmed in the roadmap with a dated revisit before 2026-10-31 and the TimeoutError alias is fixed in place as a 1-line except-tuple change; both paths lock the decision against the EOL date
+- evidence: pyproject/CHANGELOG diff + CI matrix update, or the recorded re-affirmation + the alias-fix diff with a test on 3.10
+
+### Adopt next_cursor on empty filtered WS pages and fix the idle-timeout guard
+- id: `rm-110` | track: reliability | priority: 50.0 | status: candidate
+- signals: conductor.run-b6659410:research-R9 (verified remainder of rm-080), operator_live_events.py:384 gates cursor adoption on `if events:` so a non-truncated but empty filtered page never adopts the high watermark — active filters rescan the same window forever (contradicts docs/live-events.md:42); :395-396 `except TimeoutError` misses asyncio.TimeoutError on py3.10, killing idle streams with an unhandled error instead of the intended 0.5s poll tick
+- acceptance: a non-truncated page advances next_cursor to the watermark regardless of visible-event count (empty-page test added to the rm-080 suite); the except clause catches both timeout classes (tuple or asyncio.TimeoutError) with a test on each SDK/py lane; docs/live-events.md cursor claim re-verified against behavior
+- evidence: diff (operator_live_events.py); empty-page + idle-timeout tests red pre-fix / green post-fix; test_operator_live_events.py green
+
+### Doctor ui_mount: live state, not a capped audit tail
+- id: `rm-111` | track: correctness | priority: 40.0 | status: candidate
+- signals: conductor.run-b6659410:research-R10 (extends landed rm-078), operator_diagnostics.py:581 ui_mount check scans the last 50 audit records (tool filter :594) for the boot-time mount-failure record — on an active server the record ages out of the capped tail within minutes and doctor reports UI_MOUNT_HEALTHY while the UI is down (false-PASS on a signal operators are told to trust)
+- acceptance: the check reads current mount state (app route table / live mount probe) or an unbounded failure latch, not a capped tail; a test writes >50 audit records after a mount failure and asserts doctor still reports the failure; docs/operator-mode.md doctor section updated to match
+- evidence: diff (operator_diagnostics.py); aging-tail test red pre-fix / green post-fix; test_operator_diagnostics.py green
+
+### Document the env-knob surface with a drift guard
+- id: `rm-112` | track: docs | priority: 35.0 | status: candidate
+- signals: conductor.run-b6659410:research-R11, 28 of 90 HERMES_GPT_* knobs appear nowhere in docs/*.md, README.md, or CLI help — including security-adjacent OPERATOR_DENIED_PATHS and HERMES_GPT_ALLOW_PRIVATE_NETWORK; extraction done by source scan this run (artifact /tmp/b6659410-research/)
+- acceptance: every knob documented in the right guide (operator-mode/README/codex) with default + gate semantics per AGENTS.md doc rules; a guard test extracts knob names from source and fails when a knob is neither documented nor on a reviewed backlog allowlist (allowlist entries carry their owning rm-id); the two security-adjacent knobs land first
+- evidence: docs diff; guard test output listing 0 undocumented/0 unreviewed; allowlist file with rm-id annotations
+
+### docs/README authority-map release rows point at the current record
+- id: `rm-113` | track: docs | priority: 30.0 | status: candidate
+- signals: conductor.run-b6659410:assess-F3 (MEDIUM), docs/README.md:49-52 authority-map rows label release-notes-v0.8.0.md / v0.6.0.md as the current release record while the same file states version 0.12.0 (:15-17) and PyPI serves 0.12.0 (verified live); actual v0.11/v0.12 notes exist only under docs/releases/
+- acceptance: the release-record row points at docs/releases/v0.12.0-release-notes.md (verified to exist) and older notes are re-filed as historical per the AGENTS.md marking rule; a sibling check asserts the authority-map row and pyproject version agree (manual checklist item or a docs lint if one lands)
+- evidence: docs/README.md diff; link targets verified present; maintenance-cycle-log gains the cycle-5 row per its format
+
+### Atomic token_store key-file permissions and WAL sidecar modes
+- id: `rm-114` | track: security | priority: 28.0 | status: candidate
+- signals: conductor.run-b6659410:research-R13, token_store.py:128 writes the master key via tmp.write_bytes then chmods 0600 at :129 — umask-visible window between write and chmod; the atomic pattern already exists in-file (O_CREAT|0o600 at :326); db file chmod 0600 (:378-379) never covers the -wal/-shm sidecars sqlite creates
+- acceptance: key file created with O_CREAT|0o600 before any write (reuse the :326 pattern); post-open check asserts -wal/-shm sidecars are 0600 (or the store disables WAL if that conflicts with the durability rationale — record which); tests assert modes on a fresh store incl. after a checkpoint cycle
+- evidence: diff (token_store.py); mode-assertion tests green on a fresh tmp store; rationale note for the WAL decision
+
+### tools/upstream-gap watch: automate the fork-vs-upstream probe
+- id: `rm-115` | track: developer-experience | priority: 20.0 | status: candidate
+- signals: conductor.run-b6659410:research-R14 (reasoned, accepted after rejecting vaguer watch ideas), every maintenance cycle re-derives fork/upstream state by hand — this run alone ran six probe commands (ls-remote tip+tags, rev-list count, merge-base, PR list, diff-stat) and sibling runs repeated them same-day; tools/ carries only check_package_hygiene.py; rm-103's adopt-on-tag gate is currently a manual watch
+- acceptance: tools/upstream_gap.py (or equivalent) prints distance to upstream master, newest tag, whether the fork tip is an ancestor (ff vs true-merge), open-PR list, and flags when an upstream tag appears that the fork has not adopted — usable as the mechanical trigger for rm-103; documented in docs/maintenance-cycle-log.md or the runbook index; runs read-only against git remotes (no network writes)
+- evidence: new tool + sample output captured in a cycle artifact; README/docs pointer; no network mutations (loopback-only posture preserved)
+
 <!-- managed by hermes-roadmap render; do not edit by hand -->

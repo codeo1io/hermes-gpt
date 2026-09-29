@@ -211,3 +211,55 @@ pre-existing environment skips; ruff clean. 14 tracked files changed,
 - **Candidate hardening:** autouse fixture resetting `set_audit_log_override`;
   additive py3.13 CI lane (ci edits were prohibited in-cycle); the two
   environment-dependent skips in the full suite remain unowned.
+
+## Cycle 5 — 2026-10-01 — "Turn-lease renewal + bounded graceful shutdown"
+
+Run `b665941020024956b7fca47ce2b28813` (repository-maintenance `d9d185eb`) against
+the worktree at `caf60018d2`. Selected batch from the cycle-5 roadmap block in the
+root [`../ROADMAP.md`](../ROADMAP.md): rm-102 + rm-105 + rm-113, rider rm-115.
+
+### What the cycle did
+
+- **rm-102 (HIGH, reliability):** chat turns acquired the session turn lease with
+  a 300 s TTL but never renewed it, so any turn longer than the TTL silently lost
+  the one-live-turn invariant (`ui_chat.py`; `hermes_state.refresh_session_turn_lease`
+  was dead code with zero callers). The turn worker now renews at one-fifth of the
+  TTL, and a lease that can no longer be renewed aborts the turn on the existing
+  cancellation path instead of expiring underneath it.
+- **rm-105 (MEDIUM, reliability):** neither `uvicorn.run` site set
+  `timeout_graceful_shutdown` and no lifespan drained live SSE/WS streams, so
+  SIGTERM could hang until killed and kill the process with the turn lease still
+  held. Both run sites are bounded (10 s), and the composed ASGI lifespan drains
+  registered chat SSE and operator live-event WS streams (5 s) via the new
+  `live_streams` registry before the MCP lifespan closes.
+- **rm-113 (MEDIUM, docs truth):** `docs/README.md` labeled the v0.8.0 and v0.6.0
+  release-note rows "current release record" against repository version 0.12.0,
+  and the v0.10/v0.11/v0.12 note files had no authority-map rows at all. The two
+  stale labels were corrected and the three missing rows added.
+- **rm-115 (rider, tooling):** `tools/upstream_gap.py` — a read-only probe of the
+  upstream gap (commits, tags, open PRs) so cycle planning does not re-derive it
+  by hand; see the usage pointer in Local toolchain notes below.
+
+### Prevention rules established
+
+- A TTL'd lease with no renewal path is a defect, not an optimization: new lease
+  acquire sites ship with their renewal + loss semantics and a regression test.
+- Every `uvicorn.run` site sets `timeout_graceful_shutdown`; long-lived streaming
+  handlers register with `live_streams` so shutdown can cancel them promptly.
+
+### Local toolchain notes (small, reusable)
+
+- `python tools/upstream_gap.py [--repo-root PATH] [--remote NAME] [--json]` answers
+  the cycle-planning probes in one read-only call: behind/ahead counts against
+  `<remote>/master`, fast-forward-vs-merge, newest local vs remote tag (an absent
+  `v0.13.0` is the rm-103 gate), and open upstream PRs via `gh` (best effort —
+  offline fields degrade to `null`/unknown and the probe still exits 0). It never
+  fetches or mutates refs; the rm-103 re-probe trigger is one command, not a
+  re-derivation.
+
+### Context left for the next cycle
+
+- Deferred cycle-5 candidates stay in the roadmap block: rm-103 is gated on the
+  v0.13.0 tag plus open PRs #83/#84/#85; rm-106, rm-111, and rm-114 are contested
+  by sibling-run implementations and fold at the landing gate; rm-104/rm-112 were
+  implemented by run `0aa75ea44f93`.

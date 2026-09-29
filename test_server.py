@@ -1637,3 +1637,33 @@ def test_history_enabled_connector_surface_acceptance(monkeypatch):
         assert schema["properties"]["profile"]["default"] == "default"
 
     assert (enabled.version if hasattr(enabled, "version") else enabled._mcp_server.version) == versioning.VERSION == "0.12.0"
+
+
+# ── rm-105: bounded graceful shutdown + live-stream drain ──────────────────
+
+def test_asgi_lifespan_drains_live_streams_on_shutdown(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import live_streams
+
+    drained = []
+
+    async def fake_drain(timeout_s):
+        drained.append(timeout_s)
+        return {"cancelled": 0, "uncancelled": 0, "timeout_s": timeout_s}
+
+    monkeypatch.setattr(live_streams, "drain", fake_drain)
+    built = server.build_server(http=True)
+    app = server.build_asgi_app(built, http=True)
+    with TestClient(app) as client:
+        assert client.get("/").status_code in (200, 400, 404, 405)
+    assert drained == [server.SHUTDOWN_STREAM_DRAIN_S], (
+        "lifespan shutdown must drain registered live streams exactly once"
+    )
+
+
+def test_both_uvicorn_run_sites_set_timeout_graceful_shutdown():
+    source = Path(server.__file__).read_text()
+    assert source.count("timeout_graceful_shutdown=SHUTDOWN_GRACE_S") == 2, (
+        "both uvicorn.run sites must stay bounded"
+    )
+    assert 0 < server.SHUTDOWN_STREAM_DRAIN_S < server.SHUTDOWN_GRACE_S

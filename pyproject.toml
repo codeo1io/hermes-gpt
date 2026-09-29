@@ -108,6 +108,7 @@ py-modules = [
   "ui_api",
   "ui_security",
   "ui_chat",
+  "live_streams",
   "ui_ops",
   "ui_fabric",
   "ui_missions",

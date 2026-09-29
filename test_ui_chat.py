@@ -620,3 +620,211 @@ def test_session_endpoints_do_not_stall_event_loop_under_sessiondb_lock(app):
             release.set()
 
     asyncio.run(scenario())
+
+
+# ── rm-102: session turn-lease renewal ─────────────────────────────────────
+
+class _FakeLeaseDB:
+    """Minimal stand-in for the SessionDB lease methods used by renewal."""
+
+    def __init__(self, outcomes):
+        # outcomes: list of results/exceptions, one per refresh call; the last repeats.
+        self.outcomes = list(outcomes)
+        self.calls = 0
+
+    def refresh_session_turn_lease(self, session_id, holder, ttl_seconds=None):
+        self.calls += 1
+        outcome = self.outcomes[min(self.calls - 1, len(self.outcomes) - 1)]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+def test_lease_renewal_aborts_turn_when_lease_lost():
+    turn = ui_chat.Turn(session_id="s-lost", turn_id="t1", holder="holder-a")
+    db = _FakeLeaseDB([False])
+    stop = threading.Event()
+    ui_chat.TURN_LEASE_REFRESH_INTERVAL_S = 0.005
+    try:
+        ui_chat._run_lease_renewal(turn, db, "holder-a", stop)
+    finally:
+        ui_chat.TURN_LEASE_REFRESH_INTERVAL_S = ui_chat.TURN_LEASE_TTL_S / 5.0
+    assert db.calls == 1
+    assert turn.cancel_requested is True, "lost lease must abort the turn"
+
+
+def test_lease_renewal_tolerates_transient_store_error_then_aborts_on_loss():
+    turn = ui_chat.Turn(session_id="s-flaky", turn_id="t2", holder="holder-b")
+    db = _FakeLeaseDB([RuntimeError("store busy"), False])
+    stop = threading.Event()
+    ui_chat.TURN_LEASE_REFRESH_INTERVAL_S = 0.005
+    try:
+        ui_chat._run_lease_renewal(turn, db, "holder-b", stop)
+    finally:
+        ui_chat.TURN_LEASE_REFRESH_INTERVAL_S = ui_chat.TURN_LEASE_TTL_S / 5.0
+    assert db.calls == 2, "transient error must be retried, not fatal"
+    assert turn.cancel_requested is True
+
+
+def test_lease_renewal_renews_until_stopped():
+    turn = ui_chat.Turn(session_id="s-live", turn_id="t3", holder="holder-c")
+    db = _FakeLeaseDB([True])
+    stop = threading.Event()
+    ui_chat.TURN_LEASE_REFRESH_INTERVAL_S = 0.005
+    worker = threading.Thread(
+        target=ui_chat._run_lease_renewal, args=(turn, db, "holder-c", stop), daemon=True
+    )
+    try:
+        worker.start()
+        time.sleep(0.08)
+    finally:
+        stop.set()
+        worker.join(timeout=1.0)
+        ui_chat.TURN_LEASE_REFRESH_INTERVAL_S = ui_chat.TURN_LEASE_TTL_S / 5.0
+    assert db.calls >= 2, "healthy lease must keep renewing"
+    assert not worker.is_alive()
+    assert turn.cancel_requested is False, "renewed lease must not abort the turn"
+
+
+def test_lease_renewal_interval_is_well_under_ttl():
+    assert ui_chat.TURN_LEASE_REFRESH_INTERVAL_S * 2 < ui_chat.TURN_LEASE_TTL_S
+    assert ui_chat.TURN_LEASE_TTL_S == 300.0
+
+
+def test_turn_outliving_ttl_keeps_lease_and_releases_it(tmp_path, monkeypatch):
+    """rm-102 acceptance, end to end against the real lease store.
+
+    A turn that runs past the lease TTL must still hold the lease (a second
+    acquire for the same session stays rejected) and must release it at turn
+    end. Against the pre-fix code the mid-turn acquire succeeds at ~TTL,
+    which is exactly the invariant loss rm-102 closes.
+    """
+    import importlib.util
+
+    # Load the repo shim by file path, never inserted into sys.modules, so
+    # the live deployment's hermes_state cannot shadow it in this process.
+    shim_path = Path(ui_chat.__file__).parent / "hermes_state.py"
+    spec = importlib.util.spec_from_file_location("b665_turn_lease_shim", str(shim_path))
+    shim = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(shim)
+    db = shim.SessionDB(db_path=tmp_path / "lease.db")
+
+    monkeypatch.setattr(ui_chat, "TURN_LEASE_TTL_S", 0.5)
+    monkeypatch.setattr(ui_chat, "TURN_LEASE_REFRESH_INTERVAL_S", 0.1)
+
+    session_id, holder = "s-long-turn", "holder-long"
+    turn = ui_chat.Turn(session_id=session_id, turn_id="t-long", holder=holder)
+    assert db.try_acquire_session_turn_lease(session_id, holder, ttl_seconds=0.5)
+
+    class _NoAgent:
+        pass  # never driven: _execute_turn is stubbed below
+
+    monkeypatch.setattr(ui_chat, "_build_agent", lambda **kwargs: _NoAgent())
+
+    release_turn = threading.Event()
+
+    def _slow_execute(agent, turn_arg, *, message, db):
+        # Hold the turn open until the main thread has probed past the
+        # original TTL; wall-clock sleep alone cannot guarantee ordering
+        # under load, the event can.
+        release_turn.wait(timeout=10.0)
+        return {"ok": True}
+
+    monkeypatch.setattr(ui_chat, "_execute_turn", _slow_execute)
+
+    worker = threading.Thread(
+        target=ui_chat._run_turn,
+        kwargs=dict(
+            turn=turn, message="hi", profile="default", model="m", db=db, holder=holder
+        ),
+        daemon=True,
+    )
+    worker.start()
+    try:
+        time.sleep(0.8)  # past the 0.5 s TTL: only renewal can keep the lease
+        mid_turn_acquire = db.try_acquire_session_turn_lease(
+            session_id, "intruder-holder", ttl_seconds=0.5
+        )
+        assert turn.cancel_requested is False
+    finally:
+        release_turn.set()
+        worker.join(timeout=5.0)
+    assert mid_turn_acquire is False, (
+        "a second turn acquired the lease while the first still ran past the TTL"
+    )
+    assert not worker.is_alive()
+    # Turn finished: the lease must be released so the next turn can start.
+    assert db.try_acquire_session_turn_lease(session_id, "next-holder", ttl_seconds=0.5)
+
+
+def test_run_turn_stops_renewal_before_releasing_lease():
+    source = Path(ui_chat.__file__).read_text()
+    assert "renewal_stop.set()" in source and "renewal.start()" in source
+    release_pos = source.index("db.release_session_turn_lease(turn.session_id, holder)")
+    stop_pos = source.index("renewal_stop.set()")
+    assert stop_pos < release_pos, "renewal must be stopped before the lease is released"
+
+
+def test_request_turn_abort_interrupts_agent_once():
+    class Boom:
+        calls = 0
+
+        def interrupt(self, hard_cancel=False):
+            Boom.calls += 1
+            raise RuntimeError("interrupt unavailable")
+
+    turn = ui_chat.Turn(session_id="s-abort", turn_id="t4", holder="holder-d")
+    turn.agent = Boom()
+    ui_chat._request_turn_abort(turn, "client_requested")
+    assert turn.cancel_requested is True
+    assert Boom.calls == 1, "interrupt must be attempted exactly once"
+    turn.agent = None
+    ui_chat._request_turn_abort(turn, "again")  # must tolerate missing agent
+
+
+def test_sse_generators_register_and_deregister_with_live_streams(monkeypatch):
+    import asyncio
+
+    calls = []
+
+    def fake_register_current():
+        marker = object()
+        calls.append(("register", marker))
+        return marker
+
+    def fake_deregister(marker):
+        calls.append(("deregister", marker))
+
+    monkeypatch.setattr(ui_chat.live_streams, "register_current", fake_register_current)
+    monkeypatch.setattr(ui_chat.live_streams, "deregister", fake_deregister)
+
+    def run_generator(gen_factory):
+        async def drive():
+            collected = []
+            async for chunk in gen_factory():
+                collected.append(chunk)
+            return collected
+
+        return asyncio.run(drive())
+
+    def finished_turn(turn_id, batch):
+        # Snapshot always reports `batch` with done=True; the generators must
+        # terminate once last >= turn.seq instead of ping-looping forever.
+        turn = ui_chat.Turn(session_id="s-sse", turn_id=turn_id, holder="holder-e")
+        turn.seq = max((seq for seq, _event, _data in batch), default=0)
+        turn.snapshot_after = lambda after, timeout=None: (batch, True)
+        return turn
+
+    # One final event then done: the generator yields it and returns.
+    batch = [(1, "done", {"ok": True})]
+    chunks = run_generator(lambda: ui_chat._sse_generator(finished_turn("t5", batch)))
+    assert len(chunks) == 1 and "done" in chunks[0], chunks
+
+    chunks = run_generator(
+        lambda: ui_chat._replay_generator(finished_turn("t6", batch), after=0)
+    )
+    assert len(chunks) == 1, chunks
+
+    assert [c[0] for c in calls] == ["register", "deregister", "register", "deregister"]
+    # Each generator's marker is the one deregistered: pairs must match.
+    assert calls[0][1] is calls[1][1] and calls[2][1] is calls[3][1]
