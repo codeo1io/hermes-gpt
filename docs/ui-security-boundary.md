@@ -53,6 +53,49 @@ without unbounded latency is tracked follow-up work. The marker table is
 `SECRET_SHAPES` table can grow into — so the streaming boundary and the
 envelope boundary cannot drift apart.
 
+### 1a. SSE reconnect contract (`gap` event, `Last-Event-ID`)
+
+Every SSE frame carries an `id: {seq}`. A reconnect resumes from that seq:
+`GET /api/chat/stream` reads the standard `Last-Event-ID` request header
+(which a native `EventSource` resends automatically) and falls back to the
+explicit `?after=` query param when the header is absent; the header wins
+when both are present.
+
+The replay ring per turn is bounded (`TURN_EVENT_RING_MAX` = 4096 events), so
+a long turn (token deltas are ring events) can evict the oldest buffered
+events. When a reconnect's cursor predates what survived, the first batch
+begins with an explicit `gap` event naming the floor:
+
+```
+event: gap
+id: <ring_floor - 1>
+data: {"type":"ring_floor","turn_id":"t-…","gap_from":<cursor+1>,"ring_floor":<floor>,"remedy":"replay buffer overflowed; re-read the transcript via GET /messages"}
+```
+
+`gap_from`..`ring_floor - 1` is the range that is gone; the client re-reads
+`GET /api/sessions/{id}/messages` for it. The `gap` frame's own id is
+`ring_floor - 1`, so a client that reconnects carrying it resumes exactly at
+the surviving floor and does not re-trigger the signal — no reconnect can
+observe a silently truncated stream as if it were complete. The `gap` event
+is derived state, not a buffered turn event: it is emitted outside the ring
+and therefore redacted directly (`ui_security.redact_browser`, strict mode)
+at emit time rather than at the `Turn.publish` chokepoint — it carries only
+ids, the turn id, and a fixed remedy string. Heartbeat (`: ping`) semantics
+are unchanged.
+
+### 1b. Transcript window (`GET /api/sessions/{id}/messages`)
+
+With no query params the endpoint returns the NEWEST page (up to
+`MESSAGE_PAGE_LIMIT` = 500 rows, oldest-first within the page so a client
+renders them in order) plus a `page` block (`limit`, `oldest_id`,
+`has_older`). Paging is keyset-based on the message id —
+`?before_id=<oldest visible id>` walks older, `?after_id=<newest visible
+id>` polls for newer — so every row of a long session is reachable without
+`OFFSET` scans; a cursor that is not an integer is a 400, never a silently
+ignored param. The whole payload is serialized with `content_allowed=True`
+(it is the user's own conversation text); the `page` block is ids and
+integers only.
+
 ## 2. What is redacted (strict mode)
 
 - Raw prompts, memory bodies, transcripts, request dumps, credentials, and
@@ -167,9 +210,13 @@ Existing env behavior is unchanged.
 ## 8. Verification
 
 ```bash
-python -m pytest test_ui_security.py      # 33 tests: redaction properties,
-                                          # account states, auth boundary,
+python -m pytest test_ui_security.py      # redaction properties, account
+                                          # states, auth boundary,
                                           # allowlist semantics, /api/* sweep
+python -m pytest test_ui_chat.py           # 35 tests: SSE encoding,
+                                          # newest-window + keyset paging,
+                                          # Last-Event-ID + ring-floor gap,
+                                          # turn lifecycle, lease handling
 cd web && npm install && npx tsc --noEmit  # frontend shared skeleton typecheck
 ```
 

@@ -1,24 +1,23 @@
-"""Minimal SessionDB-compatible shim for hermes-gpt UI chat.
+"""SQLite session store for the hermes-gpt UI chat (``source='webui'``).
 
-The full Hermes Agent ``hermes_state.SessionDB`` is a heavy, multi-mixin module
-with FTS5, CJK trigrams, and deep integrations into the Hermes CLI.  The
-hermes-gpt chat UI only needs a small, stable subset of its interface for
-persisting webui conversations.  This module provides a lightweight SQLite
-implementation of that subset so the sidecar can run in environments where the
-Hermes Agent source tree is not available (e.g., CI, fresh installs, or packaged
-distributions).
+A UI conversation IS a session in this store, and this module IS the one
+implementation the chat sidecar uses: ``ui_chat._session_db`` imports exactly
+this ``SessionDB``. There is no second "real" implementation to fall back to —
+the store is deliberately self-contained so the browser UI works where no
+Hermes Agent source tree exists (CI, fresh installs, packaged distributions).
 
 Behavioral notes:
 - The schema is intentionally the narrow set the chat UI exercises:
   ``create_session``, ``append_message``, ``get_messages``, ``list_sessions_rich``,
   ``get_session``, ``try_acquire_session_turn_lease``, and
   ``release_session_turn_lease``.
-- The full ``SessionDB`` API is **not** implemented.  Any code that calls
-  unimplemented methods will fail fast with ``NotImplementedError``.
+- The full Hermes Agent ``SessionDB`` API is **not** implemented.  Any code
+  that calls unimplemented methods will fail fast with ``NotImplementedError``.
 - ``source='webui'`` sessions are filtered by ``list_sessions_rich`` exactly as
   the chat UI expects.
-- This is **not** a drop-in replacement for the real SessionDB; it is a runtime
-  fallback so the chat UI can function without a Hermes Agent checkout.
+- Message paging is keyset-first: ``get_messages`` windows the newest rows
+  (``latest=True``) and pages with ``after_id`` / ``before_id`` id cursors, so
+  every row of a long session stays reachable without ``OFFSET`` scans.
 """
 
 from __future__ import annotations
@@ -191,7 +190,18 @@ class SessionDB:
         offset: int = 0,
         latest: bool = False,
         after_id: Optional[int] = None,
+        before_id: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
+        """Return this session's messages, oldest-first in the result list.
+
+        ``latest=True`` selects the NEWEST ``limit`` rows (still returned
+        oldest-first, so a UI renders them in order). ``after_id`` / ``before_id``
+        are keyset cursors on the message id — ``id > after_id`` and
+        ``id < before_id`` — and compose with ``latest=True`` to page a long
+        session in either direction without ``OFFSET`` scans: the newest page
+        is the no-cursor default, ``before_id=<oldest visible id>`` walks older,
+        ``after_id=<newest visible id>`` polls for newer.
+        """
         order = "DESC" if latest else "ASC"
         clauses = ["session_id = ?"]
         params: List[Any] = [session_id]
@@ -202,6 +212,9 @@ class SessionDB:
         if after_id is not None:
             clauses.append("id > ?")
             params.append(after_id)
+        if before_id is not None:
+            clauses.append("id < ?")
+            params.append(before_id)
         sql = f"SELECT * FROM messages WHERE {' AND '.join(clauses)} ORDER BY timestamp {order}, id {order}"
         if limit is not None:
             sql += " LIMIT ?"
