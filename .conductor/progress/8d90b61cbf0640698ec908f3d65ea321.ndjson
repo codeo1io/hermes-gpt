@@ -1,0 +1,2 @@
+{"step":1,"ts":"2026-09-30T09:15:00Z","summary":"Re-delivery (prior attempt 55406ad6 died on provider 429 post-recon): resuming mid-assessment with carried state, not redoing recorded work","touched":[]}
+{"step":2,"ts":"2026-09-30T09:25:00Z","summary":"Sweeps: F1 operator_live_events.py:396 except TimeoutError misses asyncio.TimeoutError on py3.10 (CI lane) - WS idle dies; verified via blame 9ec74344bb + CI matrix 3.10","touched":["operator_live_events.py","operator_fleet.py","codex_config.py","pyproject.toml"]}
