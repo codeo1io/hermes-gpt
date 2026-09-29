@@ -120,18 +120,36 @@ def _key_from_file(hermes_root: Path) -> bytes | None:
         return None
 
 
+def _private_tmp_path(path: Path) -> Path:
+    """Collision-free temp sibling for secret writes: pid + random token,
+    so concurrent processes never share a temp file."""
+    return path.with_name(f"{path.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp")
+
+
+def _write_private_file(target: Path, data: bytes) -> None:
+    """Write ``data`` to ``target`` created 0600 from the first byte onward,
+    fsync'd so the content is durable before the atomic rename."""
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        try:
+            os.unlink(target)
+        except OSError:
+            pass
+        raise
+
+
 def _write_key_file(hermes_root: Path, key: bytes) -> None:
     d = _secrets_dir(hermes_root)
-    d.mkdir(parents=True, exist_ok=True)
+    d.mkdir(parents=True, exist_ok=True, mode=0o700)
     path = key_file_path(hermes_root)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_bytes(key)
-    os.chmod(tmp, 0o600)
-    tmp.replace(path)
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
+    tmp = _private_tmp_path(path)
+    _write_private_file(tmp, key)
+    os.replace(tmp, path)
 
 
 def _rotate_active_key(hermes_root: Path) -> dict[str, Any]:
@@ -161,10 +179,9 @@ def _rotate_active_key(hermes_root: Path) -> dict[str, Any]:
     try:
         fresh = secrets.token_bytes(32)
         path = key_file_path(hermes_root)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".new")
-        tmp.write_bytes(fresh)
-        os.chmod(tmp, 0o600)
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        tmp = _private_tmp_path(path)
+        _write_private_file(tmp, fresh)
         os.replace(tmp, path)
     except Exception:
         return {"outcome": "failed", "source": "keyfile"}
@@ -238,16 +255,13 @@ def _write_envelope(hermes_root: Path, kid: str, plaintext: dict[str, Any], key:
         "nonce": _b64(nonce),
     }
     d = _secrets_dir(hermes_root)
-    d.mkdir(parents=True, exist_ok=True)
+    d.mkdir(parents=True, exist_ok=True, mode=0o700)
     path = envelope_path(hermes_root)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(envelope, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.chmod(tmp, 0o600)
-    tmp.replace(path)
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
+    tmp = _private_tmp_path(path)
+    _write_private_file(
+        tmp, json.dumps(envelope, ensure_ascii=False, indent=2).encode("utf-8")
+    )
+    os.replace(tmp, path)
 
 
 def save_tokens(hermes_root: Path, tokens: dict[str, Any]) -> dict[str, Any]:
@@ -322,7 +336,7 @@ class _StoreLock:
         _msvcrt.locking(self.fd, _msvcrt.LK_UNLCK, 1)
 
     def __enter__(self) -> "_StoreLock":
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
         try:
             self._acquire()
@@ -368,7 +382,7 @@ def _connect(hermes_root: Path) -> sqlite3.Connection:
     """
     path = _db_path(hermes_root)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         db = sqlite3.connect(path, timeout=15.0, isolation_level=None)
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA journal_mode=WAL")
@@ -379,6 +393,13 @@ def _connect(hermes_root: Path) -> sqlite3.Connection:
             os.chmod(path, 0o600)
         except OSError:
             pass
+        # WAL sidecar files inherit the process umask, not the DB mode;
+        # clamp them to 0600 whenever present so live ledger pages stay private.
+        for sidecar_name in (f"{path}-wal", f"{path}-shm"):
+            try:
+                os.chmod(sidecar_name, 0o600)
+            except OSError:
+                pass
         return db
     except sqlite3.Error as exc:
         raise TokenStoreError(f"token database unavailable: {exc}") from exc

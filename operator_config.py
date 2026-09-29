@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import shutil
 import time
 from pathlib import Path
@@ -327,7 +328,7 @@ def hermes_config_set(
 
         policy.require_mutation(dry_run)
         backup = _backup_file(path)
-        tmp = path.with_suffix(".yaml.tmp")
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp")
         with open(tmp, "w", encoding="utf-8") as fh:
             yaml.safe_dump(new_cfg, fh, sort_keys=False, default_flow_style=False)
         os.replace(tmp, path)
@@ -436,7 +437,7 @@ def hermes_config_patch(
 
         policy.require_mutation(dry_run)
         backup = _backup_file(path)
-        tmp = path.with_suffix(".yaml.tmp")
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp")
         with open(tmp, "w", encoding="utf-8") as fh:
             fh.write(new_content)
         os.replace(tmp, path)
@@ -612,9 +613,24 @@ def _write_env_key(env_path: Path, key: str, value: str) -> None:
         if out and out[-1].strip() != "":
             out.append("\n")
         out.append(new_line)
-    tmp = env_path.with_suffix(".env.tmp")
-    with open(tmp, "w", encoding="utf-8") as fh:
-        fh.writelines(out)
+    # Secrets-bearing file: create the temp 0600 from the first byte (never
+    # umask-default), fsync, then atomically replace so the final .env keeps
+    # 0600 even when an existing file already had it and umask is loose.
+    tmp = env_path.with_name(
+        f"{env_path.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp"
+    )
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.writelines(out)
+            fh.flush()
+            os.fsync(fh.fileno())
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     os.replace(tmp, env_path)
 
 

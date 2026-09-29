@@ -211,3 +211,100 @@ pre-existing environment skips; ruff clean. 14 tracked files changed,
 - **Candidate hardening:** autouse fixture resetting `set_audit_log_override`;
   additive py3.13 CI lane (ci edits were prohibited in-cycle); the two
   environment-dependent skips in the full suite remain unowned.
+
+## Cycle 5 — 2026-10-01 — "OAuth serving-loop offload + secret-path write hardening"
+
+Run 3b48f76e4787 (repository-maintenance eb1ebf9e61ef4856b79d9ac751a7ab03,
+family cycle 2 — family cycle 1 [run 1de374b5] bound 2026-09-21 but never
+executed phases; fleet cycle 5 in this log's sequence, matching ROADMAP.md's
+cycle-5 additions marker).
+
+### What the cycle did
+
+- Assessed the tree fresh at HEAD caf60018d2 (attempt 43e6ea3a) after the
+  first attempt died to an ENOSPC envelope failure leaving zero recoverable
+  artifacts: 7 line-anchored findings — OAuth/token-store blocking on the
+  serving loop (F1/F2), secret-path write-permission windows (F3/F4/F6:
+  keyfile/envelope chmod-after-create, umask-default `.env`, WAL sidecars),
+  signal noise (F5), doc gaps (F7).
+- Researched upstream from the local object store (web egress is offline on
+  this host): upstream/master 9 commits past merge-base 8d5b0f241f, tip
+  f4151d9728 = the Autopilot PR-#82 landing; v0.13.0 released upstream
+  2026-09-29 → the fork's planned v0.13.0 number now collides; MCP Skills
+  extension FINAL (SEP-2640) with the WG repo pushed 2026-09-29.
+- Roadmap: authored the cycle delta rm-085..rm-090 as a fold-ready document
+  (8111c861); the COMPOUND phase folded it into ROADMAP.md with pre-review
+  outcome riders and the cycle-5 outcome/learnings/next-cycle sections (the
+  sibling id-collision datum for the landing gate is in the cycle-5 marker
+  comment there).
+- Prioritized the batch (32b32fdcc5): rm-085 (reliability 116) + rm-086
+  (security 110) — the top two implementable, evidence-complete,
+  upstream-independent items; cycle-4's suggested headliner (rm-081 upstream
+  adoption) was deliberately deferred as version-collision-gated.
+- Implemented the batch UNCOMMITTED for the review/commit gates (f49b2298):
+  see ROADMAP.md rm-085/rm-086 update lines for the exact code/test inventory;
+  CHANGELOG Unreleased carries the two user-facing bullets.
+- Verified (recorded by the targeted/full phases; compound executed nothing):
+  pre-fix RED 8/8; focused lane 109 passed; engine impacted-tests 17-file
+  selection exit 0; full gate exit 0 (1611 passed / 5 skipped by dot-count,
+  envelope digest validation:v1:29b2694b…). ruff was NOT run by those
+  phases — flagged to the review/fix phase.
+- Review gate (independent_review f980e37d, verdict NEEDS_CHANGES; fixed
+  same day by review-fix 508d7cf3, tree still UNCOMMITTED): all 8 findings
+  fixed — OAuthState gained a re-entrant mutation lock (@_serialized on the
+  exchange/mutation methods) fencing the worker-thread race the offload
+  introduced on authorization-code single-use, with a concurrent-redemption
+  regression test; rm-085's acceptance reworded to the tier-1 scope with the
+  /oauth/authorize + /oauth/register on-loop residual recorded as open tier 2;
+  per-site offload tests; WAL-sidecar false-PASS guard; rm-089 census
+  corrected to the real 9 fixed-`.tmp` sites; ruff run over the batch
+  (35 pre-existing source findings = HEAD baseline, zero new; test files
+  clean after I001/PIE810 fixes). The ruff duty below is CLOSED.
+
+### Prevention rules established
+
+Recorded as ROADMAP.md rules 41–45 (this file quotes them by reference):
+re-walk every async boundary when an off-loop fix lands elsewhere (middleware
+included); secret files are born 0600 (O_CREAT|O_EXCL + fsync + os.replace
+over pid+random temps), never chmod-after-create; sqlite -wal/-shm sidecars
+are clamped in the connect path; batch acceptance is judged on the engine's
+impacted set, not the manual lane; gate summary counts live in the envelope
+and must be re-counted before writing results.
+
+### Local toolchain notes (small, reusable)
+
+- `local_validation_gate.py` suppresses the pytest summary line — dot-count
+  the wrapped progress lines or read the envelope; the returncode is
+  authoritative.
+- `run_repo_impacted_tests.py` provisions a worktree `.venv` via uv on first
+  targeted run — the disk-headline event class that killed this family's
+  first assess attempt (ENOSPC). It stays untracked and out of the batch.
+- Web egress is OFFLINE on this host (curl exit 6, 0.000 s): ecosystem/release
+  evidence must come from the local git object store (fetch is a no-op;
+  upstream objects are present) or be marked unavailable — disclosed, never
+  guessed.
+- Two envelope-failure classes killed attempts in this run alone (ENOSPC
+  mid-write; provider abort before the envelope existed): write the
+  phase_result JSON to the spool BEFORE composing the final message, and keep
+  tree work replayable from spool artifacts alone.
+
+### Context left for the next cycle
+
+- rm-087 (P105) upstream v0.13 Autopilot catch-up is the headline: the gap
+  GREW 8→9 commits this cycle and v0.13.0 is released upstream, so it is a
+  version-bounded port; rm-081 (P115) is the reliability slice of the same
+  adoption. Resolve rm-065's version policy first — upstream's v0.13.0
+  collides with the fork's planned number (rm-083 update line in ROADMAP.md).
+- rm-088 (P85, declare starlette + anyio) is evidence-complete,
+  upstream-independent, and next-batch-sized.
+- rm-089 (P40) finishes rm-086 tier-2 (unify the remaining fixed-`.tmp`
+  staging sites + the torn-key-file recovery doc note); rm-090 (P30) the
+  installed-docs manifest CI assertion.
+- The sibling worktrees' uncommitted rm-085..rm-115 blocks (runs 0aa75ea44f93,
+  1a6beeba, b6659410200) never landed on this lineage — treat their ids as
+  poisoned; the landing gate dedupes/renumbers landed-first.
+- Run ruff over this batch before commit — DONE by the review-fix turn
+  (508d7cf3: zero new findings vs the 35-finding HEAD baseline; batch test
+  files clean). Still open for the next cycle: pull the canonical checkout
+  forward (it sits at dce209dfcc, behind this lineage's
+  tip caf60018d2) before the next assess.
