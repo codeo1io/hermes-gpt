@@ -15,6 +15,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
+import oauth_auth
 from oauth_auth import (
     ACCESS_TOKEN_TTL_SECONDS,
     AUTH_TOKEN_ENV,
@@ -843,3 +844,158 @@ def test_authorization_response_iss_parameter(oauth_client: TestClient):
     )
     assert error_query["error"] == ["invalid_scope"]
     assert error_query["iss"] == [ISSUER]
+
+
+# ── rm-085: durable OAuth work stays off the serving event loop ────────────
+
+
+def test_token_exchange_does_not_stall_loop_under_store_lock(tmp_path, monkeypatch):
+    """rm-085 regression: store-lock contention must not freeze the app.
+
+    The token exchange durably persists credentials through
+    ``token_store.commit_tokens`` under the ``_StoreLock`` flock plus a
+    sqlite connection with a 15s busy timeout. Pre-fix that whole chain ran
+    ON the serving event loop, so one contended store serially stalled every
+    concurrent request on the surface; post-fix the handler offloads it via
+    ``asyncio.to_thread`` (oauth_auth._offload_durable). This test holds the
+    store lock from a background thread for 2s and asserts that an unrelated
+    endpoint on the SAME event loop keeps answering while the exchange
+    waits, and that the exchange itself then completes successfully.
+    """
+    import token_store as ts
+
+    root = tmp_path / "hermes-rm085"
+    state = OAuthState(
+        OAuthConfig(
+            issuer=ISSUER,
+            client_id=CLIENT_ID,
+            client_secret=CLIENT_SECRET,
+            redirect_uris=(REDIRECT_URI,),
+            scope="hermes",
+        )
+    )
+    monkeypatch.setattr(
+        oauth_auth, "_persist_hook", lambda st, kind: st.persist_tokens(root)
+    )
+
+    async def authorize_endpoint(request):
+        return authorize(request, state)
+
+    async def token_endpoint(request):
+        return await token(request, state)
+
+    async def probe_endpoint(request):
+        return JSONResponse({"ok": True})
+
+    app = Starlette(
+        routes=[
+            Route("/oauth/authorize", authorize_endpoint),
+            Route("/oauth/token", token_endpoint, methods=["POST"]),
+            Route("/probe", probe_endpoint),
+        ]
+    )
+
+    async def call(method: str, path: str, *, body: bytes = b"", query: str = ""):
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.1"},
+            "http_version": "1.1",
+            "method": method,
+            "path": path,
+            "raw_path": path.encode(),
+            "query_string": query.encode(),
+            "headers": [
+                (b"content-type", b"application/x-www-form-urlencoded"),
+                (b"content-length", str(len(body)).encode()),
+                (b"host", b"testserver"),
+            ],
+            "server": ("testserver", 80),
+            "client": ("testclient", 50000),
+            "scheme": "http",
+        }
+        messages: list[dict] = []
+
+        async def receive():
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        async def send(message):
+            messages.append(message)
+
+        await app(scope, receive, send)
+        start = next(m for m in messages if m["type"] == "http.response.start")
+        headers = {k.decode(): v.decode() for k, v in start.get("headers", [])}
+        payload = b"".join(
+            m.get("body", b"") for m in messages if m["type"] == "http.response.body"
+        )
+        return start["status"], headers, payload
+
+    def hold_store_lock(seconds: float) -> None:
+        with ts._StoreLock(root):
+            time.sleep(seconds)
+
+    async def scenario() -> None:
+        # A dynamic public client exercises the full register->authorize->
+        # exchange contract without static-client secrets.
+        client = state.register_dynamic_client([REDIRECT_URI])
+        query = urllib.parse.urlencode(
+            {
+                "response_type": "code",
+                "client_id": client.client_id,
+                "redirect_uri": REDIRECT_URI,
+                "scope": "hermes offline_access",
+                "state": "s1",
+                "code_challenge": s256(DEFAULT_VERIFIER),
+                "code_challenge_method": "S256",
+            }
+        )
+        status, headers, _ = await call("GET", "/oauth/authorize", query=query)
+        assert status == 302, headers
+        code = urllib.parse.parse_qs(urllib.parse.urlparse(headers["location"]).query)[
+            "code"
+        ][0]
+
+        lock_hold = 2.0
+        holder = asyncio.create_task(asyncio.to_thread(hold_store_lock, lock_hold))
+        await asyncio.sleep(0.3)  # the background thread now owns the flock
+
+        t_launch = time.monotonic()
+        exchange = asyncio.create_task(
+            call(
+                "POST",
+                "/oauth/token",
+                body=urllib.parse.urlencode(
+                    {
+                        "grant_type": "authorization_code",
+                        "code": code,
+                        "redirect_uri": REDIRECT_URI,
+                        "code_verifier": DEFAULT_VERIFIER,
+                        "client_id": client.client_id,
+                    }
+                ).encode(),
+            )
+        )
+        await asyncio.sleep(0.4)  # the exchange has reached the durable persist step
+        probe_status, _, probe_body = await call("GET", "/probe")
+        probe_done = time.monotonic()
+
+        # Same-loop liveness: pre-fix, the synchronous flock wait inside the
+        # token handler blocks this very loop, so the probe can only complete
+        # after the lock releases (>= t_launch + ~1.7s); post-fix it answers
+        # immediately while the exchange waits in a worker thread.
+        assert probe_status == 200, probe_body
+        assert probe_done - t_launch < 1.2, (
+            "serving loop stalled under store-lock contention: "
+            f"probe answered {probe_done - t_launch:.2f}s after exchange launch"
+        )
+
+        status, _, payload = await asyncio.wait_for(exchange, timeout=20)
+        assert status == 200, payload
+        body = json.loads(payload)
+        assert body.get("access_token"), "contended exchange must still issue tokens"
+        await asyncio.wait_for(holder, timeout=5)
+        # And the credential really was durably committed despite contention.
+        assert (
+            ts.lookup_token(root, "access", body["access_token"]) is not None
+        ), "exchange must persist through the contended store"
+
+    asyncio.run(scenario())

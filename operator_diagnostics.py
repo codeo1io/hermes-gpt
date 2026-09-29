@@ -570,13 +570,81 @@ def _check_last_audit_record() -> dict[str, Any]:
         )
 
 
+UI_MOUNT_FAILURE_MARKER = "ui_mount_failed.marker"
+
+
+def ui_mount_failure_marker_path() -> Path:
+    """Durable marker for the latest failed UI mount (rm-087).
+
+    Lives beside the active audit log so ``set_audit_log_override`` (tests)
+    redirects both consistently. The audit tail the doctor scans is
+    bounded (``audit_tail(limit=50)``), so a boot-time UI mount failure
+    scrolls out of it once the server stays busy; the marker survives
+    until the UI mounts successfully again.
+    """
+    return op.audit_log_path().parent / UI_MOUNT_FAILURE_MARKER
+
+
+def record_ui_mount_failure(detail: str) -> None:
+    """Persist the UI-mount failure marker (best-effort, rm-087)."""
+    try:
+        marker = ui_mount_failure_marker_path()
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(
+            json.dumps({"error": detail[:300]}), encoding="utf-8"
+        )
+    except Exception:  # noqa: BLE001 — best-effort by contract
+        pass
+
+
+def clear_ui_mount_failure_marker() -> None:
+    """Clear the marker once the UI mounts again (best-effort, rm-087)."""
+    try:
+        ui_mount_failure_marker_path().unlink(missing_ok=True)
+    except Exception:  # noqa: BLE001 — best-effort by contract
+        pass
+
+
 def _check_ui_mount() -> dict[str, Any]:
-    """WARN when the audit log records a failed UI mount (rm-078).
+    """WARN when the UI failed to mount (rm-078; durable marker rm-087).
 
     An explicitly-enabled UI that failed to mount is a degraded operator
-    surface: the server writes an ``ui_mount`` audit record and a live event
-    when mounting fails, so doctor can surface it from the audit log.
+    surface: the server writes an ``ui_mount`` audit record, a live event,
+    and — rm-087 — a durable marker beside the audit log. The audit
+    tail the doctor scans is bounded (``audit_tail(limit=50)``), so a
+    boot-time failure scrolls out of it once the server stays busy; the
+    marker survives until the UI mounts successfully again.
     """
+    try:
+        marker = ui_mount_failure_marker_path()
+        if marker.exists():
+            try:
+                age_seconds = max(0.0, time.time() - marker.stat().st_mtime)
+                detail = json.loads(marker.read_text(encoding="utf-8")).get(
+                    "error", "unknown error"
+                )
+            except Exception:
+                age_seconds, detail = -1.0, "unknown error (marker unreadable)"
+            return _check_result(
+                status=STATUS_WARN,
+                layer="ui",
+                code="UI_MOUNT_FAILED",
+                message=(
+                    "The browser UI is enabled but failed to mount "
+                    f"(recorded {int(age_seconds)}s ago): {detail}"
+                ),
+                suggested_action=(
+                    "Check the server log for the ui_api import error; the UI "
+                    "assets may be missing or not built. The marker clears on "
+                    "the next successful UI mount."
+                ),
+                extra={
+                    "ui_mount_failure_marker": str(marker),
+                    "age_seconds": age_seconds,
+                },
+            )
+    except Exception:  # noqa: BLE001 — fall through to the audit-tail scan
+        pass
     try:
         records = op.audit_tail(limit=50)
     except Exception as exc:

@@ -21,6 +21,7 @@ import json
 import os
 import secrets
 import sqlite3
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -120,18 +121,43 @@ def _key_from_file(hermes_root: Path) -> bytes | None:
         return None
 
 
-def _write_key_file(hermes_root: Path, key: bytes) -> None:
-    d = _secrets_dir(hermes_root)
-    d.mkdir(parents=True, exist_ok=True)
-    path = key_file_path(hermes_root)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_bytes(key)
-    os.chmod(tmp, 0o600)
-    tmp.replace(path)
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """rm-067/rm-086: unique-tmp + fsync + atomic replace for secret files.
+
+    A fixed ``.tmp`` name lets concurrent writers interleave into the same
+    temp file, so a torn payload can be published by ``os.replace``;
+    ``tempfile.mkstemp`` gives every writer a private file, and ``fsync``
+    puts content on disk before the rename publishes it.
+    """
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=path.name + ".", suffix=".tmp"
+    )
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    # Ensure the final path is 0600 even when replacing a pre-existing
+    # file whose mode already leaked.
     try:
         os.chmod(path, 0o600)
     except OSError:
         pass
+
+
+def _write_key_file(hermes_root: Path, key: bytes) -> None:
+    d = _secrets_dir(hermes_root)
+    # rm-086: the secrets dir is created 0o700 at first write (plain
+    # mkdir inherited the process umask, empirically 0o755 under 022).
+    d.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path = key_file_path(hermes_root)
+    _atomic_write_bytes(path, key)
 
 
 def _rotate_active_key(hermes_root: Path) -> dict[str, Any]:
@@ -161,11 +187,9 @@ def _rotate_active_key(hermes_root: Path) -> dict[str, Any]:
     try:
         fresh = secrets.token_bytes(32)
         path = key_file_path(hermes_root)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".new")
-        tmp.write_bytes(fresh)
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
+        # rm-086: create the secrets dir 0o700 at first write.
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        _atomic_write_bytes(path, fresh)
     except Exception:
         return {"outcome": "failed", "source": "keyfile"}
     return {"outcome": "rotated", "source": "keyfile"}
@@ -238,16 +262,13 @@ def _write_envelope(hermes_root: Path, kid: str, plaintext: dict[str, Any], key:
         "nonce": _b64(nonce),
     }
     d = _secrets_dir(hermes_root)
-    d.mkdir(parents=True, exist_ok=True)
+    # rm-086: the secrets dir is created 0o700 at first write.
+    d.mkdir(parents=True, exist_ok=True, mode=0o700)
     path = envelope_path(hermes_root)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(envelope, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.chmod(tmp, 0o600)
-    tmp.replace(path)
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
+    _atomic_write_bytes(
+        path,
+        json.dumps(envelope, ensure_ascii=False, indent=2).encode("utf-8"),
+    )
 
 
 def save_tokens(hermes_root: Path, tokens: dict[str, Any]) -> dict[str, Any]:
@@ -322,7 +343,7 @@ class _StoreLock:
         _msvcrt.locking(self.fd, _msvcrt.LK_UNLCK, 1)
 
     def __enter__(self) -> "_StoreLock":
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
         try:
             self._acquire()
@@ -360,6 +381,27 @@ def _legacy_envelope_path(hermes_root: Path) -> Path:
     return _secrets_dir(hermes_root) / LEGACY_ENVELOPE_FILENAME
 
 
+def _harden_wal_sidecars(db_path: Path) -> None:
+    """rm-086: force 0o600 on the -wal/-shm sidecars (best-effort).
+
+    Empirically (reproduced 2026-09-30/10-01) sqlite creates the sidecars at
+    the process umask — 0o644 under the common 022 — at the first write
+    transaction (``BEGIN IMMEDIATE``; ``PRAGMA journal_mode=WAL`` alone does
+    not create them), and a lone reader recreates them the same way after
+    the last writer closes. Hardening is therefore applied at both moments
+    sqlite can bring them into existence: right after every write-path
+    ``BEGIN IMMEDIATE`` (where live ledger pages flow) and at every connect
+    (self-healing sidecars an earlier connection left behind). The -wal
+    holds ciphertext ledger pages, but the row keys and metadata stay
+    private under 0o600.
+    """
+    for suffix in ("-wal", "-shm"):
+        try:
+            os.chmod(db_path.with_name(db_path.name + suffix), 0o600)
+        except OSError:
+            pass
+
+
 def _connect(hermes_root: Path) -> sqlite3.Connection:
     """Open the token DB read-write; initializes the schema. Fails closed.
 
@@ -368,7 +410,7 @@ def _connect(hermes_root: Path) -> sqlite3.Connection:
     """
     path = _db_path(hermes_root)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         db = sqlite3.connect(path, timeout=15.0, isolation_level=None)
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA journal_mode=WAL")
@@ -379,6 +421,9 @@ def _connect(hermes_root: Path) -> sqlite3.Connection:
             os.chmod(path, 0o600)
         except OSError:
             pass
+        # rm-086: self-heal any sidecars an earlier connection left
+        # behind (see _harden_wal_sidecars for the creation moments).
+        _harden_wal_sidecars(path)
         return db
     except sqlite3.Error as exc:
         raise TokenStoreError(f"token database unavailable: {exc}") from exc
@@ -786,6 +831,9 @@ def _commit_tokens_locked(
     db = _connect(hermes_root)
     try:
         db.execute("BEGIN IMMEDIATE")
+        # rm-086: the immediate transaction is what materializes the
+        # sidecars — harden them before any ledger page reaches the -wal.
+        _harden_wal_sidecars(_db_path(hermes_root))
         key, kid, source = _resolve_key_parts(hermes_root)
         _migrate_legacy_locked(db, hermes_root, key, kid, now)
         row = db.execute(
@@ -869,6 +917,8 @@ def migrate_store(hermes_root: Path) -> dict[str, Any]:
     db = _connect(hermes_root)
     try:
         db.execute("BEGIN IMMEDIATE")
+        # rm-086: harden the sidecars this transaction just created.
+        _harden_wal_sidecars(_db_path(hermes_root))
         key, kid, source = _resolve_key_parts(hermes_root)
         _migrate_legacy_locked(db, hermes_root, key, kid, now)
         meta = db.execute(
@@ -936,6 +986,8 @@ def _exchange_commit_locked(
     db = _connect(hermes_root)
     try:
         db.execute("BEGIN IMMEDIATE")
+        # rm-086: harden the sidecars this transaction just created.
+        _harden_wal_sidecars(_db_path(hermes_root))
         key, kid, source = _resolve_key_parts(hermes_root)
         _migrate_legacy_locked(db, hermes_root, key, kid, now)
         row = db.execute(
@@ -1123,6 +1175,8 @@ def _revoke_tokens_locked(
     epoch = 0
     try:
         db.execute("BEGIN IMMEDIATE")
+        # rm-086: harden the sidecars this transaction just created.
+        _harden_wal_sidecars(_db_path(hermes_root))
         row = db.execute(
             "SELECT value FROM token_meta WHERE name='revocation_epoch'"
         ).fetchone()
