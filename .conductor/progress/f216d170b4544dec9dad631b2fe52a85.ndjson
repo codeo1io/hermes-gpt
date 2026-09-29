@@ -1,0 +1,8 @@
+{"step":1,"ts":"2026-09-29T20:37:58Z","summary":"surfaces re-read; rm-076/080/078/079 mechanisms mapped; ci stretch dropped (ci prohibited)","touched":[ui_chat.py,operator_live_events.py,server.py,operator_events.py,operator_diagnostics.py]}
+{"step":2,"ts":"2026-09-29T20:37:58Z","summary":"rm-076: ui_chat handlers + live-events WS poll offloaded via asyncio.to_thread","touched":[ui_chat.py,operator_live_events.py]}
+{"step":3,"ts":"2026-09-29T20:37:58Z","summary":"rm-080: cursor clamp fixed; high watermark read pre-page (conservative under concurrent writers)","touched":[operator_live_events.py]}
+{"step":4,"ts":"2026-09-29T20:37:58Z","summary":"rm-078: _signal_ui_mount_failure (audit + live event) wired into build_asgi_app; doctor ui_mount check","touched":[server.py,operator_diagnostics.py]}
+{"step":5,"ts":"2026-09-29T20:37:58Z","summary":"rm-079: single allowlist boundary for events query+tail; truthful sources_queried + warnings both paths","touched":[operator_events.py]}
+{"step":6,"ts":"2026-09-29T20:37:58Z","summary":"regression tests added: loop-stall, cursor semantics, boundary filtering, mount visibility, doctor","touched":[test_ui_chat.py,test_operator_live_events.py,test_operator_events.py,test_ui_ops.py,test_operator_diagnostics.py]}
+{"step":7,"ts":"2026-09-29T20:37:58Z","summary":"docs: live-events cursor semantics + ui_mount_failed producer; operator-mode doctor check; CHANGELOG x4","touched":[docs/live-events.md,docs/operator-mode.md,CHANGELOG.md]}
+{"step":8,"ts":"2026-09-29T20:37:58Z","summary":"validate: 144/144 focused suites green; transport/sdk suites 27/27; ruff clean","touched":[]}
