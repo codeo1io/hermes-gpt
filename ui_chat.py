@@ -6,10 +6,18 @@ separate UI database.  This module owns:
 - ``GET    /api/sessions``            — sidebar history (webui sessions)
 - ``POST   /api/sessions``            — create an empty session
 - ``GET    /api/sessions/:id/messages`` — resume a thread from persisted rows
+                                         (newest page by default; ``before_id``/
+                                         ``after_id`` keyset cursors page a
+                                         long session in either direction)
 - ``POST   /api/chat``                — start a turn; SSE stream (meta|token|
                                          reasoning|tool_start|tool_end|
                                          message_complete|error|done)
-- ``GET    /api/chat/stream``         — reconnect replay + live tail
+- ``GET    /api/chat/stream``         — reconnect replay + live tail; the
+                                         resume cursor is the standard
+                                         ``Last-Event-ID`` header (fallback
+                                         ``?after=``), and a cursor older
+                                         than the replay ring emits an
+                                         explicit ``gap``/ring-floor event
 - ``POST   /api/chat/stop``           — interrupt the running turn
 
 Turns run Hermes' real agent loop (``AIAgent`` + ``run_conversation`` with
@@ -210,15 +218,14 @@ def _session_db() -> Any:
     if _session_db_instance is None:
         with _session_db_lock:
             if _session_db_instance is None:
-                try:
-                    from hermes_state import SessionDB
+                # rm-129: one implementation, one import path. The repo ships
+                # hermes_state.SessionDB as the chat sidecar's session store
+                # (a self-contained sqlite implementation) — the previous
+                # try/except re-imported the SAME class under a "shim" alias,
+                # so the "real vs shim" fallback could never select anything.
+                from hermes_state import SessionDB
 
-                    _session_db_instance = SessionDB(db_path=_hermes_home() / "state.db")
-                except Exception as exc:
-                    logger.warning("ui_chat: hermes_state.SessionDB unavailable (%s), using local shim", exc)
-                    from hermes_state import SessionDB as ShimSessionDB
-
-                    _session_db_instance = ShimSessionDB(db_path=_hermes_home() / "state.db")
+                _session_db_instance = SessionDB(db_path=_hermes_home() / "state.db")
     return _session_db_instance
 
 
@@ -281,7 +288,14 @@ def _serialize_session(row: Dict[str, Any]) -> Dict[str, Any]:
         "profile": row.get("profile_name") or "default",
         "model": row.get("model") or "",
         "message_count": int(row.get("message_count") or 0),
-        "last_activity_at": row.get("last_active") or row.get("started_at") or 0,
+        # rm-125: the sessions column is ``last_activity_at`` — the old
+        # ``last_active`` key never existed, so every session serialized its
+        # creation time as its last activity. ``last_active`` is retained as
+        # a legacy-row fallback, then ``started_at``.
+        "last_activity_at": row.get("last_activity_at")
+        or row.get("last_active")
+        or row.get("started_at")
+        or 0,
         "created_at": row.get("started_at") or 0,
     }
 
@@ -579,6 +593,13 @@ def _run_turn(turn: Turn, *, message: str, profile: str, model: str, db: Any, ho
             return
         agent = _build_agent(turn=turn, db=db, model=model, profile=profile)
         turn.agent = agent
+        # rm-127: a stop that arrived while the agent was being built (cold
+        # imports take seconds, and _handle_chat_stop can only interrupt once
+        # ``turn.agent`` is set) must be honored here — otherwise the turn
+        # runs to completion after the user was told it stopped.
+        if turn.cancel_requested:
+            _finalize_turn(turn, {"interrupted": True, "failed": False}, db)
+            return
         result = _execute_turn(agent, turn, message=message, db=db)
         _finalize_turn(turn, result, db)
     except ImportError as exc:
@@ -604,6 +625,25 @@ def _run_turn(turn: Turn, *, message: str, profile: str, model: str, db: Any, ho
 def _format_sse(event: str, seq: int, data: dict) -> str:
     payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
     return f"event: {event}\nid: {seq}\ndata: {payload}\n\n"
+
+
+def _format_gap_sse(last: int, floor: int, turn_id: str) -> str:
+    """Format the explicit ring-overflow signal (rm-126).
+
+    Emitted OUTSIDE the replay ring — it is derived state, not a turn event —
+    so it is redacted here rather than at the ``Turn.publish`` chokepoint.
+    Its ``id:`` is ``floor - 1``: a client that reconnects with it as its
+    Last-Event-ID resumes exactly at the surviving ring floor and does not
+    re-trigger the signal (asking for ``> floor - 1`` is gap-free).
+    """
+    safe = ui_security.redact_browser({
+        "type": "ring_floor",
+        "turn_id": turn_id,
+        "gap_from": last + 1,
+        "ring_floor": floor,
+        "remedy": "replay buffer overflowed; re-read the transcript via GET /messages",
+    })
+    return _format_sse("gap", floor - 1, safe)
 
 
 _SSE_HEADERS = {
@@ -636,6 +676,14 @@ async def _replay_generator(turn: Turn, after: int) -> AsyncIterator[str]:
     try:
         while True:
             batch, done = await asyncio.to_thread(turn.snapshot_after, last, SSE_HEARTBEAT_S)
+            # rm-126: the ring evicts oldest events silently, so a client
+            # whose cursor predates the surviving floor would receive a
+            # truncated replay that looks complete. ``batch`` holds every
+            # surviving event past ``last``, so its first seq IS the ring
+            # floor; when it is beyond the cursor, the skipped range is gone.
+            if batch and batch[0][0] > last + 1:
+                yield _format_gap_sse(last, batch[0][0], turn.turn_id)
+                last = batch[0][0] - 1
             for seq, event, data in batch:
                 yield _format_sse(event, seq, data)
                 last = seq
@@ -696,23 +744,72 @@ async def _handle_sessions_create(request: Request) -> Response:
     return _ok({"session_id": session_id, "title": ""})
 
 
+def _parse_message_cursor(value: Optional[str]) -> Optional[int]:
+    """Parse a keyset cursor (message id) from a query param.
+
+    ``None`` when the param is absent. A present-but-non-integer raises
+    ``ValueError`` so the caller answers 400 — silently ignoring a cursor
+    would hand the client the wrong page while it believes it paged.
+    """
+    if value is None or value == "":
+        return None
+    return int(value)
+
+
 async def _handle_session_messages(request: Request) -> Response:
     session_id = request.path_params.get("session_id", "")
     if not session_id:
         return _error(400, "BAD_REQUEST", "session_id is required")
+    try:
+        before_id = _parse_message_cursor(request.query_params.get("before_id"))
+        after_id = _parse_message_cursor(request.query_params.get("after_id"))
+    except ValueError:
+        return _error(400, "BAD_REQUEST", "before_id/after_id must be integer message ids")
     # rm-076: existence check + message page read are blocking sqlite.
     db = await asyncio.to_thread(_session_db)
     if not await asyncio.to_thread(_session_exists, db, session_id):
         return _error(404, "NOT_FOUND", "session not found")
     try:
+        # rm-124: the newest page is the default (the old oldest-first read
+        # made the most recent messages unreachable in any session longer
+        # than MESSAGE_PAGE_LIMIT) and paging is keyset-based on the message
+        # id, so a >500-message session is walkable without OFFSET scans.
         rows = await asyncio.to_thread(
-            db.get_messages, session_id, include_compacted=True, limit=MESSAGE_PAGE_LIMIT
+            db.get_messages,
+            session_id,
+            include_compacted=True,
+            limit=MESSAGE_PAGE_LIMIT,
+            latest=True,
+            before_id=before_id,
+            after_id=after_id,
+        )
+        messages = [_serialize_message(dict(row)) for row in rows]
+        oldest_id = messages[0]["message_id"] if messages else None
+        has_older = bool(
+            oldest_id is not None
+            and await asyncio.to_thread(
+                db.get_messages,
+                session_id,
+                include_compacted=True,
+                limit=1,
+                latest=True,
+                before_id=oldest_id,
+            )
         )
     except Exception as exc:
         logger.warning("ui_chat: message read failed: %s", exc)
         return _error(500, "INTERNAL", "Failed to load messages")
-    messages = [_serialize_message(dict(row)) for row in rows]
-    return _ok({"messages": messages}, content_allowed=True)
+    return _ok(
+        {
+            "messages": messages,
+            "page": {
+                "limit": MESSAGE_PAGE_LIMIT,
+                "oldest_id": oldest_id,
+                "has_older": has_older,
+            },
+        },
+        content_allowed=True,
+    )
 
 
 async def _handle_chat_post(request: Request) -> Response:
@@ -758,7 +855,7 @@ async def _handle_chat_post(request: Request) -> Response:
         "turn_id": turn.turn_id,
     })
 
-    threading.Thread(
+    turn_worker = threading.Thread(
         target=_run_turn,
         args=(turn,),
         kwargs={
@@ -770,7 +867,32 @@ async def _handle_chat_post(request: Request) -> Response:
         },
         daemon=True,
         name=f"ui-chat-{session_id[:8]}",
-    ).start()
+    )
+    try:
+        turn_worker.start()
+    except Exception as exc:
+        # rm-127: a failed thread start must not strand the 300 s lease (the
+        # session would 409 TURN_IN_PROGRESS until the TTL expires) nor leave
+        # a never-done Turn, which _prune_turns never collects and which keeps
+        # burning a _max_concurrent slot. Close the turn like _run_turn would
+        # and free the lease; the SSE generator below then drains error+done.
+        logger.exception("ui_chat: turn worker failed to start for session %s", session_id)
+        turn.publish("error", {
+            "code": "THREAD_START_FAILED",
+            "message": "Could not start the chat turn worker.",
+        })
+        # Same terminal contract as _finalize_turn: without a `done` frame a
+        # browser client treats the closed stream as a dropped connection.
+        turn.publish("done", {
+            "turn_id": turn.turn_id,
+            "message_id": None,
+            "finish_reason": "error",
+        })
+        turn.mark_done("error", error=str(exc) or exc.__class__.__name__)
+        try:
+            await asyncio.to_thread(db.release_session_turn_lease, session_id, holder)
+        except Exception:
+            logger.debug("ui_chat: lease release after start failure failed", exc_info=True)
 
     return StreamingResponse(_sse_generator(turn), media_type="text/event-stream", headers=_SSE_HEADERS)
 
@@ -780,8 +902,14 @@ async def _handle_chat_stream(request: Request) -> Response:
     turn_id = request.query_params.get("turn_id", "")
     if not session_id:
         return _error(400, "BAD_REQUEST", "session_id is required")
+    # rm-126: a native EventSource resends its last seen id in the standard
+    # ``Last-Event-ID`` request header, and the stream already emits
+    # ``id: {seq}`` frames — read the header (it wins when both are present)
+    # with ``?after=`` as the explicit fallback.
+    header_cursor = (request.headers.get("last-event-id") or "").strip()
+    raw_after = header_cursor or request.query_params.get("after", "0")
     try:
-        after = max(0, int(request.query_params.get("after", "0")))
+        after = max(0, int(raw_after or "0"))
     except ValueError:
         after = 0
     turn = _get_turn(session_id, turn_id or None)

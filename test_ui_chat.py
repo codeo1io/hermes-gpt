@@ -620,3 +620,353 @@ def test_session_endpoints_do_not_stall_event_loop_under_sessiondb_lock(app):
             release.set()
 
     asyncio.run(scenario())
+
+
+# ── rm-124/125/126/127/129: transcript window, order, reconnect, lifecycle ──
+
+def _seed_messages(db, session_id: str, count: int, *, prefix: str = "m") -> None:
+    for i in range(1, count + 1):
+        db.append_message(session_id, "user", content=f"{prefix}-{i:04d}")
+
+
+def _probe_holder() -> str:
+    import uuid
+
+    return f"probe-{uuid.uuid4().hex}"
+
+
+def _drive(generator, timeout: float = _THREAD_BUDGET):
+    """Drain an async SSE generator to a string (turn must be done)."""
+    import asyncio
+
+    async def _collect():
+        chunks = []
+        async for chunk in generator:
+            chunks.append(chunk)
+        return "".join(chunks)
+
+    return asyncio.run(asyncio.wait_for(_collect(), timeout))
+
+
+def test_session_messages_default_returns_newest_page(client):
+    """rm-124 (assess F1): the no-params window must be the NEWEST page.
+
+    Before the fix the handler read oldest-first, so in a 600-message session
+    the endpoint served msg-001..msg-500 and the 100 most recent messages
+    were unreachable through the API.
+    """
+    db = ui_chat._session_db()
+    sid = "window-session-1"
+    db.create_session(sid, "webui")
+    _seed_messages(db, sid, 600)
+
+    resp = client.get(f"/api/sessions/{sid}/messages")
+    assert resp.status_code == 200
+    body = resp.json()["data"]
+    ids = [m["message_id"] for m in body["messages"]]
+    assert len(ids) == ui_chat.MESSAGE_PAGE_LIMIT == 500
+    assert ids == sorted(ids)          # oldest-first WITHIN the newest page
+    assert ids[-1] == 600              # repro: the default window ends at the
+    assert ids[0] == 101               # newest message, not the oldest rows
+    assert body["messages"][0]["content"] == "m-0101"
+    assert body["messages"][-1]["content"] == "m-0600"
+    assert body["page"]["limit"] == 500
+    assert body["page"]["oldest_id"] == 101
+    assert body["page"]["has_older"] is True
+
+
+def test_session_messages_resume_beyond_page_limit(client):
+    """rm-124: the resume path extended past MESSAGE_PAGE_LIMIT — keyset
+    paging backward from the default window reaches every message, gapless."""
+    db = ui_chat._session_db()
+    sid = "window-session-long"
+    db.create_session(sid, "webui")
+    total = ui_chat.MESSAGE_PAGE_LIMIT * 2 + 30
+    _seed_messages(db, sid, total)
+
+    seen: list[int] = []
+    page_ids: list[list[int]] = []
+    cursor = None
+    pages = 0
+    while True:
+        url = f"/api/sessions/{sid}/messages"
+        if cursor is not None:
+            url += f"?before_id={cursor}"
+        body = client.get(url).json()["data"]
+        ids = [m["message_id"] for m in body["messages"]]
+        assert ids == sorted(ids)
+        assert len(ids) <= ui_chat.MESSAGE_PAGE_LIMIT
+        seen.extend(ids)
+        page_ids.append(ids)
+        pages += 1
+        if not body["page"]["has_older"]:
+            assert ids[0] == 1
+            break
+        cursor = body["page"]["oldest_id"]
+    assert pages == 3                       # 1030 messages / 500 per page
+    assert sorted(seen) == list(range(1, total + 1))  # every message, once
+    # pages walk newest-window → older-window, each rendered oldest-first
+    bounds = [(ids[0], ids[-1]) for ids in page_ids]
+    assert [b[1] for b in bounds] == sorted((b[1] for b in bounds), reverse=True)
+    for newer, older in zip(bounds, bounds[1:]):
+        assert newer[0] - 1 == older[1]    # adjacent windows: no gap, no overlap
+
+
+def test_session_messages_after_id_returns_only_newer(client):
+    """rm-124: ``after_id`` is the forward cursor (poll for new messages)."""
+    db = ui_chat._session_db()
+    sid = "window-session-forward"
+    db.create_session(sid, "webui")
+    _seed_messages(db, sid, 10, prefix="old")
+
+    newest = client.get(f"/api/sessions/{sid}/messages").json()["data"]["messages"][-1]["message_id"]
+    _seed_messages(db, sid, 3, prefix="new")
+
+    body = client.get(f"/api/sessions/{sid}/messages?after_id={newest}").json()["data"]
+    assert [m["content"] for m in body["messages"]] == ["new-0001", "new-0002", "new-0003"]
+    assert body["page"]["has_older"] is True   # older rows exist behind the cursor
+
+    empty = client.get(f"/api/sessions/{sid}/messages?after_id={newest + 3}").json()["data"]
+    assert empty["messages"] == []
+    assert empty["page"]["oldest_id"] is None
+    assert empty["page"]["has_older"] is False
+
+
+def test_session_messages_rejects_non_integer_cursor(client):
+    """rm-124: a cursor that cannot be parsed is a 400, never a silently
+    ignored param that hands the client the wrong page."""
+    db = ui_chat._session_db()
+    sid = "window-session-bad"
+    db.create_session(sid, "webui")
+    db.append_message(sid, "user", content="hello")
+    for param in ("before_id", "after_id"):
+        resp = client.get(f"/api/sessions/{sid}/messages?{param}=not-an-int")
+        assert resp.status_code == 400
+        assert resp.json()["error"]["code"] == "BAD_REQUEST"
+
+
+def test_session_list_serializes_real_last_activity_at(client):
+    """rm-125 (assess F2): ``last_active`` was a key that never existed, so
+    every session serialized its creation time as its last activity."""
+    db = ui_chat._session_db()
+    sid = "lastact-session-1"
+    db.create_session(sid, "webui", model="m")
+    row = db.get_session(sid)
+    assert row["last_activity_at"] == row["started_at"]
+    time.sleep(0.01)
+    db.append_message(sid, "user", content="hello")
+    truth = db.get_session(sid)
+    assert truth["last_activity_at"] > truth["started_at"]
+
+    resp = client.get("/api/sessions")
+    assert resp.status_code == 200
+    found = next(s for s in resp.json()["data"]["sessions"] if s["session_id"] == sid)
+    assert found["last_activity_at"] == truth["last_activity_at"]
+    assert found["last_activity_at"] > found["created_at"]
+
+
+def test_replay_without_overflow_emits_no_gap_event():
+    turn = ui_chat.Turn(session_id="nogap-s", turn_id="t-nogap", holder="h")
+    for i in range(5):
+        turn.publish("token", {"delta": f"c{i}"})
+    turn.mark_done("end_turn")
+
+    text = _drive(ui_chat._replay_generator(turn, 0))
+    events = _parse_sse(text)
+    # mark_done only flips the turn's flags — the `done` frame is published
+    # by _finalize_turn on the worker path, so a hand-built turn replays its
+    # events and then the generator closes.
+    assert [e[0] for e in events] == ["token"] * 5
+    assert [e[1] for e in events] == [1, 2, 3, 4, 5]
+    # a mid-stream cursor is gap-free too (nothing was evicted)
+    mid = _parse_sse(_drive(ui_chat._replay_generator(turn, 2)))
+    assert all(e[0] != "gap" for e in mid)
+    assert [e[1] for e in mid] == [3, 4, 5]
+
+
+def test_ring_overflow_emits_gap_event_naming_floor(monkeypatch):
+    """rm-126 (assess F3): after ring eviction a reconnect at after=0 used to
+    receive a silently truncated batch; it must be told the floor + gap."""
+    monkeypatch.setattr(ui_chat, "TURN_EVENT_RING_MAX", 32)
+    turn = ui_chat.Turn(session_id="gap-s", turn_id="t-gap", holder="h")
+    for i in range(40):
+        turn.publish("token", {"delta": f"chunk-{i}"})
+    turn.mark_done("end_turn")
+    floor = 40 - 32 + 1  # seq 9 is the oldest surviving event
+
+    events = _parse_sse(_drive(ui_chat._replay_generator(turn, 0)))
+    assert events[0][0] == "gap"
+    assert events[0][2]["ring_floor"] == floor
+    assert events[0][2]["gap_from"] == 1
+    assert events[0][2]["type"] == "ring_floor"
+    # the gap event's id is floor-1, so a reconnect carrying it resumes at
+    # the surviving floor and does not re-trigger the signal
+    assert events[0][1] == floor - 1
+    assert [e[1] for e in events[1:]] == list(range(floor, 41))
+
+    resumed = _parse_sse(_drive(ui_chat._replay_generator(turn, floor - 1)))
+    assert resumed[0][0] != "gap"
+    assert [e[1] for e in resumed] == list(range(floor, 41))
+
+
+def test_reconnect_honors_last_event_id_header(client, monkeypatch):
+    """rm-126: a native EventSource resends Last-Event-ID automatically — the
+    header is the resume cursor (and wins over ?after=)."""
+    install_stub_agent(monkeypatch)
+    with client.stream("POST", "/api/chat", json={"message": "replay me"}) as resp:
+        assert resp.status_code == 200
+        text = "".join(resp.iter_text())
+    events = _parse_sse(text)
+    meta = events[0][2]
+    sid, turn_id = meta["session_id"], meta["turn_id"]
+    cut = events[2][1]
+    expected = [e[1] for e in events if e[1] > cut]
+
+    resp = client.get(
+        f"/api/chat/stream?session_id={sid}&turn_id={turn_id}",
+        headers={"Last-Event-ID": str(cut)},
+    )
+    assert resp.status_code == 200
+    replay = _parse_sse(resp.text)
+    assert [e[1] for e in replay] == expected
+    assert all(e[0] != "gap" for e in replay)
+
+    # header precedence: ?after=0 is ignored when the header is present
+    resp = client.get(
+        f"/api/chat/stream?session_id={sid}&turn_id={turn_id}&after=0",
+        headers={"Last-Event-ID": str(cut)},
+    )
+    assert [e[1] for e in _parse_sse(resp.text)] == expected
+
+
+def test_reconnect_after_ring_overflow_names_the_floor(client, monkeypatch):
+    """rm-126, over HTTP: the first batch of an overflowed reconnect carries
+    the explicit gap event before the surviving events."""
+    monkeypatch.setattr(ui_chat, "TURN_EVENT_RING_MAX", 32)
+    turn = ui_chat.Turn(session_id="gap-http", turn_id="t-gap-http", holder="h")
+    for i in range(40):
+        turn.publish("token", {"delta": str(i)})
+    turn.mark_done("end_turn")
+    ui_chat._register_turn(turn)
+
+    resp = client.get("/api/chat/stream?session_id=gap-http&turn_id=t-gap-http&after=0")
+    assert resp.status_code == 200
+    events = _parse_sse(resp.text)
+    assert events[0][0] == "gap"
+    assert events[0][2]["ring_floor"] == 9
+    assert events[0][2]["gap_from"] == 1
+    assert [e[1] for e in events[1:]] == list(range(9, 41))
+
+
+class _ThreadStartFailureProxy:
+    """``threading`` stand-in whose Thread.start() always fails (rm-127 F4)."""
+
+    def __getattr__(self, name):
+        return getattr(threading, name)
+
+    class Thread:  # noqa: N801 — mirrors threading.Thread's construction site
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("can't start new thread")
+
+
+def test_thread_start_failure_releases_lease_and_closes_turn(client, monkeypatch):
+    """rm-127 (assess F4): a failed Thread.start must not strand the 300 s
+    lease (session 409s until TTL) nor leave a never-done, unprunable Turn
+    that keeps burning a _max_concurrent slot."""
+    install_stub_agent(monkeypatch)
+    real_threading = ui_chat.threading
+    ui_chat.threading = _ThreadStartFailureProxy()  # restored below: the
+    # monkeypatch fixture instance is shared with the autouse env isolation,
+    # so undo() here would also revert HERMES_HOME back to the real home.
+    sid = _create_session_via_api(client)
+    try:
+        with client.stream("POST", "/api/chat", json={"session_id": sid, "message": "go"}) as resp:
+            assert resp.status_code == 200
+            text = "".join(resp.iter_text())
+    finally:
+        ui_chat.threading = real_threading
+
+    events = _parse_sse(text)
+    assert [e[0] for e in events] == ["meta", "error", "done"]
+    assert events[1][2]["code"] == "THREAD_START_FAILED"
+    assert events[-1][2]["finish_reason"] == "error"
+
+    turn = ui_chat._turns[sid]
+    assert turn.done is True
+    assert turn.finish_reason == "error"
+    assert ui_chat._active_turn_count() == 0
+
+    # the lease is free: a second send on the same session is NOT 409
+    db = ui_chat._session_db()
+    holder = _probe_holder()
+    assert db.try_acquire_session_turn_lease(sid, holder, ttl_seconds=300.0) is True
+    db.release_session_turn_lease(sid, holder)
+
+
+def test_stop_during_agent_build_is_honored(client, monkeypatch):
+    """rm-127 (assess F5): a stop arriving while _build_agent runs (cold
+    imports take seconds; turn.agent is not set yet) must prevent the turn
+    from executing, not return {stopped:true} and run to completion."""
+    build_started = threading.Event()
+    release_build = threading.Event()
+    executed = {"run_conversation": 0}
+
+    class _BuiltButNeverRunAgent:
+        def interrupt(self, *args, **kwargs):
+            pass
+
+        def run_conversation(self, *args, **kwargs):
+            executed["run_conversation"] += 1
+            return {"interrupted": False, "failed": False, "final_response": ""}
+
+    def _slow_build_agent(*, turn, db, model, profile):
+        build_started.set()
+        assert release_build.wait(_THREAD_BUDGET), "test never released the build"
+        return _BuiltButNeverRunAgent()
+
+    monkeypatch.setattr(ui_chat, "_build_agent", _slow_build_agent)
+    sid = _create_session_via_api(client)
+    result: dict = {}
+
+    def _stream():
+        with client.stream("POST", "/api/chat", json={"session_id": sid, "message": "go"}) as resp:
+            result["status"] = resp.status_code
+            result["text"] = "".join(resp.iter_text())
+
+    stream_thread = threading.Thread(target=_stream, daemon=True)
+    stream_thread.start()
+    try:
+        _wait_for_turn(sid)
+        assert build_started.wait(_THREAD_BUDGET), "agent build never started"
+        # the stop lands while _build_agent is still running
+        resp = client.post("/api/chat/stop", json={"session_id": sid})
+        assert resp.status_code == 200
+        assert resp.json()["data"]["stopped"] is True
+    finally:
+        release_build.set()
+        stream_thread.join(timeout=_THREAD_BUDGET)
+
+    assert result.get("status") == 200
+    events = _parse_sse(result.get("text", ""))
+    assert events[-1][0] == "done"
+    assert events[-1][2]["finish_reason"] == "interrupted"
+    assert executed["run_conversation"] == 0
+
+    db = ui_chat._session_db()
+    holder = _probe_holder()
+    assert db.try_acquire_session_turn_lease(sid, holder, ttl_seconds=300.0) is True
+    db.release_session_turn_lease(sid, holder)
+
+
+def test_session_db_is_the_single_hermes_state_store():
+    """rm-129 (assess F7): there is exactly one SessionDB implementation and
+    no 'real vs shim' fallback indirection left to mislead a reader."""
+    import hermes_state
+
+    db = ui_chat._session_db()
+    assert isinstance(db, hermes_state.SessionDB)
+    assert "ShimSessionDB" not in Path(ui_chat.__file__).read_text()
+    assert "drop-in replacement" not in hermes_state.__doc__
