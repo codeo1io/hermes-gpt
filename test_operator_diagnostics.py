@@ -716,3 +716,13 @@ def test_doctor_ui_mount_check_passes_without_failures(hermes_root, clean_env, a
     check = parsed["checks"]["ui_mount"]
     assert check["status"] == od.STATUS_PASS
     assert check["code"] == "UI_MOUNT_HEALTHY"
+
+
+def test_ui_cron_dispatch_check_declares_in_process_scope():
+    """rm-140: the dispatch-registry doctor check must declare that it reads
+    this process's registry only — served-by-another-process dispatches are
+    invisible to it, and an unqualified "0 active" pass is misleading."""
+    result = od._check_ui_cron_dispatch()
+    assert result["code"] == "UI_CRON_DISPATCH_OK"
+    assert result["scope"] == "in-process"
+    assert "this process" in result["message"]

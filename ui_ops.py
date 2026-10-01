@@ -747,21 +747,26 @@ async def _action(request: Request) -> JSONResponse:
                 ),
                 429,
             )
-        root = _resolve_root()
+        # rm-131: everything after acquire() must release the token on failure.
+        # A raise between acquire() and .start() (e.g. _resolve_root) used to
+        # escape unreleased, permanently consuming one dispatch slot until
+        # restart — after _CRON_DISPATCH_LIMIT failures every later
+        # long-running run 429-capped.
         dispatch_id = f"dsp-{uuid.uuid4().hex[:12]}"
         job_id = str(kwargs.get("job_id") or "")[:64]
-        with _dispatch_lock:
-            _dispatch_active[dispatch_id] = {
-                "dispatch_id": dispatch_id,
-                "tool": tool,
-                "job_id": job_id,
-                "started_epoch": time.time(),
-                "started_at": _now_iso(),
-                "success": None,
-                "finished_at": None,
-                "duration_s": None,
-            }
         try:
+            root = _resolve_root()
+            with _dispatch_lock:
+                _dispatch_active[dispatch_id] = {
+                    "dispatch_id": dispatch_id,
+                    "tool": tool,
+                    "job_id": job_id,
+                    "started_epoch": time.time(),
+                    "started_at": _now_iso(),
+                    "success": None,
+                    "finished_at": None,
+                    "duration_s": None,
+                }
             threading.Thread(
                 target=_run_long_running_dispatch,
                 args=(dispatch_id, tool, spec.fn, root, kwargs),

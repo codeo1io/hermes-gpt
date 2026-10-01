@@ -59,14 +59,17 @@ _DURATION_MULTIPLIERS = {"m": 1, "h": 60, "d": 1440}
 
 # Day-spec phrases for "every monday 9am" / "every day at 9am". Cron weekday
 # numbering is 0=Sunday … 6=Saturday (croniter's default).
+# rm-138: plural keys map to the same dow as the singular form — without
+# them "every mondays 9am" fell through to the interval path and died with
+# the misleading "Invalid duration: 'mondays 9am'".
 _WEEKDAY_TO_CRON_DOW = {
-    "sunday": "0", "sun": "0",
-    "monday": "1", "mon": "1",
-    "tuesday": "2", "tue": "2", "tues": "2",
-    "wednesday": "3", "wed": "3", "weds": "3",
-    "thursday": "4", "thu": "4", "thur": "4", "thurs": "4",
-    "friday": "5", "fri": "5",
-    "saturday": "6", "sat": "6",
+    "sunday": "0", "sundays": "0", "sun": "0",
+    "monday": "1", "mondays": "1", "mon": "1",
+    "tuesday": "2", "tuesdays": "2", "tue": "2", "tues": "2",
+    "wednesday": "3", "wednesdays": "3", "wed": "3", "weds": "3",
+    "thursday": "4", "thursdays": "4", "thu": "4", "thur": "4", "thurs": "4",
+    "friday": "5", "fridays": "5", "fri": "5",
+    "saturday": "6", "saturdays": "6", "sat": "6",
 }
 
 # Keyword day-specs that expand to a cron weekday field.
@@ -181,7 +184,54 @@ def _cron_schedule(expr: str, display: str, missing_croniter: str, invalid_label
 
 
 def _interval_schedule(minutes: int) -> dict[str, Any]:
+    # rm-057 floor: a zero/negative interval is a silent hot-loop footgun —
+    # it used to be stored as minutes=0 and created a real job (assess F2).
+    # Reject loudly; immediate one-shot needs are "in <duration>" schedules.
+    if minutes < 1:
+        raise ValueError(
+            f"Interval schedules must be at least 1 minute, got {minutes}. "
+            "Use a one-shot 'in <duration>' schedule for immediate runs."
+        )
     return {"kind": "interval", "minutes": minutes, "display": f"every {minutes}m"}
+
+
+def _schedule_preview(parsed: dict[str, Any], count: int = 3) -> dict[str, Any]:
+    """rm-132: next-fire preview + the effective timezone, for dry-run plans.
+
+    Times are computed against the server's local timezone (the standalone
+    distribution has no configured Hermes timezone to honor) and the zone is
+    declared in the preview so "once at 9:00" stops being an implicit
+    timezone guess. The preview confirms intent at arm time; the external
+    scheduler remains the authority for when jobs actually fire.
+    """
+    now = datetime.now().astimezone()
+    offset = now.strftime("%z")
+    tz_label = f"{now.tzname() or 'local'} (UTC{offset[:3]}:{offset[3:]})"
+    kind = str(parsed.get("kind") or "")
+    preview: dict[str, Any] = {
+        "schedule_kind": kind,
+        "timezone": tz_label,
+        "times": [],
+    }
+    if kind == "interval":
+        minutes = int(parsed.get("minutes") or 0)
+        preview["times"] = [
+            (now + timedelta(minutes=minutes * i)).isoformat()
+            for i in range(1, count + 1)
+        ]
+    elif kind == "cron":
+        if not _ensure_croniter():
+            preview["unavailable"] = "croniter is not installed"
+        else:
+            it = _croniter(str(parsed.get("expr")), now)
+            preview["times"] = [it.get_next(datetime).isoformat() for _ in range(count)]
+    elif kind == "once":
+        run_at = parsed.get("run_at")
+        preview["times"] = [str(run_at)] if run_at else []
+        preview["note"] = "one-shot schedule: fires exactly once at the time shown"
+    else:
+        preview["unavailable"] = f"no preview for schedule kind {kind!r}"
+    return preview
 
 
 def _parse_schedule(schedule: str) -> dict[str, Any]:
@@ -246,9 +296,13 @@ def _parse_schedule(schedule: str) -> dict[str, Any]:
         return {"kind": "once", "run_at": run_at.isoformat(), "display": f"once in {duration_str}"}
 
     try:
-        return _interval_schedule(_parse_duration(schedule))
+        minutes = _parse_duration(schedule)
     except ValueError:
-        pass
+        minutes = None
+    if minutes is not None:
+        # Outside the catch: the rm-057 floor raises its dedicated message
+        # here instead of it being swallowed into the generic error below.
+        return _interval_schedule(minutes)
 
     raise ValueError(
         f"Invalid schedule '{original}'. Use:\n"
@@ -1251,6 +1305,10 @@ def hermes_cron_create(
                 "job_id": new_id,
                 "name": job_name,
                 "schedule": schedule,
+                # rm-132: fire-time preview computed in the effective server
+                # timezone — the operator confirms WHEN the grammar parsed,
+                # before arming.
+                "schedule_preview": _schedule_preview(parsed_schedule),
                 "prompt_len": len(prompt),
                 "skills": skills or [],
                 "deliver": deliver or "local",

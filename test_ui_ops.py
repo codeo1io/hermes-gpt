@@ -679,6 +679,46 @@ def test_action_cron_run_concurrency_cap_rejects_loudly(client, monkeypatch, tmp
         ui_ops._dispatch_semaphore.release()
 
 
+def test_cron_dispatch_resolve_failure_does_not_leak_semaphore(client, monkeypatch):
+    """rm-131: a raising _resolve_root() between semaphore acquire and thread
+    start must fail cleanly AND release the dispatch token. Before the fix the
+    exception escaped the acquire->dispatch span unreleased, so every failure
+    permanently consumed one token until process restart (4 failures = every
+    later long-running run 429-capped)."""
+    calls: list[dict] = []
+
+    def stub_cron_run(**kwargs):
+        calls.append(kwargs)
+        return json.dumps({"success": True, "dry_run": False, "job": "j1"})
+
+    _set_env(monkeypatch, CRON_ENV)
+    monkeypatch.setattr(ui_ops._MUTATION_TOOLS["hermes_cron_run"], "fn", stub_cron_run)
+    real_resolve_root = ui_ops._resolve_root
+
+    def boom():
+        raise RuntimeError("root resolution failed")
+
+    monkeypatch.setattr(ui_ops, "_resolve_root", boom)
+    payload = {"tool": "hermes_cron_run", "args": {"profile": "default", "job_id": "j1", "dry_run": False}}
+
+    # More failures than the dispatch limit: every one must return a clean
+    # 500 INTERNAL (not an unhandled crash, not a 429) and release its token.
+    for _ in range(ui_ops._CRON_DISPATCH_LIMIT + 2):
+        resp = client.post("/api/ops/action", json=payload)
+        assert resp.status_code == 500
+        assert resp.json()["error"]["code"] == "INTERNAL"
+    assert calls == []  # the tool itself never ran
+    assert ui_ops._dispatch_active == {}  # no leaked registry entries
+    assert ui_ops._dispatch_semaphore._value == ui_ops._CRON_DISPATCH_LIMIT  # rm-131: capacity intact
+
+    # Recovery: with _resolve_root restored, a dispatch is accepted (202) —
+    # it is NOT 429-capped, which is exactly what a leaked token would cause.
+    monkeypatch.setattr(ui_ops, "_resolve_root", real_resolve_root)
+    resp = client.post("/api/ops/action", json=payload)
+    assert resp.status_code == 202
+    assert calls, "recovered dispatch should have run the stub tool"
+
+
 def test_cron_dispatch_registry_is_operator_visible(client, monkeypatch, tmp_path):
     """rm-097: hermes_operator_doctor surfaces the dispatch registry.
 
