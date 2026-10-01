@@ -41,6 +41,9 @@ MAX_SUBJECT = 192
 MAX_QUERY = 500
 MAX_WAIT_MS = 30_000
 MAX_CURSOR = 2**63 - 1
+# rm-119: idle-poll bound for the WS receive loop; module-level so tests can
+# shorten it instead of waiting real half-seconds per poll cycle.
+_WS_IDLE_POLL_SECONDS = 0.5
 DEFAULT_RETENTION = 20_000
 HARD_RETENTION = 100_000
 
@@ -392,8 +395,14 @@ async def _websocket_endpoint(
                 await websocket.send_json({"schema": STREAM_SCHEMA, "type": "heartbeat", "cursor": cursor})
                 last_heartbeat = now
             try:
-                text = await asyncio.wait_for(websocket.receive_text(), timeout=0.5)
-            except TimeoutError:
+                text = await asyncio.wait_for(
+                    websocket.receive_text(), timeout=_WS_IDLE_POLL_SECONDS
+                )
+            # rm-119: on Python 3.10 asyncio.wait_for raises the distinct
+            # asyncio.TimeoutError (aliased onto builtin TimeoutError only on
+            # 3.11+), so catching the builtin alone let the first idle poll
+            # kill the stream past the outer except WebSocketDisconnect.
+            except (TimeoutError, asyncio.TimeoutError):
                 continue
             if len(text) > 4096:
                 await websocket.close(code=1009)

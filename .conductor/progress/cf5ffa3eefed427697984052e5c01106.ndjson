@@ -1,0 +1,2 @@
+{"step":1,"ts":"2026-09-30T09:20:00Z","summary":"3rd re-delivery (two attempts died on provider 429 post-work): resuming from carried state - sweeps done, 5 findings; finishing mcp_compat exception-surface + runtime gates","touched":[]}
+{"step":2,"ts":"2026-09-30T09:32:00Z","summary":"Runtime gates: pytest collect-only OK (no collection errors), ruff check . = All checks passed; mcp_compat@HEAD has no ToolError wrapper (sibling work unlanded, known)","touched":["mcp_compat.py","operator_codex.py","operator_runners.py"]}

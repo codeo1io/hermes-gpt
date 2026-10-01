@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -315,3 +317,29 @@ def test_read_since_no_match_advances_cursor(hermes_root):
     events2, _ = live.read_since(next_cursor, topic="other", hermes_root=hermes_root)
     assert [e["seq"] for e in events2] == [c["seq"]]
 
+
+
+def test_websocket_idle_poll_catches_asyncio_timeout_error():
+    """rm-119: on Python 3.10 asyncio.wait_for raises asyncio.TimeoutError, a
+    distinct class from builtin TimeoutError (aliased only on 3.11+). The
+    idle-poll except must catch both or the first idle poll kills the stream
+    with an uncaught escape past the outer except WebSocketDisconnect."""
+    source = inspect.getsource(live._websocket_endpoint)
+    assert "except (TimeoutError, asyncio.TimeoutError):" in source
+
+
+def test_websocket_survives_idle_polls_and_keeps_serving_control_frames(
+    hermes_root: Path, monkeypatch
+):
+    """rm-119 behavioral witness: a client that stays silent through several
+    idle-poll timeouts must keep a live stream (control frames still answer).
+    On 3.10 the unfixed except lets the first poll timeout escape and the
+    connection dies; the source-contract test above pins that statically."""
+    monkeypatch.setattr(live, "_WS_IDLE_POLL_SECONDS", 0.05)
+    app = Starlette(routes=live.websocket_routes(lambda: hermes_root))
+    client = TestClient(app)
+    with client.websocket_connect("/events/ws?cursor=0") as ws:
+        time.sleep(0.3)  # several idle poll cycles with no events inbound
+        ws.send_json({"action": "ping"})
+        pong = ws.receive_json()
+        assert pong["type"] == "pong"

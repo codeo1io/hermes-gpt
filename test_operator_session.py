@@ -104,3 +104,58 @@ def test_reconcile_marks_unowned_running_job_orphaned(tmp_path):
     result = session.hermes_session_job_status(job_id, tmp_path)
     assert result["job"]["status"] == "orphaned"
     assert "ownership" in result["job"]["reconciliation"]
+
+
+def test_persist_failure_unwinds_registration_and_terminates_child(monkeypatch, tmp_path):
+    """rm-122: when _save fails after the child is spawned (disk full,
+    permission error), the turn must unwind — terminate the child, close and
+    remove the output file, release the session key — instead of stranding an
+    unwatched process and a SESSION_BUSY key until process restart."""
+    monkeypatch.setenv(session.ENABLE_SESSION_CONTROL_ENV, "1")
+    started_threads = []
+
+    class _RecordingThread:
+        def __init__(self, *, target, args, daemon):
+            self.target = target
+            self.args = args
+            self.daemon = daemon
+
+        def start(self):
+            started_threads.append(self)
+
+    class _StubProcess:
+        def __init__(self, argv, **kwargs):
+            self.argv = argv
+            self.kwargs = kwargs
+            self.pid = 4321
+            self.returncode = None
+
+        def wait(self, timeout=None):
+            return 0
+
+        def poll(self):
+            return self.returncode
+
+    monkeypatch.setattr(session.threading, "Thread", _RecordingThread)
+    monkeypatch.setattr(session.subprocess, "Popen", lambda argv, **kw: _StubProcess(argv, **kw))
+    terminated = []
+    monkeypatch.setattr(session, "_terminate", lambda proc: terminated.append(proc))
+
+    def failing_save(meta, hermes_root=None):
+        raise OSError("simulated disk full during session-job persist")
+
+    monkeypatch.setattr(session, "_save", failing_save)
+
+    result = session.hermes_session_continue(
+        "20260810_143227_6b0982",
+        "private follow-up prompt",
+        hermes_root=tmp_path,
+        agent_root=tmp_path / "agent",
+    )
+    assert result["success"] is False
+    assert result["code"] == "SESSION_PERSIST_FAILED"
+    assert len(terminated) == 1
+    assert started_threads == []
+    assert "default:20260810_143227_6b0982" not in session._active_sessions
+    assert session._processes == {}
+    assert not any(tmp_path.rglob("*.txt"))

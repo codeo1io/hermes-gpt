@@ -614,15 +614,19 @@ def test_ui_mount_failure_is_operator_visible(tmp_path, monkeypatch):
             and "ui_mount" in e.get("refs", [])
             and e.get("status_after") == "error"
         ]
-        assert audit_hits, envelope["events"]
+        # rm-121: exactly-once — a duplicated emission (per-request remount
+        # failure, double publish) must fail here, not pass as presence-only.
+        assert len(audit_hits) == 1, envelope["events"]
 
         import operator_live_events
 
         live_events, _ = operator_live_events.read_since(0, hermes_root=home)
-        assert any(
-            e.get("kind") == "ui_mount_failed" and e.get("source") == "server"
+        ui_mount_failed_events = [
+            e
             for e in live_events
-        )
+            if e.get("kind") == "ui_mount_failed" and e.get("source") == "server"
+        ]
+        assert len(ui_mount_failed_events) == 1, live_events
 
         doctor = json.loads(
             operator_diagnostics.hermes_operator_doctor(profile="default", hermes_root=home)

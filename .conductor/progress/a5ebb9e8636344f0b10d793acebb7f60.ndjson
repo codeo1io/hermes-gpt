@@ -1,0 +1,2 @@
+{"step":1,"ts":"2026-10-01T01:10:00Z","summary":"Prioritize kickoff: reading cycle-5 ROADMAP block (rm-116..rm-123) + open-item baseline to score and select the cycle batch","touched":[]}
+{"step":2,"ts":"2026-10-01T09:05:00Z","summary":"prioritize: batch rm-119+rm-122+rider rm-121 selected; rm-117/120/123 deduped to unlanded siblings; rm-116 tag-blocked; rm-118 dated-deferred","touched":["/home/agent/.hermes/conductor-delegate-spool/delegate/a5ebb9e8636344f0b10d793acebb7f60.json"]}

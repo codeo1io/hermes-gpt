@@ -1,0 +1,1 @@
+{"step":1,"ts":"2026-10-01T09:40:00Z","summary":"stewardship: structured stewardship_request written (2 units + rider, 9 surfaces, 4 must_remain_separate pairs, dedupe exclusions, dirty-state contract)","touched":["/home/agent/.hermes/conductor-delegate-spool/delegate/00594dfd205a454bbc2710f8f51a02da.json","/tmp/stewardship-099e2bfc/stewardship-request.md"]}

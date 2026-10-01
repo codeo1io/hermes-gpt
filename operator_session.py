@@ -191,7 +191,26 @@ def hermes_session_continue(
             "Check the Hermes CLI installation, provider authentication, and session ID.",
         )
     meta.update({"status": "running", "started_at": _now(), "pid": proc.pid})
-    _save(meta, hermes_root)
+    # rm-122: a persist failure after the child is spawned must not strand an
+    # unwatched process — terminate the child, close and remove the output
+    # file, and release the session key. Without this unwind the exception
+    # propagated with the key still registered (SESSION_BUSY until process
+    # restart), the child running with no timeout enforcement, and the output
+    # descriptor never closed (the _watch thread never started).
+    try:
+        _save(meta, hermes_root)
+    except (OSError, ValueError) as exc:
+        _terminate(proc)
+        output.close()
+        output_path.unlink(missing_ok=True)
+        with _lock:
+            if _active_sessions.get(active_key) == job_id:
+                _active_sessions.pop(active_key, None)
+        return _error(
+            "SESSION_PERSIST_FAILED",
+            op.redact_output(str(exc)),
+            "Check disk space and permissions under the Hermes session-jobs directory, then retry the turn.",
+        )
     with _lock:
         _processes[job_id] = proc
     threading.Thread(
