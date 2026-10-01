@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import base64
+import functools
 import hashlib
 import hmac
 import json
 import os
 import re
 import secrets
+import threading
 import time
 import urllib.parse
 from dataclasses import dataclass, field
@@ -347,6 +350,33 @@ def _registerable_redirect(redirect_uri: str) -> bool:
     )
 
 
+def _serialized(method):
+    """Serialize an :class:`OAuthState` mutation across worker threads.
+
+    rm-085 moved the OAuth exchanges onto worker threads
+    (``asyncio.to_thread``), so concurrent ``/oauth/token`` requests are
+    genuinely parallel for the first time in this module's lifetime. The
+    credential stores are check-then-act shared dicts — the authorization-code
+    replay fence reads ``used_auth_codes`` at method entry and writes it only
+    after minting — so without this lock two racing redemptions of one code
+    could both pass the check and both mint + persist token sets (RFC 6749
+    §4.1.2/§10.5 single-use). The lock is held across the whole exchange,
+    including the durable commit, so mint-and-persist stays atomic against a
+    competing redemption. It serializes WORKER THREADS against each other;
+    the event loop never calls these mutators while holding it, so the
+    rm-085 loop-offload goal is preserved. Re-entrant on purpose: locked
+    mutators call each other (``cleanup`` from ``_require_capacity`` and the
+    exchanges).
+    """
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._mutation_lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
 class OAuthState:
     def __init__(
         self,
@@ -371,7 +401,12 @@ class OAuthState:
         self._hermes_root: Path | None = None
         self._epoch: int = 0
         setattr(self, "_retired_refresh_to" + "kens", set())
+        # rm-085 review fix: exchanges run on worker threads now; this lock
+        # serializes credential mutations between those threads (the event
+        # loop never acquires it — see @_serialized).
+        self._mutation_lock = threading.RLock()
 
+    @_serialized
     def register_dynamic_client(self, redirect_uris: list[str]) -> DynamicClient:
         """Mint a public dynamic client; bounded, chatgpt.com-redirects only."""
         cleaned = list(dict.fromkeys(redirect_uris))
@@ -607,6 +642,7 @@ class OAuthState:
             imported += 1
         return imported
 
+    @_serialized
     def cleanup(self) -> None:
         """Evict expired authorization codes, tokens, and dynamic clients."""
         now = time.time()
@@ -833,6 +869,7 @@ class OAuthState:
             return
         self._adopt_current_epoch()
 
+    @_serialized
     def exchange_authorization_code(
         self,
         *,
@@ -950,6 +987,7 @@ class OAuthState:
             raise OAuthError("invalid_grant", "Invalid, expired, or already used refresh token.")
         return item
 
+    @_serialized
     def exchange_refresh_token(
         self,
         *,
@@ -1075,6 +1113,7 @@ class OAuthState:
     # ever written to the audit log or returned on surfaces.
     # ------------------------------------------------------------------
 
+    @_serialized
     def clear_live_tokens(self) -> None:
         """Drop live bearer/refresh caches after a durable revocation.
 
@@ -1364,7 +1403,12 @@ class BearerAuthMiddleware:
         headers = {key.lower(): value for key, value in scope.get("headers") or []}
         authorization = headers.get(b"authorization", b"").decode("latin-1")
         supplied = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
-        if not validate_bearer_token(supplied, self.state, static_token=expected_static):
+        # Bearer validation reaches the durable token store (sqlite, 15s
+        # busy_timeout); run it off the event loop so a contended DB cannot
+        # stall every concurrent request.
+        if not await asyncio.to_thread(
+            validate_bearer_token, supplied, self.state, static_token=expected_static
+        ):
             challenge = "Bearer"
             if self.state is not None:
                 metadata = f"{self.state.config.issuer}/.well-known/oauth-protected-resource"
@@ -1675,9 +1719,13 @@ async def token(request: Request, state: OAuthState) -> JSONResponse:
             raise OAuthError("invalid_request", "grant_type is required.")
         if grant_type not in {"authorization_code", "refresh_token"}:
             raise OAuthError("unsupported_grant_type", "The requested grant type is not supported.")
-        client_id = _authenticate_client(request, form, state)
+        # Client auth and code/refresh exchanges hit the durable token store
+        # (sqlite, synchronous=FULL commits); offload them so concurrent
+        # HTTP/WS/MCP traffic is not stalled by the commit.
+        client_id = await asyncio.to_thread(_authenticate_client, request, form, state)
         if grant_type == "authorization_code":
-            response = state.exchange_authorization_code(
+            response = await asyncio.to_thread(
+                state.exchange_authorization_code,
                 code=_form_value(form, "code"),
                 client_id=client_id,
                 redirect_uri=_form_value(form, "redirect_uri"),
@@ -1688,7 +1736,8 @@ async def token(request: Request, state: OAuthState) -> JSONResponse:
             refresh_token = _form_value(form, "refresh_token")
             if not refresh_token:
                 raise OAuthError("invalid_request", "refresh_token is required.")
-            response = state.exchange_refresh_token(
+            response = await asyncio.to_thread(
+                state.exchange_refresh_token,
                 refresh_token=refresh_token,
                 client_id=client_id,
                 requested_scope=_form_value(form, "scope"),
