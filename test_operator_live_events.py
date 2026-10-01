@@ -263,6 +263,65 @@ def test_composed_websocket_reuses_server_bearer_boundary(hermes_root: Path, mon
 # ── rm-080: read_since cursor high-watermark semantics ─────────────────────
 
 
+# ── rm-095: the WS loop adopts the watermark on empty filtered pages ─────────
+
+
+def test_websocket_empty_page_adopts_watermark_without_rescan(hermes_root, monkeypatch):
+    """An idle filtered WS client advances past non-matching events.
+
+    Pre-fix, the loop assigned ``cursor = next_cursor`` only inside
+    ``if events:`` — an idle client whose filter matched nothing discarded
+    read_since's skip-ahead watermark (rm-080) and rescanned the journal
+    tail from its stale cursor on every poll, contradicting the documented
+    cursor semantics (docs/live-events.md, "Cursor semantics").
+    """
+    app = Starlette(routes=live.websocket_routes(lambda: hermes_root))
+    client = TestClient(app)
+    for i in range(3):
+        live.publish_event(
+            topic="swarm", kind="swarm.updated", subject_type="swarm",
+            subject_id=f"swarm-{i}", source="test", payload={}, hermes_root=hermes_root,
+        )
+    high = live.high_watermark(hermes_root)
+
+    seen_cursors: list[int] = []
+    real_read_since = live.read_since
+
+    def recording_read_since(cursor, **kwargs):
+        seen_cursors.append(cursor)
+        return real_read_since(cursor, **kwargs)
+
+    monkeypatch.setattr(live, "read_since", recording_read_since)
+
+    with client.websocket_connect("/events/ws?cursor=0&topic=mission") as ws:
+        # No event matches topic=mission: the client stays idle but its
+        # cursor must still adopt the high watermark...
+        ws.send_json({"action": "ping"})
+        pong = ws.receive_json()
+        assert pong["type"] == "pong"
+        assert pong["cursor"] == high
+        ws.send_json({"action": "ping"})
+        pong2 = ws.receive_json()
+        assert pong2["cursor"] == high
+
+        # ...and adoption must not skip a matching event published after
+        # the watermark was taken (rm-080's snapshot-ordering guarantee).
+        late = live.publish_event(
+            topic="mission", kind="mission.updated", subject_type="mission",
+            subject_id="msn-idle", mission_id="msn-idle", source="test",
+            payload={}, hermes_root=hermes_root,
+        )
+        batch = ws.receive_json()
+        assert batch["type"] == "events"
+        assert [e["seq"] for e in batch["events"]] == [late["seq"]]
+
+    assert seen_cursors[0] == 0
+    # Every poll after the first starts from the adopted watermark (or later,
+    # once the late event advances it) — the non-matching tail is never
+    # rescanned. Pre-fix every poll restarted from cursor 0.
+    assert all(cursor >= high for cursor in seen_cursors[1:])
+
+
 def test_read_since_advances_cursor_to_high_watermark_when_no_more_matches(hermes_root):
     """A non-truncated filtered page advances the cursor past non-matching events.
 

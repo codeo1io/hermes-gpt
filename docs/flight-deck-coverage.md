@@ -81,7 +81,12 @@ The current policy contract remains [Operator Mode](operator-mode.md).
 - [x] Existing operator level, direct-mode, confirmation, audit, and secret-path
   protections remain authoritative. The Flight Deck adds no authority bypass.
 - [x] Blocking cron execution returns `202 Accepted` and runs off the request
-  path; the UI refreshes the existing cron read model for status.
+  path on a bounded dispatch (concurrency-capped; cap-exceeded requests are
+  rejected with `429 RATE_LIMITED`). The dispatch is recorded in a registry
+  surfaced by `hermes_operator_doctor`'s `ui_cron_dispatch` check, and the
+  adapter-level audit record is written at completion with the real outcome
+  and duration — never as a success record at dispatch time. The UI
+  refreshes the existing cron read model for status.
 
 ## Intentional adapter boundaries
 

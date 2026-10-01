@@ -20,6 +20,13 @@ dependencies = [
   "pyyaml>=6.0.3,<7",
   "croniter>=2.0,<7",
   "tomli; python_version < '3.11'",
+  # rm-099: both are DIRECT imports, previously resolved only transitively
+  # via mcp[cli]. starlette: server.py, ui_api.py, ui_chat.py, ui_missions.py,
+  # ui_ops.py, operator_live_events.py. anyio: mcp_compat.py, ui_missions.py
+  # (dedicated long-poll limiter). Declared so the operator UI has an
+  # explicit install contract independent of the MCP SDK's dependency pivot.
+  "starlette>=0.40,<2",
+  "anyio>=4,<5",
 ]
 
 [project.optional-dependencies]

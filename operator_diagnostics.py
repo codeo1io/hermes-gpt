@@ -39,6 +39,9 @@ STATUS_UNSUPPORTED = "UNSUPPORTED"
 
 # Heartbeat considered stale after 5 minutes (best-effort).
 _STALE_HEARTBEAT_SECONDS = 300
+# rm-097: hermes_cron_run documents a 30-7200s execution window; an active
+# UI dispatch older than this is no longer expected to be a healthy run.
+_DISPATCH_STUCK_SECONDS = 7200
 
 # ---------------------------------------------------------------------------
 # Path helpers (mirroring operator modules so we do not depend on privates)
@@ -570,6 +573,71 @@ def _check_last_audit_record() -> dict[str, Any]:
         )
 
 
+def _check_ui_cron_dispatch() -> dict[str, Any]:
+    """Report the long-running UI dispatch registry (rm-097).
+
+    Long-running browser-UI mutations (``hermes_cron_run``) execute off the
+    request path on bounded daemon dispatch threads. This check surfaces
+    the in-process registry: how many runs are active, how many recently
+    finished, and whether any active run has outlived the documented cron
+    execution window (30-7200 s) and may be wedged.
+    """
+    try:
+        import ui_ops  # deferred: ui_ops imports operator_diagnostics
+    except Exception as exc:  # pragma: no cover - UI adapter not importable
+        return _check_result(
+            status=STATUS_UNSUPPORTED,
+            layer="ui",
+            code="UI_DISPATCH_CHECK_UNAVAILABLE",
+            message=f"ui_ops registry unavailable: {exc.__class__.__name__}.",
+            suggested_action="Install/repair the browser UI modules, then re-run doctor.",
+        )
+    try:
+        snapshot = ui_ops._dispatch_registry_snapshot()
+    except Exception as exc:  # pragma: no cover - registry contract drift
+        return _check_result(
+            status=STATUS_UNSUPPORTED,
+            layer="ui",
+            code="UI_DISPATCH_CHECK_UNAVAILABLE",
+            message=f"dispatch registry could not be read: {exc.__class__.__name__}.",
+            suggested_action="Check ui_ops dispatch registry state; see server logs.",
+        )
+    oldest_age = snapshot["oldest_active_age_s"]
+    if oldest_age is not None and oldest_age > _DISPATCH_STUCK_SECONDS:
+        return _check_result(
+            status=STATUS_WARN,
+            layer="ui",
+            code="UI_CRON_DISPATCH_STUCK",
+            message=(
+                f"{snapshot['active']} long-running UI dispatch(es) running; oldest is "
+                f"{oldest_age:.0f}s old, past the 7200s cron execution window."
+            ),
+            suggested_action="Inspect the dispatching cron job and server logs; the run may be wedged.",
+            extra={
+                "active": snapshot["active"],
+                "finished": snapshot["finished"],
+                "limit": snapshot["limit"],
+                "oldest_active_age_s": oldest_age,
+            },
+        )
+    return _check_result(
+        status=STATUS_PASS,
+        layer="ui",
+        code="UI_CRON_DISPATCH_OK",
+        message=(
+            f"{snapshot['active']} active / {snapshot['finished']} recently finished "
+            f"long-running UI dispatch(es); concurrency limit {snapshot['limit']}."
+        ),
+        suggested_action="No action needed.",
+        extra={
+            "active": snapshot["active"],
+            "finished": snapshot["finished"],
+            "limit": snapshot["limit"],
+            "oldest_active_age_s": oldest_age,
+        },
+    )
+
+
 def _check_ui_mount() -> dict[str, Any]:
     """WARN when the audit log records a failed UI mount (rm-078).
 
@@ -683,6 +751,7 @@ def hermes_operator_doctor(
             "operator_policy": _check_operator_policy(profile, hermes_root),
             "last_audit_record": _check_last_audit_record(),
             "ui_mount": _check_ui_mount(),
+            "ui_cron_dispatch": _check_ui_cron_dispatch(),
             "connector_api_bridge": _check_connector_api_bridge(profile_home),
         }
 

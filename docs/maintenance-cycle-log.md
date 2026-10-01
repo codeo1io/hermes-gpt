@@ -211,3 +211,124 @@ pre-existing environment skips; ruff clean. 14 tracked files changed,
 - **Candidate hardening:** autouse fixture resetting `set_audit_log_override`;
   additive py3.13 CI lane (ci edits were prohibited in-cycle); the two
   environment-dependent skips in the full suite remain unowned.
+
+## Cycle 5 — 2026-10-01 — "Operator async-surface reliability close-out +
+stale-gate unblock"
+
+Run `1a6beebac21c4907ad8195fc9c5e90fa` (repository-maintenance
+`00b0db0d136e4dfe9a9bff361e8c362d`, cycle 2) against worktree at `caf60018d2`
+(run-1a6beebac21c-1a6beeba, branch `conductor/run-1a6beebac21c`). Phases:
+assess → research → roadmap → prioritize → stewardship → implement → targeted
+tests → full tests → compound. All outcomes below are pre-review: the batch is
+implemented and locally verified but uncommitted, awaiting the fold and commit
+gates. Sibling families worked the same base in parallel (0aa75ea44f93 holds an
+uncommitted cycle-5 block minting rm-085..rm-094; this cycle's ids start at
+rm-095 and the landing gate dedupes content overlaps — upstream v0.13 adoption
+is held by both).
+
+### What the cycle did
+
+- **rm-095 (P85)** — the live-events WS loop now adopts `read_since`'s
+  watermark on empty filtered pages (cursor adoption moved above
+  `if events:`), so an idle topic/kind-filtered client no longer rescans the
+  non-matching journal tail from a stale cursor every ≤0.5 s poll; rm-080's
+  delivered-or-rescanned-never-skipped guarantee is preserved and
+  `docs/live-events.md`'s cursor-semantics paragraph now holds verbatim.
+- **rm-096 (P90)** — the mission-events long-poll
+  (`/api/ops/missions/{mission_id}/events`, 25 s max wait) no longer parks
+  tokens on anyio's shared 40-token default threadpool limiter: it runs through
+  a dedicated `anyio.CapacityLimiter(40)` via `anyio.to_thread.run_sync(limiter=...)`,
+  so 40 concurrent long-polls can no longer starve every other offloaded
+  handler and sync route. Behavior unchanged.
+- **rm-097 (P88)** — `hermes_cron_run` dispatch through
+  `POST /api/ops/action` is now bounded (cap 4; cap-exceeded requests get 429
+  RATE_LIMITED like the chat turn gate), registry-tracked (active/finished in
+  the 202 body), audited at COMPLETION with the real outcome + duration
+  (previously a success-marked record at dispatch time), and observable via
+  `hermes_operator_doctor`'s new `ui_cron_dispatch` check (stuck-run WARN).
+  docs/operator-mode.md + docs/flight-deck-coverage.md updated.
+- **rm-099 (P55)** — pyproject declares `starlette>=0.40,<2` and `anyio>=4,<5`
+  as direct dependencies (both were direct imports resolved only transitively
+  via mcp[cli]) with the transitive-source comment; resolved set unchanged.
+- **rm-053 (decision-slice)** — stale gate closed: upstream PR #76 is closed
+  unmerged (2026-10-01 probe) and the skill-name grammar slice it gated landed
+  at HEAD; gate text removed from the roadmap entry.
+
+Verification (pre-review, repo .venv, tests-first red→green with a red witness
+at each defect site): targeted_command exit 0 — the runner self-escalated to
+the authoritative full gate (pyproject.toml in FULL_IMPACT_FILES; envelope
+result-739098, returncode 0, workers 2, 377 s; count recovery `1610 passed, 5
+skipped, 1 warning in 238.09s`); focused 4-file lane `116 passed, 1 warning in
+11.23s`; full_command VERBATIM exit 0 (envelope result-1529618, returncode 0,
+workers 1 admitted at load1=31.31, ~457 s; count recovery `1610 passed, 5
+skipped, 1 warning in 261.35s`); ruff `All checks passed!` at both gates;
+validation digest `validation:v1:4a1f4beb1ad6e848a678594cb0c6526255ff43fda34e4b2cc99cf998838ec608`
+declared verbatim and recomputation-verified byte-identical. 12 tracked files
+changed, +664/−12, including new regression tests for every unit.
+
+### Prevention rules established
+
+1. **Watermark adoption is an empty-page concern.** Advance the cursor on the
+   pages you did NOT deliver; a loop that only advances when events arrive
+   rescans the tail forever for exactly its quietest (idle, filtered) clients.
+   Keep the truncated-page stop so no event is skipped; test the idle-filtered
+   client advances past N non-matching events without rescanning.
+2. **anyio's default limiter is a global budget, not a default.** Every
+   `run_in_threadpool` call without `limiter=` shares one 40-token pool; a
+   wait-bearing offload parks tokens it doesn't need (the rm-076 loop-stall
+   class relocated into the pool). Wait-bearing endpoints get a dedicated
+   CapacityLimiter, proven by a saturation test that parks all 40 default
+   tokens.
+3. **Fire-and-forget dispatch manufactures false audit trails.** A success
+   record written at dispatch time is a guarantee of a wrong trail for every
+   failed/wedged run — evidence integrity, not just reliability. Mutating
+   long-runners ship bound + registry + completion-time audit (real outcome +
+   duration) + doctor visibility together.
+4. **Every directly-imported distribution is a declared dependency.** Diff
+   import roots against `[project]` dependencies; undeclared transitive
+   resolution is an install-time contract gap. New declarations name their
+   transitive source and leave the resolved set unchanged.
+5. **Stale gates name their re-verify trigger.** rm-053 closed in one probe
+   because its gate text recorded the concrete signal to re-check (PR #76
+   merge state); gates that record only the blocking fact rot into research
+   projects.
+
+### Local toolchain notes (small, reusable)
+
+- The gate's own result envelope carries `digest_base: unknown` — its digest
+  is NOT the engine's validation digest. Declare the dispatch digest and, when
+  tree identity matters, recompute via
+  `hermes_conductor.validation_policy.validation_digest(<full HEAD sha>, repo)`
+  (a short sha or 'unknown' base yields a different, non-matching digest).
+- Repo addopts `-q` stacks with CLI `-q` into `-qq`, which suppresses even the
+  summary line — counts need `python -m pytest -o addopts= -q` (cycle-3 rule 5,
+  still true in cycle 5).
+- Under fleet load the admission gate may spend its whole 900 s resource-wait
+  window before pytest starts (observed: a foreground 900 s tool ceiling
+  killed the run with an empty log and no envelope; the detached rerun
+  admitted workers=1 at load1=31.31 and passed). Run the verbatim gate command
+  detached and poll by PID; a slow-but-green gate is still a valid full pass
+  (cycle-4 note, mechanism now identified).
+- `run_repo_impacted_tests.py` self-escalates to the authoritative full gate
+  when pyproject.toml is in the changed set (FULL_IMPACT_FILES) — a targeted
+  dispatch can therefore carry full-gate evidence; read the gate's envelope
+  rather than the runner's exit code alone.
+
+### Context left for the next cycle
+
+- **rm-098 (P115) upstream v0.13 Autopilot adoption** (9-commit gap, tip
+  f4151d972; no v0.13 tag yet; PRs #83/#84 open docs/site-only) — FLEET
+  INTERLOCK: sibling 0aa75ea44f93 holds the same topic as its uncommitted
+  rm-085; landing gate dedupes, do not implement twice; rm-081 folds into it
+  (issue #74 closed 2026-09-29).
+- **rm-100 (P75) Python 3.10 EOL 2026-10-31** — next cycle lands inside the
+  window; dated floor-bump decision (3.11 floor, 3.13 lane, tomli conditional
+  removal) rides the next release batch (CI edits prohibited in-cycle).
+- **rm-101 (P25)** — own the two environment-dependent skips
+  (test_operator_export.py:129, test_operator_policy.py:711) and add the
+  autouse `set_audit_log_override` reset fixture (cycle-4 rule 5 follow-up).
+- **Landing-gate duties:** reconcile this cycle's rm-095..rm-101 ids against
+  sibling 0aa75ea44f93's uncommitted rm-085..rm-094 block (landed-first wins)
+  and the sibling b6659410/099e2bfc candidate sets at integration; the 12-file
+  batch (+664/−12) is uncommitted with digest
+  `validation:v1:4a1f4beb…ec608` current at compound time.
