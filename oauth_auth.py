@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -7,11 +8,12 @@ import json
 import os
 import re
 import secrets
+import threading
 import time
 import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse, RedirectResponse
@@ -370,6 +372,12 @@ class OAuthState:
         self._register_hits: dict[str, tuple[float, int]] = {}
         self._hermes_root: Path | None = None
         self._epoch: int = 0
+        # rm-085: serializes durable OAuth operations (exchanges, dynamic
+        # registration, persist hooks) while they run OFF the serving loop.
+        # Today the event loop implicitly serializes them; moving them to
+        # worker threads without this lock would let concurrent requests
+        # interleave registry mutations.
+        self._durable_op_lock = threading.Lock()
         setattr(self, "_retired_refresh_to" + "kens", set())
 
     def register_dynamic_client(self, redirect_uris: list[str]) -> DynamicClient:
@@ -1520,6 +1528,28 @@ def _form_value(form: dict[str, list[str]], name: str) -> str:
     return values[0] if values else ""
 
 
+async def _offload_durable(
+    state: OAuthState, fn: Callable[..., Any], *args: Any, **kwargs: Any
+) -> Any:
+    """rm-085: run a durable OAuth operation off the serving event loop.
+
+    Exchanges and dynamic registration mutate the in-memory registries and
+    perform blocking durable-store I/O (token_store flock + sqlite with a
+    15s busy timeout) — the same defect class rm-076 fixed for the chat and
+    live-events handlers. On the loop, store-lock contention stalls every
+    concurrent request for up to the full sqlite timeout. ``asyncio.to_thread``
+    moves that wait off the loop, and ``_durable_op_lock`` preserves the
+    loop's implicit serialization so concurrent requests can never
+    interleave registry mutations.
+    """
+
+    def _run() -> Any:
+        with state._durable_op_lock:
+            return fn(*args, **kwargs)
+
+    return await asyncio.to_thread(_run)
+
+
 async def register_client(request: Request, state: OAuthState) -> JSONResponse:
     """RFC 7591 dynamic client registration (public clients only).
 
@@ -1579,8 +1609,12 @@ async def register_client(request: Request, state: OAuthState) -> JSONResponse:
         redirect_uris = payload.get("redirect_uris")
         if not isinstance(redirect_uris, list):
             raise OAuthError("invalid_redirect_uri", "redirect_uris must be a JSON array.")
-        client = state.register_dynamic_client(redirect_uris)
-        _run_persist_hook(state, "register_client")
+        def _register_and_persist() -> DynamicClient:
+            client = state.register_dynamic_client(redirect_uris)
+            _run_persist_hook(state, "register_client")
+            return client
+
+        client = await _offload_durable(state, _register_and_persist)
         return JSONResponse(client.as_public_dict(), status_code=201)
     except OAuthError as exc:
         return _error_response(exc)
@@ -1677,7 +1711,9 @@ async def token(request: Request, state: OAuthState) -> JSONResponse:
             raise OAuthError("unsupported_grant_type", "The requested grant type is not supported.")
         client_id = _authenticate_client(request, form, state)
         if grant_type == "authorization_code":
-            response = state.exchange_authorization_code(
+            response = await _offload_durable(
+                state,
+                state.exchange_authorization_code,
                 code=_form_value(form, "code"),
                 client_id=client_id,
                 redirect_uri=_form_value(form, "redirect_uri"),
@@ -1688,7 +1724,9 @@ async def token(request: Request, state: OAuthState) -> JSONResponse:
             refresh_token = _form_value(form, "refresh_token")
             if not refresh_token:
                 raise OAuthError("invalid_request", "refresh_token is required.")
-            response = state.exchange_refresh_token(
+            response = await _offload_durable(
+                state,
+                state.exchange_refresh_token,
                 refresh_token=refresh_token,
                 client_id=client_id,
                 requested_scope=_form_value(form, "scope"),

@@ -716,3 +716,77 @@ def test_doctor_ui_mount_check_passes_without_failures(hermes_root, clean_env, a
     check = parsed["checks"]["ui_mount"]
     assert check["status"] == od.STATUS_PASS
     assert check["code"] == "UI_MOUNT_HEALTHY"
+
+
+# ── rm-087: the ui_mount failure signal survives audit-tail aging ──────────
+
+
+def test_doctor_ui_mount_failure_survives_audit_tail_aging(
+    hermes_root, clean_env, audit_override
+):
+    """rm-087 regression: 50+ later records must not bury a mount failure.
+
+    Pre-fix doctor read only the last 50 audit records, so a boot-time
+    ui_mount failure scrolled out of view on a busy server and doctor
+    false-PASSed while the UI stayed unmounted. Post-fix server.py also
+    writes a durable marker beside the audit log, and doctor checks that
+    marker before the bounded tail.
+    """
+    op.audit_record(
+        tool="ui_mount",
+        level="read_only",
+        apply_mode="direct",
+        dry_run=False,
+        success=False,
+        summary="UI mount skipped: ImportError: import of ui_api halted",
+        error="ImportError: import of ui_api halted",
+    )
+    od.record_ui_mount_failure("ImportError: import of ui_api halted")
+    # Bury both signals under well past one audit-tail window of noise.
+    for i in range(60):
+        op.audit_record(
+            tool="noise",
+            level="read_only",
+            apply_mode="direct",
+            dry_run=True,
+            success=True,
+            summary=f"routine traffic {i}",
+        )
+
+    parsed = json.loads(od.hermes_operator_doctor(profile="default", hermes_root=hermes_root))
+    check = parsed["checks"]["ui_mount"]
+    assert check["status"] == od.STATUS_WARN
+    assert check["code"] == "UI_MOUNT_FAILED"
+    assert "ui_api" in check["message"]
+
+
+def test_doctor_ui_mount_marker_clears_after_successful_remount(
+    hermes_root, clean_env, audit_override
+):
+    """The marker (not the audit record) drives health once present.
+
+    After a failed mount is followed by a successful remount, server.py
+    clears the marker and doctor must report healthy again even though the
+    old failure record is still in the audit log.
+    """
+    od.record_ui_mount_failure("ImportError: import of ui_api halted")
+    parsed = json.loads(od.hermes_operator_doctor(profile="default", hermes_root=hermes_root))
+    assert parsed["checks"]["ui_mount"]["code"] == "UI_MOUNT_FAILED"
+
+    od.clear_ui_mount_failure_marker()
+    parsed = json.loads(od.hermes_operator_doctor(profile="default", hermes_root=hermes_root))
+    check = parsed["checks"]["ui_mount"]
+    assert check["status"] == od.STATUS_PASS
+    assert check["code"] == "UI_MOUNT_HEALTHY"
+
+
+def test_ui_mount_marker_lives_beside_active_audit_log(
+    hermes_root, clean_env, audit_override
+):
+    """The marker follows the audit-log override so tests never touch a real log dir."""
+    od.record_ui_mount_failure("boom")
+    marker = od.ui_mount_failure_marker_path()
+    assert marker.parent == op.audit_log_path().parent
+    assert marker.exists()
+    od.clear_ui_mount_failure_marker()
+    assert not marker.exists()

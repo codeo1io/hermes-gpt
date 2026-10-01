@@ -3121,6 +3121,14 @@ def _signal_ui_mount_failure(exc: Exception) -> None:
         )
     except Exception:  # noqa: BLE001
         eprint("ui mount failure live event could not be published")
+    try:
+        # rm-087: durable marker — the doctor's audit-tail window
+        # (audit_tail(limit=50)) lets a boot-time failure scroll out of
+        # view; the marker survives until the next successful mount
+        # clears it.
+        op_diagnostics.record_ui_mount_failure(detail)
+    except Exception:  # noqa: BLE001
+        eprint("ui mount failure marker could not be written")
 
 
 def build_asgi_app(server: FastMCP, *, http: bool) -> Any:
@@ -3222,6 +3230,12 @@ def build_asgi_app(server: FastMCP, *, http: bool) -> Any:
             import ui_api
 
             routes.extend(ui_api.routes())
+            # rm-087: the UI mounted — clear any stale failure marker so
+            # doctor reports healthy once the surface actually is.
+            try:
+                op_diagnostics.clear_ui_mount_failure_marker()
+            except Exception:  # noqa: BLE001
+                pass
         except Exception as exc:  # noqa: BLE001
             eprint(f"UI mount skipped: {exc.__class__.__name__}: {exc}")
             _signal_ui_mount_failure(exc)

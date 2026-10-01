@@ -142,8 +142,10 @@ error-contract batches).
 Verification (pre-review): targeted uv run of the 10 changed surfaces
 144/144/0/0; the engine's full gate (`local_validation_gate.py --shell-command
 'uv run python -m pytest -q -n 8'`) exit 0 with 0 failed/errored and 2
-pre-existing environment skips; ruff clean. 14 tracked files changed,
-+509/−23, including 11 new regression tests.
+pre-existing environment skips; ruff clean. 15 tracked files changed,
++620/−23, including 11 new regression tests. (rm-089: corrected 2026-10-01
+to match `git show 80bd0f524d --numstat` — the original entry undercounted
+the ROADMAP.md flip and understated insertions.)
 
 ### Prevention rules established
 

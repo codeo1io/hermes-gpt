@@ -486,6 +486,8 @@ Gateway state is fail-closed: `hermes_operator_doctor` never reports the gateway
 
 The browser UI mount is checked too: when the UI is explicitly enabled (`HERMES_GPT_UI_ENABLED=1`) but its route mount fails (for example a broken or missing `ui_api` module), the failure is recorded as an audit record and a `ui_mount_failed` live event at boot, and the doctor reports it as `UI_MOUNT_FAILED` (`WARN`) instead of the server silently degrading to MCP-only with a single log line.
 
+The mount-failure signal is durable: a failed mount also writes a marker file (`ui_mount_failed.marker`) beside the active audit log, and the doctor checks that marker before scanning the bounded audit tail. The audit tail the doctor reads is capped (the `audit_tail(limit=50)` window), so on a busy server the boot-time audit record alone would age out of view and doctor would false-`PASS` while the UI stayed unmounted; the marker survives arbitrarily long. The marker is cleared when the UI mounts successfully again (including on a later boot with the fault fixed), at which point doctor returns to `UI_MOUNT_HEALTHY` even though the old failure record remains in the audit log.
+
 Status vocabulary:
 
 - `PASS`

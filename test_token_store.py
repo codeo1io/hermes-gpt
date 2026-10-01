@@ -259,3 +259,101 @@ def test_restore_populates_after_restart(hermes_root):
     summary = fresh.restore_tokens(hermes_root)
     assert summary["restored"] == 2
     assert fresh.validate_access_token("tok-restart") is True
+
+
+# ── rm-086: secret-path permissions (sidecars + directory modes) ───────────
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows does not expose POSIX file modes")
+def test_fresh_store_permissions_under_umask_022(tmp_path):
+    """rm-086: a store created under the common umask 022 is 0700/0600 throughout.
+
+    Pre-fix: the secrets dir came up 0o755 (plain mkdir), the -wal/-shm
+    sidecars 0o644 (sqlite applies the process umask at sidecar creation,
+    empirically at the first write transaction), and nothing ever corrected
+    them. Post-fix every creation moment hardens its own artifact.
+    """
+    root = tmp_path / "fresh-store"  # secrets dir intentionally NOT pre-created
+    state = _oauth_state()
+    resource = state.config.resource
+    state.access_tokens["tok-rm086-0123456789abcd"] = {
+        "client_id": "client-id",
+        "scope": "hermes",
+        "resource": resource,
+        "expires_at": time_far(),
+    }
+    # A second open connection keeps sqlite from deleting the -wal/-shm
+    # sidecars when the writer closes, so their on-disk modes are observable.
+    old_umask = os.umask(0o022)
+    keeper = None
+    try:
+        state.persist_tokens(root)
+        keeper = ts._connect(root)
+        assert ts.lookup_token(root, "access", "tok-rm086-0123456789abcd") is not None
+    finally:
+        os.umask(old_umask)
+
+    secrets = root / "secrets"
+    assert secrets.is_dir(), "persist must create the secrets dir"
+    assert os.stat(secrets).st_mode & 0o777 == 0o700, "secrets dir must be 0700 at creation"
+
+    db_path = secrets / "hermes_gpt_tokens.db"
+    assert os.stat(db_path).st_mode & 0o777 == 0o600
+
+    # Live sidecars: kept on disk by `keeper` after the writer closed. The
+    # -wal holds ledger pages between checkpoints — it must not be readable
+    # beyond the db's own 0o600.
+    for suffix in ("-wal", "-shm"):
+        sidecar = db_path.with_name(db_path.name + suffix)
+        assert sidecar.exists(), f"keeper connection must keep {sidecar.name} alive"
+        mode = os.stat(sidecar).st_mode & 0o777
+        assert mode == 0o600, f"{sidecar.name} leaked mode {oct(mode)} under umask 022"
+
+    # Every other artifact in the secrets dir (key file, envelope, lock
+    # file) is 0600, and no temp file from the atomic-write path survives.
+    names = set()
+    for entry in secrets.iterdir():
+        mode = os.stat(entry).st_mode & 0o777
+        assert mode == 0o600, f"{entry.name} leaked mode {oct(mode)}"
+        assert not entry.name.endswith(".tmp"), f"temp residue: {entry.name}"
+        names.add(entry.name)
+    assert "hermes_gpt_tokens.db" in names
+
+    if keeper is not None:
+        keeper.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows does not expose POSIX file modes")
+def test_store_sidecar_modes_self_heal_on_connect(tmp_path):
+    """rm-086: connect re-applies 0600 to sidecars a prior process left loose."""
+    root = tmp_path / "heal-store"
+    state = _oauth_state()
+    resource = state.config.resource
+    state.access_tokens["tok-heal-0123456789abcd"] = {
+        "client_id": "client-id",
+        "scope": "hermes",
+        "resource": resource,
+        "expires_at": time_far(),
+    }
+    state.persist_tokens(root)
+    db_path = root / "secrets" / "hermes_gpt_tokens.db"
+
+    # A keeper holds the sidecars alive while we simulate a leaked mode
+    # (e.g. written by an older binary that never hardened them).
+    keeper = ts._connect(root)
+    try:
+        for suffix in ("-wal", "-shm"):
+            sidecar = db_path.with_name(db_path.name + suffix)
+            if sidecar.exists():
+                os.chmod(sidecar, 0o644)
+        reconnected = ts._connect(root)
+        try:
+            for suffix in ("-wal", "-shm"):
+                sidecar = db_path.with_name(db_path.name + suffix)
+                if sidecar.exists():
+                    mode = os.stat(sidecar).st_mode & 0o777
+                    assert mode == 0o600, f"{sidecar.name} not healed: {oct(mode)}"
+        finally:
+            reconnected.close()
+    finally:
+        keeper.close()
