@@ -26,6 +26,9 @@ from __future__ import annotations
 
 import json
 import threading
+import time
+import uuid
+from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -129,7 +132,14 @@ def _parse_payload(result: Any) -> dict[str, Any]:
     raise ValueError(f"operator tool returned unsupported payload type {type(result).__name__}")
 
 
-def _audit(tool: str, *, success: bool, summary: str, extra: dict[str, Any] | None = None) -> None:
+def _audit(
+    tool: str,
+    *,
+    success: bool,
+    summary: str,
+    extra: dict[str, Any] | None = None,
+    dry_run: bool = True,
+) -> None:
     """Best-effort adapter-level audit record (never breaks a request)."""
     try:
         policy = op.OperatorPolicy()
@@ -137,7 +147,7 @@ def _audit(tool: str, *, success: bool, summary: str, extra: dict[str, Any] | No
             tool=tool,
             level=policy.level or "read_only",
             apply_mode=policy.apply_mode,
-            dry_run=True,
+            dry_run=dry_run,
             success=bool(success),
             changed=False,
             summary=str(summary)[:500],
@@ -145,6 +155,114 @@ def _audit(tool: str, *, success: bool, summary: str, extra: dict[str, Any] | No
         )
     except Exception:  # noqa: BLE001 - audit must never break the surface
         pass
+
+
+# ---------------------------------------------------------------------------
+# rm-097: bounded, registry-tracked dispatch for long-running mutations
+# ---------------------------------------------------------------------------
+
+# ``hermes_cron_run`` blocks for the cron job's full execution window
+# (30-7200 s). Dispatching it on an unbounded daemon thread meant: no
+# concurrency cap, failures visible only through the threading excepthook,
+# and a single success-marked audit record written at dispatch time — a
+# failed or wedged run left a success-marked trail. Long-running
+# dispatches now draw from a bounded semaphore, are recorded in this
+# in-process registry (surfaced via ``hermes_operator_doctor``'s
+# ``ui_cron_dispatch`` check and the 202 response body), and write their
+# audit record at completion with the real outcome and duration.
+_CRON_DISPATCH_LIMIT = 4
+_DISPATCH_REGISTRY_LIMIT = 50
+_dispatch_semaphore = threading.BoundedSemaphore(_CRON_DISPATCH_LIMIT)
+_dispatch_lock = threading.Lock()
+_dispatch_active: dict[str, dict[str, Any]] = {}
+_dispatch_finished: deque[dict[str, Any]] = deque(maxlen=_DISPATCH_REGISTRY_LIMIT)
+
+
+def _dispatch_registry_snapshot() -> dict[str, Any]:
+    """Operator-visible registry of long-running dispatches."""
+    with _dispatch_lock:
+        active = sorted(_dispatch_active.values(), key=lambda entry: entry["started_epoch"])
+        return {
+            "active": len(active),
+            "finished": len(_dispatch_finished),
+            "limit": _CRON_DISPATCH_LIMIT,
+            "oldest_active_age_s": (
+                round(max(0.0, time.time() - active[0]["started_epoch"]), 3) if active else None
+            ),
+            "active_entries": [dict(entry) for entry in active],
+            "finished_entries": [dict(entry) for entry in _dispatch_finished],
+        }
+
+
+def _run_long_running_dispatch(
+    dispatch_id: str,
+    tool: str,
+    fn: Callable[..., Any],
+    root: Any,
+    kwargs: dict[str, Any],
+) -> None:
+    """Execute one long-running mutation off the request path (rm-097).
+
+    Runs on a daemon dispatch thread (pre-existing semantics: a multi-hour
+    cron job never blocks interpreter shutdown). The registry transition
+    and audit record happen here, at completion, so the audit trail
+    reflects the run's outcome instead of the dispatch.
+    """
+    started = time.monotonic()
+    success = False
+    summary = ""
+    error = ""
+    error_class = ""
+    try:
+        try:
+            payload = _parse_payload(fn(hermes_root=root, **kwargs))
+            success = bool(payload.get("success", True))
+            summary = str(
+                payload.get("safe_message")
+                or payload.get("summary")
+                or payload.get("message")
+                or f"{tool} finished"
+            )[:300]
+            if not success:
+                error_class = str(payload.get("code") or payload.get("error") or "TOOL_ERROR")[:96]
+        except Exception as exc:  # noqa: BLE001 - record, never crash the dispatch thread
+            success = False
+            error_class = exc.__class__.__name__
+            summary = f"{tool} raised {error_class}"
+            error = op.redact_output(str(exc))[:300]
+
+        duration = time.monotonic() - started
+        with _dispatch_lock:
+            entry = _dispatch_active.pop(dispatch_id, None) or {
+                "dispatch_id": dispatch_id,
+                "tool": tool,
+                "job_id": "",
+                "started_epoch": time.time(),
+                "started_at": "",
+            }
+            entry.update(
+                finished_at=_now_iso(),
+                duration_s=round(duration, 3),
+                success=success,
+                error_class=error_class or None,
+            )
+            _dispatch_finished.appendleft(entry)
+        _audit(
+            tool,
+            success=success,
+            summary=f"{tool} long-running run finished ({duration:.1f}s): {summary}",
+            extra={
+                "dispatch_id": dispatch_id,
+                "job_id": str(entry.get("job_id") or "")[:64],
+                "duration_s": round(duration, 3),
+                "outcome": "completed" if success else "failed",
+                "error_class": entry.get("error_class") or "",
+                "error": error,
+            },
+            dry_run=False,
+        )
+    finally:
+        _dispatch_semaphore.release()
 
 
 # ---------------------------------------------------------------------------
@@ -616,17 +734,61 @@ async def _action(request: Request) -> JSONResponse:
     # HTTP request. Dry-run plans are fast and run inline; real executions
     # are dispatched to a daemon thread and the UI polls /api/ops/cron.
     if spec.long_running and not dry_run_effective:
+        # rm-097: bounded dispatch instead of an unbounded daemon thread.
+        # The cap rejects loudly (429, the ui_chat turn-gate pattern); the
+        # registry and the completion audit live in _run_long_running_dispatch.
+        if not _dispatch_semaphore.acquire(blocking=False):
+            return _json_resp(
+                _err(
+                    "RATE_LIMITED",
+                    f"too many concurrent long-running {tool} runs; retry when an active run finishes",
+                    429,
+                    extra={"tool": tool, "limit": _CRON_DISPATCH_LIMIT},
+                ),
+                429,
+            )
         root = _resolve_root()
+        dispatch_id = f"dsp-{uuid.uuid4().hex[:12]}"
+        job_id = str(kwargs.get("job_id") or "")[:64]
+        with _dispatch_lock:
+            _dispatch_active[dispatch_id] = {
+                "dispatch_id": dispatch_id,
+                "tool": tool,
+                "job_id": job_id,
+                "started_epoch": time.time(),
+                "started_at": _now_iso(),
+                "success": None,
+                "finished_at": None,
+                "duration_s": None,
+            }
         try:
             threading.Thread(
-                target=lambda: spec.fn(hermes_root=root, **kwargs),
-                name=f"ui-ops-{tool}",
+                target=_run_long_running_dispatch,
+                args=(dispatch_id, tool, spec.fn, root, kwargs),
+                name=f"ui-ops-dispatch-{dispatch_id}",
                 daemon=True,
             ).start()
         except Exception as exc:  # noqa: BLE001
+            with _dispatch_lock:
+                _dispatch_active.pop(dispatch_id, None)
+            _dispatch_semaphore.release()
             return _json_resp(_err("INTERNAL", f"failed to dispatch {tool}: {op.redact_output(str(exc))[:300]}"), 500)
-        _audit(tool, success=True, summary=f"{tool} dispatched (long-running)")
-        return _json_resp(_ok({"tool": tool, "accepted": True, "status": "running", "dry_run": False}), 202)
+        snapshot = _dispatch_registry_snapshot()
+        return _json_resp(
+            _ok(
+                {
+                    "tool": tool,
+                    "accepted": True,
+                    "status": "running",
+                    "dry_run": False,
+                    "dispatch_id": dispatch_id,
+                    "job_id": job_id,
+                    "active": snapshot["active"],
+                    "finished": snapshot["finished"],
+                }
+            ),
+            202,
+        )
 
     try:
         root = _resolve_root()

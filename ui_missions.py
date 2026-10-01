@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from starlette.concurrency import run_in_threadpool
+import anyio
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
@@ -23,6 +23,16 @@ import ui_security
 _MAX_MISSIONS = 200
 _MAX_EVENTS = 100
 _MAX_WAIT_MS = 25_000
+
+# rm-096: the mission-events long-poll holds its worker thread for the full
+# wait window (wait_ms up to _MAX_WAIT_MS = 25 s). starlette's
+# run_in_threadpool draws every call from anyio's shared default thread
+# limiter (40 tokens), so 40 concurrent long-polls would pin the whole pool
+# and starve every other offloaded handler and sync route. Long-poll waits
+# draw from this dedicated limiter instead: the shared pool stays available
+# to everything else while concurrent long-polls stay bounded.
+_MISSION_EVENTS_LIMIT = 40
+_MISSION_EVENTS_LIMITER = anyio.CapacityLimiter(_MISSION_EVENTS_LIMIT)
 
 
 def _root() -> Any:
@@ -112,7 +122,7 @@ async def _mission_events(request: Request) -> JSONResponse:
     cursor = _clamp(request.query_params.get("cursor"), 0, 0, 2**63 - 1)
     limit = _clamp(request.query_params.get("limit"), 100, 1, _MAX_EVENTS)
     wait_ms = _clamp(request.query_params.get("wait_ms"), 0, 0, _MAX_WAIT_MS)
-    payload = await run_in_threadpool(
+    payload = await anyio.to_thread.run_sync(
         live_events.hermes_live_events_since,
         cursor,
         mission_id,
@@ -121,6 +131,7 @@ async def _mission_events(request: Request) -> JSONResponse:
         limit,
         wait_ms,
         _root(),
+        limiter=_MISSION_EVENTS_LIMITER,
     )
     decoded = _decode(payload)
     if not _success(decoded):

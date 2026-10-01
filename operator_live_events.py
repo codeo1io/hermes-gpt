@@ -381,8 +381,15 @@ async def _websocket_endpoint(
                 await websocket.send_json({"schema": STREAM_SCHEMA, "type": "error", "code": "LIVE_EVENT_READ_FAILED"})
                 await websocket.close(code=1011)
                 return
+            # rm-095: adopt the returned cursor on empty pages too.
+            # read_since's next_cursor is always safe to adopt: a truncated
+            # page stops at the last delivered match, and a non-truncated
+            # page advances only to the pre-page high watermark (rm-080) —
+            # a matching event is delivered or rescanned, never skipped.
+            # Discarding it on empty filtered pages made an idle client
+            # rescan the non-matching journal tail on every poll.
+            cursor = next_cursor
             if events:
-                cursor = next_cursor
                 await websocket.send_json(
                     {"schema": STREAM_SCHEMA, "type": "events", "cursor": cursor, "events": events}
                 )

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 from pathlib import Path
 
@@ -64,6 +65,11 @@ def isolate_ui_ops(monkeypatch, tmp_path):
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     # Ensure the temp root exists (some surfaces read it directly).
     tmp_path.mkdir(parents=True, exist_ok=True)
+    # rm-097: the long-running dispatch registry is module state; reset it so
+    # one test's dispatches never bleed into the next test's assertions.
+    with ui_ops._dispatch_lock:
+        ui_ops._dispatch_active.clear()
+        ui_ops._dispatch_finished.clear()
     return tmp_path
 
 
@@ -548,6 +554,8 @@ def test_action_cron_run_long_running_dispatched_202(client, monkeypatch, tmp_pa
     data = resp.json()["data"]
     assert data["accepted"] is True
     assert data["status"] == "running"
+    assert data["dispatch_id"].startswith("dsp-")  # rm-097: registry key
+    dispatch_id = data["dispatch_id"]
 
     # The daemon thread performs the call asynchronously.
     for _ in range(50):
@@ -558,6 +566,176 @@ def test_action_cron_run_long_running_dispatched_202(client, monkeypatch, tmp_pa
     assert calls and calls[0]["job_id"] == "j1"
     assert calls[0]["dry_run"] is False
     assert calls[0]["hermes_root"]  # resolved server-side, never client-supplied
+
+    # rm-097: the run lands in the operator-visible finished registry with
+    # its real outcome; the registry is drained when the run completes.
+    for _ in range(100):
+        if any(e["dispatch_id"] == dispatch_id for e in ui_ops._dispatch_finished):
+            break
+        time.sleep(0.05)
+    entry = next(e for e in ui_ops._dispatch_finished if e["dispatch_id"] == dispatch_id)
+    assert entry["success"] is True
+    assert entry["duration_s"] >= 0
+    snapshot = ui_ops._dispatch_registry_snapshot()
+    assert snapshot["active"] == 0
+    assert snapshot["finished"] >= 1
+
+
+def test_action_cron_run_completion_audit_ordering(client, monkeypatch, tmp_path):
+    """rm-097: the audit record lands at completion with the real outcome.
+
+    Pre-fix, the ONLY adapter-level audit record was ``success=True``
+    written at dispatch time — before the blocking run even started — so a
+    failed or wedged cron mutation left a success-marked trail.
+    """
+    audit_path = tmp_path / "audit.jsonl"
+    monkeypatch.setattr(op, "_audit_log_override", audit_path)
+
+    started = threading.Event()
+    finish = threading.Event()
+
+    def stub_cron_run(**kwargs):
+        started.set()
+        assert finish.wait(timeout=10)
+        return json.dumps({"success": True, "dry_run": False, "job": kwargs.get("job_id")})
+
+    _set_env(monkeypatch, CRON_ENV)
+    monkeypatch.setattr(ui_ops._MUTATION_TOOLS["hermes_cron_run"], "fn", stub_cron_run)
+
+    resp = client.post(
+        "/api/ops/action",
+        json={"tool": "hermes_cron_run", "args": {"profile": "default", "job_id": "j1", "dry_run": False}},
+    )
+    assert resp.status_code == 202
+    dispatch_id = resp.json()["data"]["dispatch_id"]
+    assert started.wait(timeout=5)
+
+    # While the run is in flight there is NO audit record for it: dispatch
+    # itself no longer writes a success record before the outcome is known.
+    records = _read_audit(audit_path)
+    assert not [r for r in records if r.get("tool") == "hermes_cron_run"]
+
+    finish.set()
+    record = _await_audit_record(audit_path, "hermes_cron_run", dispatch_id)
+    assert record["success"] is True
+    assert record["dry_run"] is False
+    assert record["dispatch_id"] == dispatch_id
+    assert record["duration_s"] >= 0
+    assert record["outcome"] == "completed"
+    assert "finished" in record["summary"]
+
+
+def test_action_cron_run_injected_failure_audits_failure(client, monkeypatch, tmp_path):
+    """rm-097: a dispatched run that raises leaves a failure record."""
+    audit_path = tmp_path / "audit.jsonl"
+    monkeypatch.setattr(op, "_audit_log_override", audit_path)
+
+    def stub_cron_run(**kwargs):
+        raise RuntimeError("cron executor exploded")
+
+    _set_env(monkeypatch, CRON_ENV)
+    monkeypatch.setattr(ui_ops._MUTATION_TOOLS["hermes_cron_run"], "fn", stub_cron_run)
+
+    resp = client.post(
+        "/api/ops/action",
+        json={"tool": "hermes_cron_run", "args": {"profile": "default", "job_id": "j1", "dry_run": False}},
+    )
+    assert resp.status_code == 202
+    dispatch_id = resp.json()["data"]["dispatch_id"]
+
+    record = _await_audit_record(audit_path, "hermes_cron_run", dispatch_id)
+    assert record["success"] is False
+    assert record["dry_run"] is False
+    assert record["outcome"] == "failed"
+    assert record["error_class"] == "RuntimeError"
+
+    # The registry entry records the failure too.
+    for _ in range(100):
+        entry = next((e for e in ui_ops._dispatch_finished if e["dispatch_id"] == dispatch_id), None)
+        if entry:
+            break
+        time.sleep(0.05)
+    assert entry is not None and entry["success"] is False
+
+
+def test_action_cron_run_concurrency_cap_rejects_loudly(client, monkeypatch, tmp_path):
+    """rm-097: exceeding the dispatch cap rejects loudly (429), like the
+    ui_chat turn gate — instead of spawning an unbounded extra thread."""
+    monkeypatch.setattr(ui_ops, "_dispatch_semaphore", threading.BoundedSemaphore(1))
+    monkeypatch.setattr(ui_ops, "_CRON_DISPATCH_LIMIT", 1)
+    # Exhaust the single token without running a dispatch.
+    assert ui_ops._dispatch_semaphore.acquire(blocking=False)
+    try:
+        resp = client.post(
+            "/api/ops/action",
+            json={"tool": "hermes_cron_run", "args": {"profile": "default", "job_id": "j1", "dry_run": False}},
+        )
+        assert resp.status_code == 429
+        body = resp.json()
+        assert body["error"]["code"] == "RATE_LIMITED"
+        assert body["error"]["limit"] == 1
+        assert "hermes_cron_run" in body["error"]["message"]
+    finally:
+        ui_ops._dispatch_semaphore.release()
+
+
+def test_cron_dispatch_registry_is_operator_visible(client, monkeypatch, tmp_path):
+    """rm-097: hermes_operator_doctor surfaces the dispatch registry.
+
+    Empty registry reports PASS with zero counts; a run that outlives the
+    cron execution window warns as possibly wedged.
+    """
+    import operator_diagnostics as od
+
+    _set_env(monkeypatch, CRON_ENV)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    (tmp_path / "profiles" / "default").mkdir(parents=True, exist_ok=True)
+
+    report = json.loads(od.hermes_operator_doctor(profile="default", hermes_root=tmp_path))
+    check = report["checks"]["ui_cron_dispatch"]
+    assert check["status"] == "PASS"
+    assert check["active"] == 0
+    assert check["finished"] >= 0
+
+    # A stuck active dispatch (older than the execution window) warns.
+    stuck_age = od._DISPATCH_STUCK_SECONDS + 10
+    with ui_ops._dispatch_lock:
+        ui_ops._dispatch_active["dsp-stuck"] = {
+            "dispatch_id": "dsp-stuck",
+            "tool": "hermes_cron_run",
+            "job_id": "j9",
+            "started_epoch": time.time() - stuck_age,
+            "started_at": "2026-10-01T00:00:00+00:00",
+            "success": None,
+            "finished_at": None,
+            "duration_s": None,
+        }
+    try:
+        report = json.loads(od.hermes_operator_doctor(profile="default", hermes_root=tmp_path))
+        check = report["checks"]["ui_cron_dispatch"]
+        assert check["status"] == "WARN"
+        assert check["code"] == "UI_CRON_DISPATCH_STUCK"
+        assert check["active"] == 1
+    finally:
+        with ui_ops._dispatch_lock:
+            ui_ops._dispatch_active.pop("dsp-stuck", None)
+
+
+def _read_audit(audit_path: Path) -> list[dict]:
+    if not audit_path.exists():
+        return []
+    return [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def _await_audit_record(audit_path: Path, tool: str, dispatch_id: str, timeout_s: float = 5.0) -> dict:
+    """Poll the audit log until the dispatch's completion record lands."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        for record in _read_audit(audit_path):
+            if record.get("tool") == tool and record.get("dispatch_id") == dispatch_id:
+                return record
+        time.sleep(0.05)
+    raise AssertionError(f"no completion audit record for {dispatch_id} in {audit_path}")
 
 
 def test_ui_mount_failure_is_operator_visible(tmp_path, monkeypatch):
