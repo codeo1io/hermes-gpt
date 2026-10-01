@@ -1023,6 +1023,124 @@ def audit_tail(limit: int = 20) -> list[dict[str, Any]]:
     return records[-limit:]
 
 
+def iter_audit_for_tool(tool: str) -> Iterable[dict[str, Any]]:
+    """Stream every valid audit record for one tool name, oldest-first.
+
+    Unlike :func:`audit_tail` this scan is not tail-bounded and consults the
+    archived ``.1`` rotation generation, so a record stays findable after
+    ordinary audit churn and one rotation (rm-093: doctor's ui_mount
+    check). Full-history scans belong to diagnostics surfaces, never to
+    request paths.
+    """
+    if not isinstance(tool, str) or not tool:
+        return
+    log_path = audit_log_path()
+    sources = [log_path.with_name(log_path.name + ".1"), log_path]
+    sources = [src for src in sources if src.exists()]
+    if not sources:
+        return
+    try:
+        for src in sources:
+            with open(src, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    if len(line) > 64_000:
+                        continue
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if (
+                        isinstance(record, dict)
+                        and record.get("tool") == tool
+                    ):
+                        yield record
+    except OSError:
+        return
+
+
+# ---------------------------------------------------------------------------
+# ui_mount health marker (rm-093)
+# ---------------------------------------------------------------------------
+
+
+UI_MOUNT_STATE_FILENAME = "ui-mount-state.json"
+
+
+def ui_mount_state_path() -> Path:
+    """Path of the persistent ui_mount health marker.
+
+    Lives beside the active audit log so it follows the same HERMES_HOME /
+    state-home resolution (and the same test override). Unlike the audit
+    log it is one small record: never rotated, never evicted by audit
+    churn, so doctor's ui_mount verdict cannot age out (rm-093).
+    """
+    return audit_log_path().with_name(UI_MOUNT_STATE_FILENAME)
+
+
+def write_ui_mount_state(status: str, *, error: str | None = None) -> dict[str, Any] | None:
+    """Persist the ui_mount health signal (``failed``/``healthy``/``disabled``).
+
+    Best-effort by design, same contract as the audit record: a marker
+    write failure must never prevent server startup or break a tool.
+    Returns the persisted record, or ``None`` when the write failed.
+    """
+    record: dict[str, Any] = {
+        "status": status,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    if error:
+        record["error"] = str(error)[:300]
+    try:
+        path = ui_mount_state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(record, ensure_ascii=False, sort_keys=True),
+            encoding="utf-8",
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    return record
+
+
+def read_ui_mount_state() -> dict[str, Any] | None:
+    """Read the persistent ui_mount health marker (None when absent/corrupt)."""
+    try:
+        raw = json.loads(ui_mount_state_path().read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
+def record_ui_mount_failure(exc: BaseException | str) -> None:
+    """Record a failed UI mount on the durable operator surfaces (rm-093).
+
+    Writes the persistent ui_mount state marker (doctor's authority — it
+    survives audit churn and rotation) plus the ``ui_mount`` audit record
+    (Mission Control / events surfaces). Best-effort: never raises.
+    """
+    detail = (
+        f"{exc.__class__.__name__}: {exc}"
+        if isinstance(exc, BaseException)
+        else str(exc)
+    )
+    try:
+        write_ui_mount_state("failed", error=detail)
+        audit_record(
+            tool="ui_mount",
+            level="read_only",
+            apply_mode="direct",
+            dry_run=False,
+            success=False,
+            summary=f"UI mount skipped: {detail[:200]}",
+            error=detail[:300],
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def iter_audit_for_task(task_id: str) -> Iterable[dict[str, Any]]:
     """Stream every valid audit record for one task without tail eviction."""
     if not isinstance(task_id, str) or not task_id:

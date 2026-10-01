@@ -34,6 +34,7 @@ from oauth_auth import (
     OAuthState,
     authorization_metadata,
     authorize,
+    authorize_async,
     config_from_env,
     protected_resource_metadata,
     token,
@@ -843,3 +844,417 @@ def test_authorization_response_iss_parameter(oauth_client: TestClient):
     )
     assert error_query["error"] == ["invalid_scope"]
     assert error_query["iss"] == [ISSUER]
+
+
+# ── rm-092: OAuth paths must not block the serving event loop ───────────────
+#
+# Server mode resolves every authenticated request and every issuance write
+# against the shared durable token store with a fresh sqlite connection
+# (synchronous=FULL, busy_timeout=15000, flock-serialized commits). While
+# another peer holds the store, those reads/writes stall for seconds. These
+# regressions pin the rm-076 pattern for OAuth: the stall must confine itself
+# to a worker thread while the serving loop keeps serving everyone else
+# (HTTP requests, WS handshakes, heartbeats).
+
+
+def _stalled_connect_factory(monkeypatch, root, *, stall_seconds: float = 3.0):
+    """Install a one-shot event-gated ``token_store._connect`` for ``root``.
+
+    The first store access stalls until released (same wall-clock shape a
+    held store lock / busy_timeout wait produces, without cross-process
+    lock choreography). Returns ``(stall_entered, release, settled)``.
+    """
+    import threading
+
+    import token_store
+
+    stall_entered = threading.Event()
+    release = threading.Event()
+    settled = threading.Event()
+    real_connect = token_store._connect
+
+    def stalling_connect(hermes_root, *args, **kwargs):
+        try:
+            if hermes_root == root and not release.is_set():
+                stall_entered.set()
+                release.wait(timeout=stall_seconds)
+            return real_connect(hermes_root, *args, **kwargs)
+        finally:
+            settled.set()
+
+    monkeypatch.setattr(token_store, "_connect", stalling_connect)
+    return stall_entered, release, settled
+
+
+async def _wait_for_threading_flag(flag, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while not flag.is_set():
+        if time.monotonic() > deadline:
+            return False
+        await asyncio.sleep(0.01)
+    return True
+
+
+def _durable_oauth_state(root):
+    """A server-mode state (durable root bound) with one live access token."""
+    config = OAuthConfig(
+        issuer=ISSUER,
+        client_id=CLIENT_ID,
+        client_secret=CLIENT_SECRET,
+        redirect_uris=(REDIRECT_URI,),
+        scope="hermes",
+    )
+    issuer = OAuthState(config)
+    issuer.restore_tokens(root)
+    token_value, item = issuer._new_access_token(
+        client_id=CLIENT_ID, scope=config.scope, resource=config.resource
+    )
+    issuer.access_tokens[token_value] = item
+    issuer.persist_tokens(root)
+
+    peer = OAuthState(config)
+    peer.restore_tokens(root)
+    return peer, token_value
+
+
+def test_bearer_middleware_survives_durable_store_lock_contention(
+    tmp_path, monkeypatch
+):
+    """rm-092: a stalled bearer hot-path store read must not stall the loop.
+
+    While the durable lookup is blocked the request must stay in flight AND
+    the loop must keep running other work. Pre-fix the synchronous
+    ``token_store.lookup_token`` runs on the serving loop itself, so the
+    request finishes only after the stall times out and the loop was frozen
+    the whole time.
+    """
+    root = tmp_path / "hermes"
+    peer, token_value = _durable_oauth_state(root)
+    stall_entered, release, settled = _stalled_connect_factory(monkeypatch, root)
+
+    async def endpoint(_request):
+        return JSONResponse({"ok": True})
+
+    app = BearerAuthMiddleware(
+        Starlette(routes=[Route("/mcp", endpoint, methods=["POST"])]), peer
+    )
+
+    async def scenario():
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/mcp",
+            "headers": [
+                (b"authorization", f"Bearer {token_value}".encode("latin-1"))
+            ],
+            "query_string": b"",
+        }
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(_message):
+            pass
+
+        request = asyncio.create_task(app(scope, receive, send))
+        assert await _wait_for_threading_flag(stall_entered, 5.0)
+        # The store read is stalled RIGHT NOW: the request must still be in
+        # flight and the loop must still run unrelated work.
+        t0 = time.monotonic()
+        await asyncio.sleep(0.15)
+        loop_stall = time.monotonic() - t0
+        pending = not request.done()
+        release.set()
+        await asyncio.wait_for(request, timeout=5.0)
+        assert settled.is_set()
+        return loop_stall, pending
+
+    loop_stall, pending = asyncio.run(scenario())
+    assert pending, (
+        "stalled store read resolved before release: the request should "
+        "still be in flight while the durable lookup blocks"
+    )
+    assert loop_stall < 0.5, (
+        f"serving loop blocked {loop_stall:.2f}s on a stalled token-store "
+        "read; the bearer hot path must offload durable validation"
+    )
+
+
+def test_token_endpoint_exchange_survives_durable_store_lock_contention(
+    tmp_path, monkeypatch
+):
+    """rm-092: a stalled issuance write (refresh exchange) must not stall
+    the loop either — the durable exchange_commit + persist run through the
+    same offloaded lane. Pre-fix the synchronous exchange runs on the loop
+    itself."""
+    root = tmp_path / "hermes"
+    state, _ = _durable_oauth_state(root)
+    config = state.config
+    refresh_value, ritem = state._new_refresh_token(
+        client_id=CLIENT_ID, scope=config.scope
+    )
+    state.refresh_tokens[refresh_value] = ritem
+    state.persist_tokens(root)
+    oauth_auth_set_persist = None
+    import oauth_auth
+
+    oauth_auth_set_persist = oauth_auth.set_persist_hook
+    oauth_auth_set_persist(lambda s, kind: s.persist_tokens(root))
+    try:
+        stall_entered, release, settled = _stalled_connect_factory(
+            monkeypatch, root
+        )
+
+        async def scenario():
+            body = urllib.parse.urlencode(
+                {
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_value,
+                    "client_id": CLIENT_ID,
+                }
+            ).encode()
+            scope = {
+                "type": "http",
+                "method": "POST",
+                "path": "/oauth/token",
+                "headers": [
+                    (
+                        b"content-type",
+                        b"application/x-www-form-urlencoded",
+                    ),
+                    (b"content-length", str(len(body)).encode("latin-1")),
+                ],
+                "query_string": b"",
+            }
+
+            async def receive():
+                return {
+                    "type": "http.request",
+                    "body": body,
+                    "more_body": False,
+                }
+
+            request = Request(scope, receive)
+            task = asyncio.create_task(token(request, state))
+            assert await _wait_for_threading_flag(stall_entered, 5.0)
+            t0 = time.monotonic()
+            await asyncio.sleep(0.15)
+            loop_stall = time.monotonic() - t0
+            pending = not task.done()
+            release.set()
+            response = await asyncio.wait_for(task, timeout=5.0)
+            assert settled.is_set()
+            return loop_stall, pending, response
+
+        loop_stall, pending, response = asyncio.run(scenario())
+    finally:
+        oauth_auth_set_persist(None)
+
+    assert pending, (
+        "stalled exchange resolved before release: the durable write should "
+        "still be in flight while the store is contended"
+    )
+    assert loop_stall < 0.5, (
+        f"serving loop blocked {loop_stall:.2f}s on a stalled token exchange"
+    )
+    assert response.status_code == 200
+    assert response.body
+
+
+# ── rm-092 review fix: authorize-route offload + atomic replay guards ─────
+
+
+def test_authorize_route_survives_durable_store_lock_contention(tmp_path, monkeypatch):
+    """Review fix (rm-092 remainder): the authorize route issues a durable
+    authorization code — ``issue_authorization_code`` reads the revocation
+    epoch through sqlite (busy_timeout=15000) — so the async serving wrapper
+    must offload the sync authorize body. Pre-fix the wrapper called
+    ``oauth_auth.authorize`` inline and a contended store froze every
+    concurrent request (the async wrapper also defeats Starlette's own
+    sync-endpoint threadpooling)."""
+    root = tmp_path / "hermes"
+    state, _ = _durable_oauth_state(root)
+    stall_entered, release, settled = _stalled_connect_factory(monkeypatch, root)
+
+    async def scenario():
+        query = urllib.parse.urlencode(
+            {
+                "response_type": "code",
+                "client_id": CLIENT_ID,
+                "redirect_uri": REDIRECT_URI,
+                "scope": "hermes",
+                "code_challenge": s256(DEFAULT_VERIFIER),
+                "code_challenge_method": "S256",
+                "state": "st",
+            }
+        ).encode()
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": "/oauth/authorize",
+            "headers": [],
+            "query_string": query,
+        }
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        request = Request(scope, receive)
+        task = asyncio.create_task(authorize_async(request, state))
+        assert await _wait_for_threading_flag(stall_entered, 5.0)
+        # The durable epoch read is stalled RIGHT NOW: the authorize call
+        # must stay in flight and the loop must keep running other work.
+        t0 = time.monotonic()
+        await asyncio.sleep(0.15)
+        loop_stall = time.monotonic() - t0
+        pending = not task.done()
+        release.set()
+        response = await asyncio.wait_for(task, timeout=5.0)
+        assert settled.is_set()
+        return loop_stall, pending, response
+
+    loop_stall, pending, response = asyncio.run(scenario())
+    assert pending, (
+        "stalled authorize resolved before release: the durable code "
+        "issuance should still be in flight while the store is contended"
+    )
+    assert loop_stall < 0.5, (
+        f"serving loop blocked {loop_stall:.2f}s on a stalled authorize; the "
+        "route wrapper must offload the sync authorize body"
+    )
+    assert response.status_code == 302
+    issued = urllib.parse.parse_qs(
+        urllib.parse.urlparse(response.headers["location"]).query
+    ).get("code", [])
+    assert issued, "authorize did not hand out an authorization code"
+
+
+def test_authorization_code_replay_reservation_is_atomic(oauth_state, monkeypatch):
+    """Review fix: exchange bodies run on worker threads, so the used-code
+    replay guard must be an atomic reservation. Check-then-act let two
+    racing exchanges of one code both pass the membership check and both
+    mint single-use credentials."""
+    import threading
+
+    code = oauth_state.issue_authorization_code(
+        client_id=CLIENT_ID,
+        redirect_uri=REDIRECT_URI,
+        scope="hermes",
+        resource=RESOURCE,
+        code_challenge=s256(DEFAULT_VERIFIER),
+    )
+    original_require = oauth_state._require_capacity
+
+    def slow_require(*args, **kwargs):
+        # Widen the check->mark window exactly the way a contended store or
+        # slow mint does; the membership check has already passed by here.
+        time.sleep(0.25)
+        return original_require(*args, **kwargs)
+
+    monkeypatch.setattr(oauth_state, "_require_capacity", slow_require)
+    results: list[dict] = []
+    errors: list[str] = []
+
+    def exchange():
+        try:
+            results.append(
+                oauth_state.exchange_authorization_code(
+                    code=code,
+                    client_id=CLIENT_ID,
+                    redirect_uri=REDIRECT_URI,
+                    code_verifier=DEFAULT_VERIFIER,
+                )
+            )
+        except OAuthError as exc:
+            errors.append(exc.error)
+
+    threads = [threading.Thread(target=exchange) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10.0)
+
+    assert len(results) == 1, (
+        f"a single-use authorization code was exchanged {len(results)} times "
+        f"concurrently; the replay guard is check-then-act (errors={errors})"
+    )
+    assert errors == ["invalid_grant"]
+
+    # The losing thread's failure must not leave the nonce reserved: a
+    # FAILED exchange (bad verifier) also rolls back, so the code stays
+    # redeemable until one exchange actually succeeds.
+    second = oauth_state.issue_authorization_code(
+        client_id=CLIENT_ID,
+        redirect_uri=REDIRECT_URI,
+        scope="hermes",
+        resource=RESOURCE,
+        code_challenge=s256(DEFAULT_VERIFIER),
+    )
+    with pytest.raises(OAuthError) as exc_info:
+        oauth_state.exchange_authorization_code(
+            code=second,
+            client_id=CLIENT_ID,
+            redirect_uri=REDIRECT_URI,
+            code_verifier="b" * 64,
+        )
+    assert exc_info.value.error == "invalid_grant"
+    redeemed = oauth_state.exchange_authorization_code(
+        code=second,
+        client_id=CLIENT_ID,
+        redirect_uri=REDIRECT_URI,
+        code_verifier=DEFAULT_VERIFIER,
+    )
+    assert redeemed["token_type"] == "Bearer"
+
+
+def test_standalone_refresh_rotation_is_atomic_under_threaded_exchange(
+    oauth_state, monkeypatch
+):
+    """Review fix: standalone (no durable root) refresh rotation must
+    consume the presented token atomically — check-then-act let two racing
+    rotations of one refresh token both succeed. The durable lane is
+    already atomic via token_store.exchange_commit."""
+    import threading
+
+    refresh_value, item = oauth_state._new_refresh_token(
+        client_id=CLIENT_ID, scope="hermes"
+    )
+    oauth_state.refresh_tokens[refresh_value] = item
+    original_new_refresh = oauth_state._new_refresh_token
+
+    def slow_new_refresh(*args, **kwargs):
+        time.sleep(0.25)
+        return original_new_refresh(*args, **kwargs)
+
+    monkeypatch.setattr(oauth_state, "_new_refresh_token", slow_new_refresh)
+    results: list[dict] = []
+    errors: list[str] = []
+
+    def rotate():
+        try:
+            results.append(
+                oauth_state.exchange_refresh_token(
+                    refresh_token=refresh_value,
+                    client_id=CLIENT_ID,
+                    requested_scope="hermes",
+                )
+            )
+        except OAuthError as exc:
+            errors.append(exc.error)
+
+    threads = [threading.Thread(target=rotate) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10.0)
+
+    assert len(results) == 1, (
+        f"one refresh token was rotated {len(results)} times concurrently; "
+        f"standalone rotation is check-then-act (errors={errors})"
+    )
+    assert errors == ["invalid_grant"]
+    # The presented token is consumed exactly once and the winner's
+    # rotation is live; the loser's failure must not resurrect it.
+    assert refresh_value not in oauth_state.refresh_tokens
+    assert refresh_value in oauth_state._retired_refresh_tokens
+    assert results[0]["refresh_token"] in oauth_state.refresh_tokens

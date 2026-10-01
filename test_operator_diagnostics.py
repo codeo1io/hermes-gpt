@@ -710,9 +710,179 @@ def test_doctor_warns_on_recorded_ui_mount_failure(hermes_root, clean_env, audit
     assert "UI mount" in check["message"]
 
 
+# ── rm-093: ui_mount health must survive audit churn and rotation ──────────
+
+
+def test_doctor_ui_mount_warning_survives_audit_churn(hermes_root, clean_env, audit_override):
+    """rm-093: >50 newer audit records must not evict the ui_mount failure
+    from doctor's view (the bounded tail scan used to false-PASS here)."""
+    op.audit_record(
+        tool="ui_mount",
+        level="read_only",
+        apply_mode="direct",
+        dry_run=False,
+        success=False,
+        summary="UI mount skipped: ImportError: import of ui_api halted",
+        error="ImportError: import of ui_api halted",
+    )
+    for i in range(60):
+        op.audit_record(
+            tool="web_search",
+            level="read_only",
+            apply_mode="direct",
+            dry_run=False,
+            success=True,
+            summary=f"ordinary operator traffic {i}",
+        )
+    parsed = json.loads(od.hermes_operator_doctor(profile="default", hermes_root=hermes_root))
+    check = parsed["checks"]["ui_mount"]
+    assert check["status"] == od.STATUS_WARN, (
+        "ui_mount failure aged out of the audit tail and doctor false-PASSed"
+    )
+    assert check["code"] == "UI_MOUNT_FAILED"
+
+
+def test_doctor_ui_mount_warning_survives_audit_rotation(hermes_root, clean_env, audit_override):
+    """rm-093: a rotation that moves the ui_mount failure record into the
+    archived ``.1`` generation must not make doctor false-PASS."""
+    op.audit_record(
+        tool="ui_mount",
+        level="read_only",
+        apply_mode="direct",
+        dry_run=False,
+        success=False,
+        summary="UI mount skipped: ImportError: import of ui_api halted",
+        error="ImportError: import of ui_api halted",
+    )
+    audit_override.replace(audit_override.with_name(audit_override.name + ".1"))
+    for i in range(5):
+        op.audit_record(
+            tool="web_search",
+            level="read_only",
+            apply_mode="direct",
+            dry_run=False,
+            success=True,
+            summary=f"post-rotation traffic {i}",
+        )
+    parsed = json.loads(od.hermes_operator_doctor(profile="default", hermes_root=hermes_root))
+    check = parsed["checks"]["ui_mount"]
+    assert check["status"] == od.STATUS_WARN, (
+        "ui_mount failure rotated out of the active log and doctor false-PASSed"
+    )
+    assert check["code"] == "UI_MOUNT_FAILED"
+
+
+def test_doctor_ui_mount_marker_failure_survives_without_audit_records(
+    hermes_root, clean_env, audit_override
+):
+    """rm-093: the persistent ui_mount state marker is doctor's authority —
+    a failed mount warns even with no audit evidence in any tail window."""
+    op.record_ui_mount_failure("ImportError: import of ui_api halted")
+    for i in range(60):
+        op.audit_record(
+            tool="web_search",
+            level="read_only",
+            apply_mode="direct",
+            dry_run=False,
+            success=True,
+            summary=f"ordinary operator traffic {i}",
+        )
+    parsed = json.loads(od.hermes_operator_doctor(profile="default", hermes_root=hermes_root))
+    check = parsed["checks"]["ui_mount"]
+    assert check["status"] == od.STATUS_WARN
+    assert check["code"] == "UI_MOUNT_FAILED"
+    assert "ui_api" in check["message"]
+    assert check.get("last_ui_mount_failure_timestamp")
+    assert check.get("ui_mount_state_path")
+
+
+def test_doctor_ui_mount_marker_healthy_and_disabled_states_pass(
+    hermes_root, clean_env, audit_override
+):
+    """rm-093: healthy and disabled markers clear a stale failure — doctor
+    must not warn about a UI that is no longer enabled or failed."""
+    op.write_ui_mount_state("healthy")
+    parsed = json.loads(od.hermes_operator_doctor(profile="default", hermes_root=hermes_root))
+    check = parsed["checks"]["ui_mount"]
+    assert check["status"] == od.STATUS_PASS
+    assert check["code"] == "UI_MOUNT_HEALTHY"
+
+    op.write_ui_mount_state("disabled")
+    parsed = json.loads(od.hermes_operator_doctor(profile="default", hermes_root=hermes_root))
+    check = parsed["checks"]["ui_mount"]
+    assert check["status"] == od.STATUS_PASS
+    assert check["code"] == "UI_MOUNT_HEALTHY"
+
+
 def test_doctor_ui_mount_check_passes_without_failures(hermes_root, clean_env, audit_override):
     """No recorded ui_mount failure -> PASS."""
     parsed = json.loads(od.hermes_operator_doctor(profile="default", hermes_root=hermes_root))
     check = parsed["checks"]["ui_mount"]
     assert check["status"] == od.STATUS_PASS
     assert check["code"] == "UI_MOUNT_HEALTHY"
+
+
+# ── rm-093 review fix: marker authority vs. historical audit failures ─────
+
+
+def test_doctor_ui_mount_marker_overrides_stale_audit_failure(
+    hermes_root, clean_env, audit_override
+):
+    """Review fix (rm-093): a healthy/disabled marker recorded AFTER an
+    audit failure is the newer authority and must clear the WARN — the
+    doctor used to fall through to the audit fallback and re-WARN on the
+    historical failure forever, so a recovered UI never showed healthy."""
+    op.audit_record(
+        tool="ui_mount",
+        level="read_only",
+        apply_mode="direct",
+        dry_run=False,
+        success=False,
+        summary="UI mount skipped: ImportError: import of ui_api halted",
+        error="ImportError: import of ui_api halted",
+    )
+    op.write_ui_mount_state("healthy")
+    parsed = json.loads(od.hermes_operator_doctor(profile="default", hermes_root=hermes_root))
+    check = parsed["checks"]["ui_mount"]
+    assert check["status"] == od.STATUS_PASS, (
+        "a healthy marker recorded after the failure still WARNed: the audit "
+        "fallback outranked the newer marker"
+    )
+    assert check["code"] == "UI_MOUNT_HEALTHY"
+    assert "disabled" not in check["message"].lower()
+
+    op.write_ui_mount_state("disabled")
+    parsed = json.loads(od.hermes_operator_doctor(profile="default", hermes_root=hermes_root))
+    check = parsed["checks"]["ui_mount"]
+    assert check["status"] == od.STATUS_PASS, (
+        "a disabled marker recorded after the failure still WARNed with "
+        "'enabled but failed to mount' wording"
+    )
+    assert check["code"] == "UI_MOUNT_HEALTHY"
+    assert "disabled" in check["message"].lower()
+
+
+def test_doctor_ui_mount_warns_when_failure_newer_than_marker(
+    hermes_root, clean_env, audit_override
+):
+    """Review fix (rm-093) fleet backstop: peers sharing one root can write
+    a healthy marker and then record a NEWER failure — the newest writer
+    must win, so a failure record that postdates the marker still WARNs."""
+    op.write_ui_mount_state("healthy")
+    op.audit_record(
+        tool="ui_mount",
+        level="read_only",
+        apply_mode="direct",
+        dry_run=False,
+        success=False,
+        summary="UI mount skipped: ImportError: import of ui_api halted",
+        error="ImportError: import of ui_api halted",
+    )
+    parsed = json.loads(od.hermes_operator_doctor(profile="default", hermes_root=hermes_root))
+    check = parsed["checks"]["ui_mount"]
+    assert check["status"] == od.STATUS_WARN, (
+        "a failure record newer than the healthy marker was outranked by the "
+        "stale marker"
+    )
+    assert check["code"] == "UI_MOUNT_FAILED"
+    assert check.get("last_ui_mount_failure_timestamp")

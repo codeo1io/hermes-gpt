@@ -425,6 +425,25 @@ The manifest defines expected peer identity/role/profile authority. It must not 
 
 High-impact structured work additionally requires bounded approval metadata. Public-action detection and role authority are enforced locally before work is sent.
 
+### Fleet peer identity and advertised URL
+
+Each Fleet peer publishes an Agent Card at `/.well-known/agent-card.json`
+(and `/.well-known/agent.json`) describing itself — never credentials,
+tokens, or peer secrets. Environment knobs control what that card says;
+all are read from the server process environment when the card is served:
+
+| Knob | Default | Scope and gate semantics |
+| --- | --- | --- |
+| `HERMES_GPT_FLEET_PEER_NAME` | `hermes-peer` | The identity this peer attests in its own Agent Card. The fleet authority manifest pins `expected_card_identity` to this value; before direct structured dispatch the caller rechecks live peer identity against that manifest, and a mismatch stops dispatch. |
+| `HERMES_GPT_FLEET_PEER_URL` | `http://$HERMES_GPT_HOST:$HERMES_GPT_PORT` | The URL advertised in this peer's own Agent Card and registered for loopback verification. Descriptive metadata for callers — not a listen address, and it must not carry credentials. |
+| `HERMES_GPT_FLEET_PEER_VERSION` | `0.20.5` | Version string reported in this peer's Agent Card. Bounded compatibility metadata only. |
+| `HERMES_GPT_HOST` | `127.0.0.1` | Fallback host for the advertised peer URL when `HERMES_GPT_FLEET_PEER_URL` is unset. It does **not** change the actual listen address: the server binds the `--host`/`--port` CLI flags (default `127.0.0.1:7677`). |
+| `HERMES_GPT_PORT` | `4750` | Fallback port for the advertised peer URL when `HERMES_GPT_FLEET_PEER_URL` is unset. Note the mismatch by design: the advertised default port (`4750`) is not the server's default listen port (`7677`), so a peer reachable on another port should set `HERMES_GPT_FLEET_PEER_URL` (or both fallbacks) explicitly. |
+
+None of these knobs relaxes an authority gate: the manifest, registry, and
+policy checks above still apply, and setting them cannot make dispatch trust
+a peer.
+
 ## Codex CLI jobs through the Operator server
 
 This is different from installing Hermes GPT as an MCP server inside Codex.
@@ -484,7 +503,7 @@ Read-only deep health check across the Operator surface. Checks include gateway 
 
 Gateway state is fail-closed: `hermes_operator_doctor` never reports the gateway as healthy on a heartbeat file alone. A heartbeat with no live gateway PID fails with `GATEWAY_PID_MISSING`; a dead PID fails with `GATEWAY_DEAD_PID`; an unreachable gateway fails with `GATEWAY_UNREACHABLE`. Stale heartbeat files surface as `GATEWAY_STALE_HEARTBEAT` warnings.
 
-The browser UI mount is checked too: when the UI is explicitly enabled (`HERMES_GPT_UI_ENABLED=1`) but its route mount fails (for example a broken or missing `ui_api` module), the failure is recorded as an audit record and a `ui_mount_failed` live event at boot, and the doctor reports it as `UI_MOUNT_FAILED` (`WARN`) instead of the server silently degrading to MCP-only with a single log line.
+The browser UI mount is checked too: when the UI is explicitly enabled (`HERMES_GPT_UI_ENABLED=1`) but its route mount fails (for example a broken or missing `ui_api` module), the failure is recorded in a persistent ui-mount state marker (`ui-mount-state.json`, written beside the audit log) plus an audit record and a `ui_mount_failed` live event at boot. The state marker is the doctor's authority: unlike the bounded audit tail it survives ordinary audit churn and log rotation, so a failed mount keeps reporting `UI_MOUNT_FAILED` (`WARN`) until a later successful mount (or a restart with the UI disabled) records `healthy`/`disabled` and clears the signal — a marker newer than the last audit failure wins, and a failure record newer than the marker still WARNs (fleet peers sharing one root: newest writer wins) — instead of the server silently degrading to MCP-only with a single log line.
 
 Status vocabulary:
 
@@ -700,6 +719,25 @@ Deployments can constrain autonomous routing with comma-separated allowlists:
 Unset allowlists preserve compatibility and allow all values. Set allowlists are
 enforced before dispatch so contracts cannot silently route work into an
 unexpected backend, provider, or model.
+
+### Runner executable overrides
+
+The local runner backends locate their CLI executable through a fixed
+resolution order, and dispatch fails closed (`RUNNER_UNAVAILABLE`) when no
+candidate exists:
+
+| Knob | Backend | Resolution order |
+| --- | --- | --- |
+| `HERMES_GPT_PI_EXE` | `pi_rpc` | this knob → `pi` on `PATH` → `~/.local/bin/pi` → the `@earendil-works/pi-coding-agent` package `cli.js`. |
+| `HERMES_GPT_OMX_EXE` | `omx` | this knob → `omx` on `PATH` → `/usr/bin/omx` → `~/.local/bin/omx`. |
+| `HERMES_GPT_OPENCODE_EXE` | `opencode` | this knob → `opencode` on `PATH` → `~/.local/bin/opencode`. |
+
+Each override is a plain filesystem path to an existing executable file.
+Candidates that do not exist are skipped, and when none exists the backend
+reports `available: false` and dispatch returns `RUNNER_UNAVAILABLE` instead
+of falling back to a shell lookup. Setting an override does not bypass
+confinement: `pi_rpc` still requires the OS-level confinement gate above,
+and every backend still executes only already-authorized work contracts.
 
 Local runner request envelopes are transient. Workers unlink `*.request.json`
 files immediately after loading them, and runner listing/status performs TTL
