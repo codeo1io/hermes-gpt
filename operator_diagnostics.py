@@ -626,7 +626,11 @@ def _check_ui_cron_dispatch() -> dict[str, Any]:
         code="UI_CRON_DISPATCH_OK",
         message=(
             f"{snapshot['active']} active / {snapshot['finished']} recently finished "
-            f"long-running UI dispatch(es); concurrency limit {snapshot['limit']}."
+            f"long-running UI dispatch(es); concurrency limit {snapshot['limit']}. "
+            # rm-140: this reads THIS process's registry only — a UI served by
+            # a different process would legitimately show 0 active here.
+            "Scope: this process's in-memory dispatch registry only; dispatches "
+            "from another UI-serving process are not visible to this check."
         ),
         suggested_action="No action needed.",
         extra={
@@ -634,6 +638,7 @@ def _check_ui_cron_dispatch() -> dict[str, Any]:
             "finished": snapshot["finished"],
             "limit": snapshot["limit"],
             "oldest_active_age_s": oldest_age,
+            "scope": "in-process",
         },
     )
 

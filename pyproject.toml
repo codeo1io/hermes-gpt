@@ -37,6 +37,9 @@ dev = [
   "build",
   "twine",
   "keyring",
+  # rm-138: property-based grammar invariants for the vendored cron
+  # schedule parser (new direct dev dependency; no runtime impact).
+  "hypothesis>=6,<7",
 ]
 
 # uv syncs this PEP 735 dependency group by default (unlike extras), so
@@ -51,6 +54,7 @@ dev = [
   "build",
   "twine",
   "keyring",
+  "hypothesis>=6,<7",
 ]
 
 [project.scripts]

@@ -332,3 +332,158 @@ changed, +664/−12, including new regression tests for every unit.
   and the sibling b6659410/099e2bfc candidate sets at integration; the 12-file
   batch (+664/−12) is uncommitted with digest
   `validation:v1:4a1f4beb…ec608` current at compound time.
+
+## Cycle 6 — 2026-10-01 — "Cron arm-to-dispatch truthfulness close-out"
+
+Run `bf4db34f3880424f976254e81cf56fe0` (repository-maintenance
+`63b87a5f9bf14df0b678cdd43a2ee395`, cycle 2) against worktree at `941f4cfc69`
+(run-bf4db34f3880-bf4db34f, branch `conductor/run-bf4db34f3880` = canonical
+master `dce209dfcc` + 12 conductor run-merges, including cycle 5's landing
+`d1f252ec2e`). Phases: assess → research → roadmap → prioritize → stewardship →
+implement → targeted tests → compound. All outcomes below are pre-review: the
+batch is implemented and locally verified but uncommitted, awaiting review and
+the fold/commit gates. Sibling families worked the same base in parallel and
+minted roadmap ids concurrently this morning (61db9bce `d863b69e`, c5fba76a
+`5e1ae1a7`) — see Landing-gate duties below; this cycle minted rm-131..rm-140
+at 08:42:40Z off the then-frontier rm-130 and raced both.
+
+### What the cycle did
+
+- **rm-131 (P90)** — closed the fresh-landing semaphore leak from cycle 5's
+  rm-097: `ui_ops.py` long-running dispatch now runs EVERYTHING between
+  semaphore `acquire()` and thread `.start()` (the `_resolve_root()` call and
+  the registry insert) inside the failure handler that pops the registry entry,
+  releases the token and returns a clean 500 INTERNAL. Previously a raising
+  `_resolve_root()` leaked one token per failure (limit 4) until every
+  long-running `hermes_cron_run` 429'd until restart. Red witness → green
+  (limit+2 injected failures, then a recovered dispatch accepted 202).
+- **rm-132 (P72)** — `hermes_cron_create` dry-run plans now carry
+  `schedule_preview {schedule_kind, timezone "<name> (UTC±HH:MM)", times[>=3]}`
+  via new `_schedule_preview()` (interval arithmetic; cron kinds through the
+  existing lazy croniter import; once-schedules a single labeled fire time).
+  Converts the whole parser-edge class into a pre-arm confirmation; tz contract
+  documented in `docs/operator-mode.md` "Schedule grammar and fire-time
+  preview".
+- **rm-057 floor slice + rm-138 (P44)** — `_interval_schedule` rejects
+  minutes<1 with a dedicated "at least 1 minute" message (the fallthrough was
+  restructured so the message is not swallowed by the generic error);
+  `_WEEKDAY_TO_CRON_DOW` gains all seven plural weekday keys; a hypothesis
+  dev-group property lane (derandomized, 100+100 examples) pins
+  weekday-grammar→cron-expr croniter-validity, the floor, zero-rejection and
+  per-kind preview. DEVIATION recorded at implement: rm-138's acceptance named
+  a `_format_schedule` round-trip invariant — no such function exists
+  (speculatively written acceptance); the four pinned invariants cover the same
+  intent. rm-057's manifest-walk memoization slice remains open.
+- **rm-140 (P30)** — the doctor `ui_cron_dispatch` check now declares its
+  in-process scope in the PASS detail (plus `scope='in-process'` in the
+  payload) and `docs/operator-mode.md` states the caveat with the
+  durable-audit-log alternative for cross-process authority.
+- **Adopted from a reaped same-phase attempt (718e3b7b)** — the targeted-tests
+  attempt reaped mid-turn left a real 7-line fix in-tree (property lane
+  `deadline=None` + `suppress_health_check=[HealthCheck.too_slow]`), verified
+  against the implement batch reconstruction and adopted rather than redone;
+  the verbatim gate run it never performed was redone from scratch.
+- **Disposition of this run's assess findings** — F1 (semaphore leak) → rm-131
+  implemented; F2 (zero-interval floor) → rm-057 slice implemented; F3
+  (job_wait occupancy) → rm-063 refreshed, still open; F4 (doctor cross-process
+  caveat) → rm-140 implemented; F5 (plural weekdays) → rm-138 implemented.
+  Five of five triaged, four closed pre-review.
+
+### Validation record (pre-review)
+
+targeted_command verbatim (detached `setsid`/`nohup` wrapper,
+`/tmp/a8ed99d3-scratch/`): the runner classified `pyproject.toml` as shared
+build/test configuration and self-escalated to the authoritative full gate via
+its own `--fallback-command` — envelope `result-356086-335547330.json`,
+returncode 0, outcome completed, workers 3, 162 s; dot-count **1617 passed +
+5 skipped = 1622, 0 failed**, exactly implement's collect-only 1622 (assess
+baseline 1615 + 7 net-new); the 5 skips are the standing platform-gated set.
+Declared digest `validation:v1:8e40bd12…d1fbfd2` — recomputed byte-identical
+BEFORE and AFTER the run via `validation_policy.validation_digest(full HEAD)`,
+and unchanged at compound time because this phase touches only non-executable
+surfaces (`ROADMAP.md`, this log), which the digest excludes by construction.
+Static: ruff clean on all seven changed surfaces under both system ruff 0.15.10
+and `uvx ruff@0.15.22`.
+
+### Prevention rules established
+
+1. **Every acquire→release span must cover everything that can raise inside
+   it.** rm-131's leak was a semaphore acquired before a `_resolve_root()` call
+   whose exception escaped past the release (the `except` guarded only
+   `.start()`). Fix pattern: resolve/validate first, then acquire; or wrap the
+   entire span so every exit releases. The regression-test pattern that
+   actually catches this: inject the failure MORE times than the limit, then
+   assert a subsequent dispatch still succeeds.
+2. **A batch that touches `pyproject.toml` runs the full suite in the targeted
+   phase.** `run_repo_impacted_tests.py` hard-classifies pyproject.toml as
+   shared build/test configuration and self-escalates through its own
+   `--fallback-command` (the authoritative full gate). Budget for full-suite
+   timing (162–340 s fleet-observed) and remember addopts `-q` stacking
+   suppresses pytest's summary line — reconcile counts by dot-count.
+3. **Property lanes under fleet load need load-robust settings from day one.**
+   The cron property lane flaked as `FailedHealthCheck.too_slow` (8 draws,
+   5.46 s) under load1≈24 before `deadline=None` +
+   `suppress_health_check=[HealthCheck.too_slow]` + `derandomize=True` were
+   added (the adopted 718e3b7b delta). Any future hypothesis lane starts with
+   those settings.
+4. **Name the interpreter when reconciling skip counts.** `importorskip` makes
+   skips interpreter-dependent: the hermes-agent venv `python3` has no
+   hypothesis, while the gate's `python` resolves to
+   `/work/projects/hermes-autonomy/.venv` (hypothesis since 2026-10-01T10:32Z).
+   The same tree showed "136 passed, 1 skipped" under one and 137 passed under
+   the other.
+5. **In-process introspection checks must declare their scope.** A check built
+   on process-local state (rm-140's registry read) reads as 0/0 + PASS from any
+   other process. Scope declaration belongs in the check's detail text AND its
+   docs paragraph; audit-log-backed checks are the contrast class.
+6. **A reaped attempt's absent envelope is not evidence of no work.** Check
+   per-file mtimes inside the reap window and reconstruct candidate deltas from
+   the implement batch diff before redoing; adopt verified durable work — the
+   engine derives the dispatch digest after the reap, so adopted work is
+   already inside a verbatim-declarable digest (prove it by recomputation, as
+   done here pre- and post-run).
+7. **Roadmap id minting must re-probe live and mint past the OBSERVED fleet
+   max.** This cycle minted rm-131..rm-140 at 08:42:40Z off the then-frontier
+   rm-130; siblings minted rm-131..rm-135 (61db9bce, 08:43:54Z) and
+   rm-131..rm-140 (c5fba76a, 08:42:19Z, renumbered to rm-141..rm-150 on
+   observing the race) within two minutes. The observed fleet frontier is now
+   rm-150 (all unlanded); the next roadmap phase anywhere continues at rm-151+.
+   rm-139 (`tools/check_roadmap_ids.py`) mechanizes exactly this and is now
+   justified by an observed incident, not a hypothetical.
+
+### Local toolchain notes (small, reusable)
+
+- Gate runs detached (`setsid`/`nohup` wrapper) survive delegate reaps; the
+  gate admitted at workers=3 under load1≈17–38 and writes envelopes under
+  `~/.hermes/local-validation-gate/results/`.
+- `.hypothesis/` self-ignores (its own `.gitignore` containing `*`), so the
+  hypothesis constants cache never dirties a census; `.pytest_cache/` is
+  `.gitignore:13`.
+- ruff parity: system 0.15.10 vs `uvx ruff@0.15.22` agreed (clean/clean) on
+  all seven changed surfaces.
+
+### Context left for the next cycle
+
+- **Still-candidate items minted here:** rm-133 fork distribution identity
+  (DECISION-GATED: local version segment vs never-publish — must precede any
+  0.13-numbered fork release), rm-134 fetch-metadata + content-type hardening
+  on browser-UI POSTs, rm-135 live-deployment provenance capture +
+  uncommitted-delta release blocker, rm-136 browser-UI agent-runtime
+  cross-project seam, rm-137 OpenAPI description from the 20-route HTTP
+  surface, rm-139 roadmap id-allocation guard (elevate: rule 7's incident),
+  plus the refreshed rm-063 (job_wait occupancy) and rm-098 (upstream v0.13
+  adoption) which stay open. rm-057's manifest-walk memoization slice rides
+  the next batch.
+- **Cross-family topics for the next assess to re-derive, not re-mint** (held
+  in sibling uncommitted blocks): write-claim atomicity, SessionDB shim
+  capability contract, web transport-resilience client wiring, finance
+  request_id confinement, validate_public_url redirect/rebinding pin, py3.11
+  floor (c5fba76a rm-141..rm-150); `hermes_mission_usage` 24h-vs-all-time
+  totals (61db9bce assess F6, defect-class).
+- **Landing-gate duties:** this cycle's batch is uncommitted with digest
+  `validation:v1:8e40bd12…d1fbfd2` current at compound time; fold id
+  collisions landed-first-wins — rm-131..rm-135 collide with sibling 61db9bce's
+  block (different content); the provenance topic is triple-held (rm-135 here,
+  61db9bce rm-133, c5fba76a rm-148); upstream remains frozen at tip
+  `f4151d9728` (9 commits ahead, no v0.13 tag; PR #85 touches
+  `operator_workspace.py` — check it before any backup-related work).

@@ -881,3 +881,155 @@ def test_write_jobs_removes_staging_file_on_failure(hermes_root: Path, monkeypat
     with pytest.raises(OSError):
         cron_mod._write_jobs(hermes_root, [{"id": "j1", "name": "x"}])
     assert list((hermes_root / "cron").glob("*.tmp")) == []
+
+
+# --- run bf4db34f cycle 6: NL-grammar truthfulness (rm-138 + rm-057 floor) ---
+
+
+def test_parse_schedule_rejects_zero_interval():
+    """rm-057 floor slice: zero intervals are rejected loudly, never stored as
+    minutes=0 — assess F2 empirically created a real 'every 0m' job."""
+    for bad in ("every 0m", "0m", "every 0h", "every 0 days", "0 hours"):
+        with pytest.raises(ValueError, match="at least 1 minute"):
+            oc._parse_schedule(bad)
+
+
+def test_parse_schedule_accepts_plural_weekdays():
+    """rm-138: plural weekday names map like singulars instead of falling
+    through to the misleading interval error ("Invalid duration: 'mondays 9am'"
+    — the schedule kind parsed fine; only the grammar table was singular)."""
+    expr = oc._parse_schedule("every mondays 9am")
+    assert expr["kind"] == "cron"
+    assert expr["expr"] == "0 9 * * 1"
+    # Every weekday has a plural key mapping to the same dow as the singular.
+    for singular, plural, dow in (
+        ("sunday", "sundays", "0"), ("monday", "mondays", "1"),
+        ("tuesday", "tuesdays", "2"), ("wednesday", "wednesdays", "3"),
+        ("thursday", "thursdays", "4"), ("friday", "fridays", "5"),
+        ("saturday", "saturdays", "6"),
+    ):
+        assert oc._WEEKDAY_TO_CRON_DOW[singular] == oc._WEEKDAY_TO_CRON_DOW[plural] == dow
+    # Mixed plural/singular lists keep their order-unique dow set.
+    mixed = oc._parse_schedule("every tuesdays and fri 8:30am")
+    assert mixed["expr"] == "30 8 * * 2,5"
+
+
+# --- run bf4db34f cycle 6: arm-time fire preview (rm-132) ---
+
+
+def _preview_for(monkeypatch, hermes_root, schedule):
+    monkeypatch.setenv(op.OPERATOR_ENABLED_ENV, "1")
+    monkeypatch.setenv(op.OPERATOR_LEVEL_ENV, "cron")
+    out = oc.hermes_cron_create(
+        profile="default", schedule=schedule, prompt="preview probe",
+        dry_run=True, hermes_root=hermes_root,
+    )
+    return json.loads(out)["plan"]["schedule_preview"]
+
+
+def test_schedule_preview_interval_daily_weekday_and_once(monkeypatch, hermes_root):
+    """rm-132: the dry-run plan previews >=3 computed fire times in the
+    effective timezone for every schedule kind the grammar accepts."""
+    import datetime as _dt
+
+    pv = _preview_for(monkeypatch, hermes_root, "every 30m")
+    assert pv["schedule_kind"] == "interval"
+    assert len(pv["times"]) >= 3
+    assert pv["timezone"] and "UTC" in pv["timezone"]
+    t0, t1 = (_dt.datetime.fromisoformat(t) for t in pv["times"][:2])
+    assert 25 <= (t1 - t0).total_seconds() / 60 <= 35
+
+    # Daily cron: every previewed fire sits at minute 0 hour 9 local.
+    pv = _preview_for(monkeypatch, hermes_root, "0 9 * * *")
+    assert pv["schedule_kind"] == "cron"
+    assert len(pv["times"]) >= 3
+    assert all(t[11:16] == "09:00" for t in pv["times"])
+
+    # Weekday grammar (the rm-138 plural path) previews through the same key.
+    pv = _preview_for(monkeypatch, hermes_root, "every mondays 9am")
+    assert pv["schedule_kind"] == "cron"
+    assert len(pv["times"]) >= 3
+
+    # One-shot: exactly one fire, labeled as such.
+    pv = _preview_for(monkeypatch, hermes_root, "in 30m")
+    assert pv["schedule_kind"] == "once"
+    assert len(pv["times"]) == 1
+    assert "once" in pv["note"]
+
+
+def test_schedule_preview_declares_tz_environment(monkeypatch, hermes_root):
+    """rm-132: with TZ set in the environment the preview declares the zone it
+    resolved against — 'once at HH:MM' stops being an implicit tz guess."""
+    import time as _time
+
+    if not hasattr(_time, "tzset"):
+        pytest.skip("time.tzset unavailable on this platform")
+    monkeypatch.setenv("TZ", "UTC")
+    _time.tzset()
+    try:
+        pv = _preview_for(monkeypatch, hermes_root, "every 45m")
+    finally:
+        monkeypatch.delenv("TZ", raising=False)
+        _time.tzset()
+    assert "UTC" in pv["timezone"]
+    assert len(pv["times"]) >= 3
+
+
+# --- run bf4db34f cycle 6: property-based grammar invariants (rm-138) ---
+# hypothesis is a declared dev-group dependency (pyproject [dependency-groups]
+# and [project.optional-dependencies].dev). The lane skips cleanly where the
+# package is absent rather than failing the suite.
+
+def test_cron_grammar_property_invariants():
+    """rm-138: property-based lane pinning the schedule grammar's truthfulness
+    invariants across generated inputs (derandomized: fixed outcome per run)."""
+    pytest.importorskip("hypothesis")
+    from hypothesis import HealthCheck, given, settings
+    from hypothesis import strategies as st
+
+    # deadline=None + too_slow suppression keep the lane load-robust on the
+    # shared fleet host: input generation here is intrinsically fast, but a
+    # CPU-starved worker (suite admitted at workers=1 under load1~24) misses
+    # hypothesis's default 200ms/example deadline and 5s data-generation
+    # health check without any real invariant violation (proven: run
+    # bf4db34f targeted_tests attempt 718e3b7b, FailedHealthCheck.too_slow
+    # with 8 draws in 5.46s). Assertions and 100-example coverage unchanged.
+
+    weekdays = st.sampled_from(
+        ["sunday", "sundays", "sun", "monday", "mondays", "mon",
+         "tuesday", "tuesdays", "tue", "tues", "wednesday", "wednesdays", "wed",
+         "thursday", "thursdays", "thu", "friday", "fridays", "fri",
+         "saturday", "saturdays", "sat"]
+    )
+    hours = st.integers(min_value=0, max_value=23)
+    minutes = st.integers(min_value=0, max_value=59)
+
+    @settings(max_examples=100, derandomize=True, deadline=None,
+              suppress_health_check=[HealthCheck.too_slow])
+    @given(weekday=weekdays, hour=hours, minute=minutes)
+    def weekday_grammar_produces_valid_cron(weekday, hour, minute):
+        hhmm = f"{hour:02d}:{minute:02d}"
+        parsed = oc._parse_schedule(f"every {weekday} {hhmm}")
+        assert parsed["kind"] == "cron", parsed
+        assert oc._croniter(parsed["expr"]) is not None
+        # The fire time the user wrote is the fire time the expr encodes.
+        fields = parsed["expr"].split()
+        assert fields[0] == str(minute) and fields[1] == str(hour)
+
+    @settings(max_examples=100, derandomize=True, deadline=None,
+              suppress_health_check=[HealthCheck.too_slow])
+    @given(minutes=st.integers(min_value=1, max_value=100_000))
+    def interval_floor_never_yields_zero(minutes):
+        parsed = oc._parse_schedule(f"every {minutes}m")
+        assert parsed["kind"] == "interval"
+        assert parsed["minutes"] == minutes >= 1  # rm-057 floor invariant
+
+    def zero_intervals_always_rejected():
+        # Any zero duration must be rejected loudly, never stored (rm-057).
+        for unit in ("m", "h", "d"):
+            with pytest.raises(ValueError, match="at least 1 minute"):
+                oc._parse_schedule(f"every 0{unit}")
+
+    weekday_grammar_produces_valid_cron()
+    interval_floor_never_yields_zero()
+    zero_intervals_always_rejected()

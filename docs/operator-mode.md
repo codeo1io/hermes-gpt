@@ -482,6 +482,8 @@ Audit records do not intentionally persist raw prompts, `.env` values, vault con
 
 Read-only deep health check across the Operator surface. Checks include gateway state, config/env readability, cron/skills, policy, audit readability, UI mount, long-running UI dispatch (`ui_cron_dispatch`), and connector capability.
 
+The `ui_cron_dispatch` check reads the in-memory dispatch registry of the process running the doctor call only. When the browser UI is served by a different process than the one executing `hermes_operator_doctor`, dispatches handled by that other process are invisible to this check — `0 active` there means "no dispatches in this process", not "none anywhere".
+
 Gateway state is fail-closed: `hermes_operator_doctor` never reports the gateway as healthy on a heartbeat file alone. A heartbeat with no live gateway PID fails with `GATEWAY_PID_MISSING`; a dead PID fails with `GATEWAY_DEAD_PID`; an unreachable gateway fails with `GATEWAY_UNREACHABLE`. Stale heartbeat files surface as `GATEWAY_STALE_HEARTBEAT` warnings.
 
 The browser UI mount is checked too: when the UI is explicitly enabled (`HERMES_GPT_UI_ENABLED=1`) but its route mount fails (for example a broken or missing `ui_api` module), the failure is recorded as an audit record and a `ui_mount_failed` live event at boot, and the doctor reports it as `UI_MOUNT_FAILED` (`WARN`) instead of the server silently degrading to MCP-only with a single log line.
@@ -506,6 +508,12 @@ Actual recovery mutation requires `apply=true` plus the normal direct/workspace 
 ### Corrupt `jobs.json` recovery
 
 If a profile's cron `jobs.json` is unparseable (invalid JSON or non-UTF-8 bytes), cron reads treat the schedule as empty instead of crashing, and before the next write replaces the file the corrupt payload is preserved as `jobs.json.corrupt-<timestamp>` next to it (distinct payloads backed up within the same second get a `-N` suffix — glob `jobs.json.corrupt-*` to enumerate them). The sidecar's presence is the operator-visible signal: restore jobs from the sidecar (or delete it once inspected) with the normal profile file tools. Backups are best-effort and deduplicated — unchanged corrupt payloads are not backed up twice.
+
+### Schedule grammar and fire-time preview
+
+`hermes_cron_create` accepts interval (`30m`, `every 2h`), weekly/daily natural language (`every monday 9am`, `weekdays at 9am`, plural forms like `every mondays 9am` and mixed lists like `tuesdays and fri 8:30am`), 5-field cron expressions (`0 9 * * *`), one-shot delays (`in 30m`), and ISO timestamps. Interval schedules must be at least 1 minute — zero/negative intervals are rejected loudly (`Interval schedules must be at least 1 minute`) instead of being stored as a no-op/hot-loop `minutes: 0` job; use a one-shot `in <duration>` schedule for immediate runs.
+
+The dry-run plan carries a `schedule_preview` object: at least three computed future fire times (one for one-shot schedules, labeled as such) plus the effective timezone the times were resolved against — the server's local timezone, since the standalone distribution has no configured Hermes timezone. The preview confirms WHEN the parsed schedule will fire, before the job is armed; the external scheduler remains the authority at run time.
 
 ### `hermes_release_doctor`
 
