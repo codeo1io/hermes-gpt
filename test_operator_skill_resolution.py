@@ -1,495 +1,329 @@
-"""Canonical profile-aware skill resolution (rm-027): resolver + two-stage
-validation + placement hard gate.
-
-Stage 1 (plan create): a declared skill that exists nowhere is rejected with
-``skill_not_found``. Stage 2 (placement): an assignee profile that cannot
-resolve a required skill is rejected with ``skill_not_resolvable_for_assignee``
-(message lists where the skill *is* available). The pure scoring core
-additionally hard-filters zero-skill targets when skills are required, while
-Fabric-style targets (skills=[]) stay placeable for skill-less requirements.
-"""
+"""Regression coverage for canonical profile-aware skill resolution."""
 
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
 
-import operator_mission_plan as plan
-import operator_mission_runtime as mission
-import operator_placement as pl
-import operator_policy as op
-import operator_skill_resolution as sres
-import operator_skills
+import operator_skill_resolution as resolution
 
 
-@pytest.fixture
-def skills_root(tmp_path: Path, monkeypatch) -> Path:
-    root = tmp_path / "hermes"
-    op.set_audit_log_override(tmp_path / "audit.jsonl")
-    monkeypatch.setenv(op.OPERATOR_ENABLED_ENV, "1")
-    monkeypatch.setenv(op.OPERATOR_LEVEL_ENV, "workspace")
-    monkeypatch.setenv(op.OPERATOR_APPLY_MODE_ENV, "direct")
-    monkeypatch.delenv(op.OWNER_ACTIVE_ENV, raising=False)
-    monkeypatch.delenv(op.OWNER_ACK_ENV, raising=False)
-    # Global skill.
-    _g = root / "skills" / "global-skill" / "SKILL.md"
-    _g.parent.mkdir(parents=True)
-    _g.write_text("# g\n")
-    # Profile dev: one top-level skill, one nested (rglob semantics).
-    for rel in ("code-review", "grouping/nested-review"):
-        p = root / "profiles" / "dev" / "skills" / rel / "SKILL.md"
-        p.parent.mkdir(parents=True)
-        p.write_text("# s\n")
-    # Profile qa exists but has no skills.
-    (root / "profiles" / "qa").mkdir(parents=True, exist_ok=True)
-    (root / "profiles" / "qa" / "config.yaml").write_text("model: m\n")
-    return root
+def _use_real_loader(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Opt out of the hermetic conftest fixture; skip without an Agent checkout.
+
+    The repo suite isolates tests from any Hermes Agent checkout via
+    ``_skill_loader_override``. Tests below that prove equivalence against the
+    real loader must null that fixture and need a real checkout; upstream CI
+    without one skips instead of failing. The ``agent-loader`` CI lane sets
+    ``HERMES_GPT_REQUIRE_AGENT_LOADER=1`` so a missing checkout fails the gate
+    instead of skipping.
+    """
+    monkeypatch.setattr(resolution, "_skill_loader_override", None)
+    if resolution._agent_modules() is None:
+        if os.environ.get("HERMES_GPT_REQUIRE_AGENT_LOADER") == "1":
+            pytest.fail("Hermes Agent checkout is required in this CI lane")
+        pytest.skip("Hermes Agent checkout not available")
 
 
-# ---------------------------------------------------------------------------
-# Resolver (read-only projection)
-# ---------------------------------------------------------------------------
-
-
-def test_resolve_profile_skill_reports_profiles_and_paths(skills_root: Path):
-    res = sres.resolve_skill("code-review", skills_root)
-    assert res.resolvable is True
-    assert res.profiles == ("dev",)
-    assert res.scope == "profile"
-    assert any("profiles/dev/skills" in p for p in res.found_paths)
-
-
-def test_resolve_nested_skill_uses_recursive_walk(skills_root: Path):
-    # operator_skills._find_skill_dir semantics: any dir containing SKILL.md.
-    assert "nested-review" in sres.profile_skills("dev", skills_root)
-
-
-def test_resolve_global_skill_is_shared_by_default_profile(skills_root: Path):
-    # Canonical semantics: the default profile's home IS the hermes root, so
-    # global-root skills resolve for the default profile too (mirrors
-    # operator_skills._find_skill_dir("default", ...)).
-    res = sres.resolve_skill("global-skill", skills_root)
-    assert res.resolvable is True
-    assert res.scope == "mixed"  # global root + default profile alias
-    assert res.profiles == ("default",)
-    assert any(p.startswith(str(skills_root / "skills")) for p in res.found_paths)
-
-
-def test_resolve_unknown_skill_unresolvable(skills_root: Path):
-    res = sres.resolve_skill("does-not-exist", skills_root)
-    assert res.resolvable is False
-    assert res.scope == ""
-    assert res.found_paths == ()
-
-
-def test_resolve_invalid_name_rejected(skills_root: Path):
-    with pytest.raises(ValueError):
-        sres.resolve_skill("Not Valid", skills_root)
-
-
-# ---------------------------------------------------------------------------
-# Two-stage validation
-# ---------------------------------------------------------------------------
-
-
-def test_stage1_unknown_skill_lists_available(skills_root: Path):
-    with pytest.raises(sres.SkillNotFoundError) as ei:
-        sres.validate_required_skills(["code-review", "ghost"], skills_root)
-    assert "ghost" in str(ei.value)
-    assert "code-review" in str(ei.value)  # actionable: what exists
-
-
-def test_stage1_known_skills_pass(skills_root: Path):
-    sres.validate_required_skills(["code-review", "global-skill"], skills_root)
-
-
-def test_stage2_assignee_without_skill_names_resolvers(skills_root: Path):
-    with pytest.raises(sres.SkillNotResolvableForAssigneeError) as ei:
-        sres.validate_assignee_skills("qa", ["code-review"], skills_root)
-    assert ei.value.assignee == "qa"
-    assert ei.value.skill == "code-review"
-    assert "dev" in str(ei.value)  # profiles that DO resolve it
-
-
-def test_stage2_global_skill_unresolvable_for_qa_names_default(skills_root: Path):
-    with pytest.raises(sres.SkillNotResolvableForAssigneeError) as ei:
-        sres.validate_assignee_skills("qa", ["global-skill"], skills_root)
-    # The default profile shares the global root, so it is the resolver named.
-    assert "default" in str(ei.value)
-
-
-def test_stage2_controller_personas_pass_through(skills_root: Path):
-    sres.validate_assignee_skills("owner", ["code-review"], skills_root)
-    sres.validate_assignee_skills("tony", ["ghost-skill-actually-unresolvable"], skills_root)
-
-
-def test_stage2_owning_profile_passes(skills_root: Path):
-    sres.validate_assignee_skills("dev", ["code-review"], skills_root)
-
-
-# ---------------------------------------------------------------------------
-# Pure placement gate
-# ---------------------------------------------------------------------------
-
-
-def _target(eid: str, **kw):
-    base = {
-        "entity_id": eid,
-        "kind": kw.pop("kind", "profile"),
-        "name": kw.pop("name", eid.split(":")[-1]),
-        "authorization_ceiling": "reversible_write",
-        "allowed_profiles": kw.pop("allowed_profiles", ["dev"]),
-        "enabled": True,
-        "reachable": True,
-        "identity_configured": True,
-    }
-    base.update(kw)
-    return base
-
-
-def _req(**kw):
-    base = {
-        "profile": "dev",
-        "skills": [],
-        "authorization_class": "reversible_write",
-    }
-    base.update(kw)
-    return base
-
-
-def test_hard_filter_zero_skill_target_rejected_when_skills_required():
-    v = pl.score_targets(
-        _req(skills=["code-review"]),
-        [
-            _target("profile:dev", skills=["code-review"]),
-            _target("profile:qa", skills=[]),
-            _target("fabric:node-a", kind="fabric_node", features=["fabric-execute"]),
-        ],
-    )
-    assert v["filter_optouts"]["profile:qa"] == ["required_skills_missing"]
-    assert v["filter_optouts"]["fabric:node-a"] == ["required_skills_missing"]
-    assert v["candidate_set"][0]["entity_id"] == "profile:dev"
-
-
-def test_hard_filter_no_skills_requirement_keeps_fabric_placeable():
-    v = pl.score_targets(
-        _req(),
-        [
-            _target("profile:dev", skills=["code-review"]),
-            _target("fabric:node-a", kind="fabric_node", features=["fabric-execute"]),
-        ],
-    )
-    ids = {c["entity_id"] for c in v["candidate_set"]}
-    assert ids == {"profile:dev", "fabric:node-a"}
-
-
-# ---------------------------------------------------------------------------
-# Stage 1 through hermes_plan_create
-# ---------------------------------------------------------------------------
-
-
-def _seed_mission(root: Path, mid: str = "msn-skills") -> None:
-    spec = {
-        "schema": mission.MISSION_SPEC_SCHEMA,
-        "mission_id": mid,
-        "title": "t",
-        "objective": "o",
-        "owner_profile": "default",
-        "acceptance_criteria": ["a"],
-        "context_refs": [],
-        "skills": [],
-        "final_approval_required": True,
-    }
-    out = json.loads(
-        mission.hermes_mission_create(
-            json.dumps(spec), confirm=True, dry_run=False, hermes_root=root
+def _skill(
+    root: Path,
+    relative: str,
+    *,
+    name: str | None = None,
+    frontmatter_extra: str = "",
+) -> Path:
+    directory = root / relative
+    directory.mkdir(parents=True, exist_ok=True)
+    frontmatter = ""
+    if name is not None:
+        frontmatter = (
+            f"---\nname: {name}\ndescription: test skill\n{frontmatter_extra}---\n"
         )
-    )
-    assert out["success"] is True, out
-
-
-def _dag(mid: str, profile: str, skills: list[str]) -> str:
-    return json.dumps(
-        {
-            "schema": plan.PLAN_SCHEMA,
-            "mission_id": mid,
-            "version": 1,
-            "decomposition": "operator-provided",
-            "objective": "o",
-            "nodes": [
-                {
-                    "node_id": "a",
-                    "kind": "single",
-                    "owner": profile,
-                    "parents": [],
-                    "objective": "node objective",
-                    "capability_req": {
-                        "profile": profile,
-                        "skills": skills,
-                        "authorization_class": "reversible_write",
-                    },
-                    "budget": {"est_minutes": 5, "est_tokens": 100},
-                    "expected_artifacts": ["evidence.json"],
-                }
-            ],
-        }
-    )
-
-
-def test_plan_create_rejects_unknown_skill_with_code(skills_root: Path):
-    _seed_mission(skills_root)
-    out = json.loads(
-        plan.hermes_plan_create(
-            "msn-skills",
-            _dag("msn-skills", "dev", ["ghost-skill"]),
-            confirm=True,
-            dry_run=False,
-            hermes_root=skills_root,
-        )
-    )
-    assert out["success"] is False
-    assert out["code"] == "SKILL_NOT_FOUND"
-    assert "ghost-skill" in out["safe_message"]
-    assert "code-review" in out["safe_message"]  # actionable listing
-
-
-def test_plan_create_accepts_resolvable_skills(skills_root: Path):
-    _seed_mission(skills_root)
-    out = json.loads(
-        plan.hermes_plan_create(
-            "msn-skills",
-            _dag("msn-skills", "dev", ["code-review", "global-skill"]),
-            confirm=True,
-            dry_run=False,
-            hermes_root=skills_root,
-        )
-    )
-    assert out["success"] is True, out
-
-
-def test_plan_create_dry_run_also_fails_closed(skills_root: Path):
-    _seed_mission(skills_root)
-    out = json.loads(
-        plan.hermes_plan_create(
-            "msn-skills",
-            _dag("msn-skills", "dev", ["ghost-skill"]),
-            confirm=False,
-            dry_run=True,
-            hermes_root=skills_root,
-        )
-    )
-    assert out["success"] is False
-    assert out["code"] == "SKILL_NOT_FOUND"
-
-
-# ---------------------------------------------------------------------------
-# Stage 2 through hermes_placement_score (assignment + reassignment)
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def seeded_db(skills_root: Path) -> Path:
-    """missions.db with msn-skills + two nodes: a (dev, ok) and b (qa, fails)."""
-    _seed_mission(skills_root)
-    path = mission._db_path(skills_root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    nodes = [
-        ("a", "dev", ["code-review"]),
-        ("b", "qa", ["code-review"]),
-    ]
-    now = "2026-01-01T00:00:00+00:00"
-    with plan._connect(path, write=True) as db:
-        plan._begin_write(db)
-        db.execute(
-            "INSERT INTO mission_plans(mission_id, plan_json, version, status, plan_sha256, decomposition, created_at, updated_at) "
-            "VALUES(?,?,?,?,?,?,?,?)",
-            (
-                "msn-skills",
-                json.dumps({"nodes": [{"node_id": n, "kind": "single", "owner": p} for n, p, _ in nodes]}),
-                1,
-                "approved",
-                "0" * 64,
-                "test",
-                now,
-                now,
-            ),
-        )
-        for node_id, profile, skills in nodes:
-            db.execute(
-                "INSERT INTO plan_nodes(mission_id, node_id, contract_sha256, capability_req, budget, deps, state, lease_lock, lease_expires, epoch, failure_kind, retries, created_at, updated_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    "msn-skills",
-                    node_id,
-                    "0" * 64,
-                    json.dumps(
-                        {
-                            "profile": profile,
-                            "skills": skills,
-                            "authorization_class": "reversible_write",
-                        }
-                    ),
-                    json.dumps({"est_minutes": 5, "est_tokens": 100}),
-                    "[]",
-                    "pending",
-                    "",
-                    "",
-                    0,
-                    "",
-                    0,
-                    now,
-                    now,
-                ),
-            )
-        db.commit()
+    path = directory / "SKILL.md"
+    path.write_text(frontmatter + "# test\n", encoding="utf-8")
     return path
 
 
-def test_placement_score_resolving_profile_succeeds(seeded_db: Path, skills_root: Path):
-    out = json.loads(
-        pl.hermes_placement_score("msn-skills", "a", hermes_root=skills_root)
-    )
-    assert out["classification"] == pl.CLASS_ASSIGNED
-
-
-def test_placement_score_assignee_without_skill_rejected(
-    seeded_db: Path, skills_root: Path
+def test_profile_resolution_distinguishes_global_existence_from_profile_loadability(
+    tmp_path: Path,
 ):
-    out = json.loads(
-        pl.hermes_placement_score("msn-skills", "b", hermes_root=skills_root)
+    root = tmp_path / "hermes"
+    _skill(root / "skills", "default-only", name="default-only")
+    _skill(root / "profiles" / "dev" / "skills", "dev-only", name="dev-only")
+
+    catalog = resolution.build_catalog(root)
+    resolved = resolution.resolve_name("default-only", catalog)
+
+    assert resolved.exists is True
+    assert resolved.defined_in == ("default",)
+    assert resolved.available_to == ("default",)
+
+    rejection = resolution.validate_required_skills(
+        "dev", ["default-only"], root, catalog=catalog
     )
-    assert out["success"] is False
-    assert out["code"] == "SKILL_NOT_RESOLVABLE_FOR_ASSIGNEE"
-    assert "qa" in out["safe_message"]
-    assert "dev" in out["safe_message"]  # where it IS resolvable
-    # Reassignment semantics: every re-run of the placement surface
-    # revalidates, so repeated scoring keeps failing closed (no mutation).
-    again = json.loads(
-        pl.hermes_placement_score("msn-skills", "b", hermes_root=skills_root)
-    )
-    assert again["code"] == "SKILL_NOT_RESOLVABLE_FOR_ASSIGNEE"
-    # Fail-closed means no placement decision was recorded (write-mode connect
-    # initializes the table; assert it stays empty).
-    with pl._connect(pl._db_path(skills_root), write=True) as db:
-        rows = db.execute("SELECT * FROM placement_decisions").fetchall()
-    assert rows == []
+    assert rejection is not None
+    assert rejection["error"] == resolution.ERROR_NOT_RESOLVABLE
+    assert rejection["skills"][0]["available_profiles"] == ["default"]
 
 
-# ---------------------------------------------------------------------------
-# Review-fix regressions (attempt e5f4ae67): grammar parity, observed
-# found_paths, recursive placement view, plan_validate stage-1
-# ---------------------------------------------------------------------------
+def test_resolution_reports_missing_skill_separately(tmp_path: Path):
+    root = tmp_path / "hermes"
+    _skill(root / "profiles" / "dev" / "skills", "dev-only", name="dev-only")
+
+    rejection = resolution.validate_required_skills("dev", ["ghost-skill"], root)
+
+    assert rejection is not None
+    assert rejection["error"] == resolution.ERROR_NOT_FOUND
+    assert rejection["skills_not_found"] == ["ghost-skill"]
 
 
-def test_grammar_parity_with_operator_skills(skills_root: Path):
-    # operator_skills' grammar (dots/underscores, cap 64) is imported
-    # verbatim; anything the executor accepts resolves here.
-    for rel in ("web.search", "data_viz", "kb-translate.v2"):
-        p = skills_root / "profiles" / "dev" / "skills" / rel / "SKILL.md"
-        p.parent.mkdir(parents=True)
-        p.write_text("# s\n")
-    assert sres.SKILL_NAME_RE is operator_skills._VALID_NAME_RE
-    names = sres.profile_skills("dev", skills_root)
-    for rel in ("web.search", "data_viz", "kb-translate.v2"):
-        assert rel in names
-    assert sres.resolve_skill("web.search", skills_root).resolvable is True
-
-
-def test_name_longer_than_executor_cap_rejected(skills_root: Path):
-    # operator_skills caps names at 64 chars; the resolver must not accept a
-    # name the executor would reject.
-    with pytest.raises(ValueError):
-        sres.resolve_skill("a" * 65, skills_root)
-
-
-def test_found_paths_report_observed_directories(skills_root: Path):
-    # found_paths must be OBSERVED SKILL.md dirs (nested walk), never the
-    # fabricated root/name join.
-    res = sres.resolve_skill("nested-review", skills_root)
-    assert res.resolvable is True
-    assert res.found_paths == (
-        str(skills_root / "profiles" / "dev" / "skills" / "grouping" / "nested-review"),
+def test_nested_frontmatter_skill_uses_same_profile_semantics(tmp_path: Path):
+    root = tmp_path / "hermes"
+    _skill(
+        root / "profiles" / "dev" / "skills",
+        "category/nested-directory",
+        name="nested-skill",
     )
 
+    catalog = resolution.build_catalog(root)
+    resolved = resolution.resolve_name("nested-skill", catalog)
 
-def test_placement_target_view_is_recursive(skills_root: Path):
-    # Dead-zone regression: a nested-only skill must keep a capable profile
-    # target placeable (manifest-load enriches with the resolver walk).
-    targets = pl.load_manifest_targets(skills_root)
-    dev = [t for t in targets if t["kind"] == "profile" and t["name"] == "dev"]
-    assert dev, "expected a profile target for dev"
-    assert "nested-review" in dev[0]["skills"]
-    verdict = pl.score_targets(
-        _req(profile="dev", skills=["nested-review"]), targets
+    assert resolved.defined_in == ("dev",)
+    assert resolution.validate_required_skills("dev", ["nested-skill"], root) is None
+    assert [entry.name for entry in resolution.profile_skill_entries("dev", root)] == [
+        "nested-skill"
+    ]
+
+
+class _StubSkillsTool:
+    """Agent-loader-shaped stub: empty catalog, explicit-load authority."""
+
+    def __init__(self, loadable: dict[str, str]):
+        self._loadable = loadable
+
+    def _find_all_skills(self):
+        return []
+
+    def skill_view(self, name, file_path=None, task_id=None, preprocess=True):
+        requested = str(name).strip()
+        if requested in self._loadable:
+            return json.dumps(
+                {
+                    "success": True,
+                    "name": requested,
+                    "description": self._loadable[requested],
+                    "content": "# stub\n",
+                    "path": f"{requested}/SKILL.md",
+                }
+            )
+        return json.dumps(
+            {"success": False, "error": f"Skill '{requested}' not found."}
+        )
+
+    def skill_matches_platform(self, frontmatter):
+        return True
+
+    def _is_skill_disabled(self, name):
+        return False
+
+
+def test_validation_probe_does_not_execute_inline_shell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Validation must call skill_view(..., preprocess=False).
+
+    Hermes' default ``preprocess=True`` runs ``!`cmd``` snippets when
+    ``skills.inline_shell`` is enabled. The stub treats preprocess as that
+    execution gate: True writes a sentinel, False does not.
+    """
+    sentinel = tmp_path / "inline-shell-executed"
+    root = tmp_path / "hermes"
+    (root / "profiles" / "dev").mkdir(parents=True)
+    seen: list[bool] = []
+
+    class _InlineShellSkillsTool(_StubSkillsTool):
+        def skill_view(self, name, file_path=None, task_id=None, preprocess=True):
+            seen.append(bool(preprocess))
+            if preprocess:
+                sentinel.write_text("executed", encoding="utf-8")
+            return super().skill_view(name, file_path=file_path, task_id=task_id, preprocess=preprocess)
+
+    monkeypatch.setattr(resolution, "_skill_loader_override", None)
+    stub = _InlineShellSkillsTool({"payload": "has !`cmd`"})
+    monkeypatch.setattr(resolution, "_require_agent_modules", lambda: (stub, object()))
+
+    assert resolution.validate_required_skills("dev", ["payload"], root) is None
+    assert seen == [False]
+    assert not sentinel.exists()
+
+
+def test_plugin_qualified_skill_resolves_via_explicit_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Plugin skills must resolve via the explicit-load path, not the catalog.
+
+    The stub catalog is empty (what the old ``_find_all_skills``-only gate
+    saw); the explicit probe serves ``myplugin:myskill``. The gate accepts.
+    """
+    root = tmp_path / "hermes"
+    (root / "profiles" / "dev").mkdir(parents=True)
+    monkeypatch.setattr(resolution, "_skill_loader_override", None)
+    stub = _StubSkillsTool({"myplugin:myskill": "plugin-provided skill"})
+    monkeypatch.setattr(
+        resolution, "_require_agent_modules", lambda: (stub, object())
     )
-    assert verdict["candidate_set"], "nested-skill target must stay placeable"
+
+    assert (
+        resolution.validate_required_skills("dev", ["myplugin:myskill"], root) is None
+    )
 
 
-def test_plan_validate_rejects_unresolvable_skill(skills_root: Path, monkeypatch):
-    # validate consumes stage-1 too, so validate and create cannot disagree.
-    monkeypatch.setenv("HERMES_HOME", str(skills_root))
-    out = json.loads(plan.hermes_plan_validate(_dag("msn-skills", "dev", ["ghost-skill"])))
-    assert out["success"] is False
-    assert out["code"] == "SKILL_NOT_FOUND"
+def test_bare_plugin_short_name_is_not_invented(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Bare short names of plugin skills stay rejected (qualified form only)."""
+    root = tmp_path / "hermes"
+    (root / "profiles" / "dev").mkdir(parents=True)
+    monkeypatch.setattr(resolution, "_skill_loader_override", None)
+    stub = _StubSkillsTool({"myplugin:myskill": "plugin-provided skill"})
+    monkeypatch.setattr(
+        resolution, "_require_agent_modules", lambda: (stub, object())
+    )
+
+    rejection = resolution.validate_required_skills("dev", ["myskill"], root)
+    assert rejection is not None
+    assert rejection["error"] == resolution.ERROR_NOT_FOUND
 
 
-def test_plan_validate_accepts_resolvable_plan(skills_root: Path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(skills_root))
-    out = json.loads(plan.hermes_plan_validate(_dag("msn-skills", "dev", ["nested-review"])))
-    assert out["success"] is True
-    assert out["valid"] is True
+def test_loader_unavailable_is_distinct_from_not_found(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Import/discovery failures fail closed, never as ``skill_not_found``."""
+
+    def _down():
+        raise resolution._LoaderUnavailable("no Agent checkout")
+
+    monkeypatch.setattr(resolution, "_skill_loader_override", None)
+    monkeypatch.setattr(resolution, "_require_agent_modules", _down)
+    root = tmp_path / "hermes"
+
+    rejection = resolution.validate_required_skills("dev", ["any-skill"], root)
+    assert rejection is not None
+    assert rejection["error"] == resolution.ERROR_UNAVAILABLE
+
+    with pytest.raises(resolution.SkillRequirementsError) as excinfo:
+        resolution.require_required_skills("dev", ["any-skill"], root)
+    assert excinfo.value.rejection["error"] == resolution.ERROR_UNAVAILABLE
 
 
-# --- rm-053 F1: grammar parity between resolver and executor -----------------
-#
-# assess F1 (run cbd4463370ee): the resolver used to strip skill names before
-# validating them, so a whitespace-padded declaration passed stage 1 + stage 2
-# and only failed later at the executor (operator_skills), which validates the
-# raw string. The fix removes the strip (fail-closed at the earliest gate) and
-# aligns both validators on the same pattern with the same match mode, so the
-# two grammars are byte-identical.
+def test_environment_filtered_skill_matches_explicit_preload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """``environments:`` hides a skill from offer surfaces but not the gate.
 
-_PADDLED_NAMES = [
-    " padded-skill",
-    "padded-skill ",
-    " padded-skill ",
-    "\tpadded-skill",
-    "padded-skill\n",
-    "padded skill",
-    "Padded-Skill",
-]
+    ``s6`` is inactive on dev/test hosts, so ``_find_all_skills`` filters the
+    skill out while ``skill_view`` (and therefore ``--skills``) still loads it.
+    The gate must follow the explicit load and accept.
+    """
+    _use_real_loader(monkeypatch)
+    root = tmp_path / "hermes"
+    _skill(
+        root / "profiles" / "dev" / "skills",
+        "env-only",
+        name="env-only",
+        frontmatter_extra="environments: [s6]\n",
+    )
 
-_VALID_NAMES = ["padded-skill", "a", "global-skill", "dev-nested.nested_review-1"]
-
-
-@pytest.mark.parametrize("name", _PADDLED_NAMES)
-def test_grammar_parity_rejects_padded_and_cased_names(name: str):
-    # Both validators must reject: neither may accept what the other rejects.
-    with pytest.raises(ValueError):
-        sres.validate_skill_name(name)
-    with pytest.raises(ValueError):
-        operator_skills._validate_skill_name(name)
+    assert "env-only" not in [
+        entry.name for entry in resolution.profile_skill_entries("dev", root)
+    ]
+    ok, _detail = resolution._explicit_load_ok("dev", "env-only", root)
+    assert ok is True
+    assert resolution.validate_required_skills("dev", ["env-only"], root) is None
 
 
-@pytest.mark.parametrize("name", _VALID_NAMES)
-def test_grammar_parity_accepts_valid_names_unchanged(name: str):
-    # The resolver returns the name UNCHANGED (no silent normalization).
-    assert sres.validate_skill_name(name) == name
-    assert operator_skills._validate_skill_name(name) == name
+def test_disabled_skill_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _use_real_loader(monkeypatch)
+    root = tmp_path / "hermes"
+    _skill(root / "profiles" / "dev" / "skills", "gated", name="gated")
+    assert resolution.validate_required_skills("dev", ["gated"], root) is None
+
+    config = root / "profiles" / "dev" / "config.yaml"
+    config.write_text("skills:\n  disabled:\n    - gated\n", encoding="utf-8")
+
+    rejection = resolution.validate_required_skills("dev", ["gated"], root)
+    assert rejection is not None
+    assert rejection["error"] in (
+        resolution.ERROR_NOT_FOUND,
+        resolution.ERROR_NOT_RESOLVABLE,
+    )
 
 
-def test_resolver_no_longer_strips_before_validating():
-    # Regression guard for the exact assess-F1 mechanics: stripping would have
-    # turned " padded-skill " into a resolvable "padded-skill" here.
-    with pytest.raises(ValueError, match="padded-skill"):
-        sres.validate_skill_name(" padded-skill ")
+def test_removed_skill_rejected_after_delete_and_with_stale_catalog(tmp_path: Path):
+    """A skill removed between planning and dispatch fails the live check."""
+    root = tmp_path / "hermes"
+    skill_dir = root / "profiles" / "dev" / "skills" / "ephemeral"
+    _skill(root / "profiles" / "dev" / "skills", "ephemeral", name="ephemeral")
+    assert resolution.validate_required_skills("dev", ["ephemeral"], root) is None
+
+    planning_catalog = resolution.build_catalog(root)
+    assert resolution.resolve_name("ephemeral", planning_catalog).exists is True
+
+    for child in sorted(skill_dir.rglob("*")):
+        if child.is_file():
+            child.unlink()
+
+    fresh = resolution.validate_required_skills("dev", ["ephemeral"], root)
+    assert fresh is not None
+    assert fresh["error"] == resolution.ERROR_NOT_FOUND
+
+    stale = resolution.validate_required_skills(
+        "dev", ["ephemeral"], root, catalog=planning_catalog
+    )
+    assert stale is not None
+    assert stale["error"] == resolution.ERROR_NOT_RESOLVABLE
+    assert "explicit-load" in stale["skills"][0]["reason"]
 
 
-def test_plan_validate_rejects_padded_skill_declaration(skills_root, monkeypatch):
-    # End to end: a padded declaration now fails closed at stage 1 (schema
-    # validation), instead of passing validation and failing at dispatch time.
-    monkeypatch.setenv("HERMES_HOME", str(skills_root))
-    out = json.loads(plan.hermes_plan_validate(_dag("msn-padded", "dev", [" padded-skill"])))
-    assert out["success"] is False
+def test_cross_profile_reassignment_with_existing_skill_rejected(tmp_path: Path):
+    """Profile A -> profile B with an existing skill rejects with provenance."""
+    root = tmp_path / "hermes"
+    _skill(root / "profiles" / "dev" / "skills", "only-dev", name="only-dev")
+    (root / "profiles" / "prod").mkdir(parents=True)
+
+    rejection = resolution.validate_required_skills("prod", ["only-dev"], root)
+    assert rejection is not None
+    assert rejection["error"] == resolution.ERROR_NOT_RESOLVABLE
+    assert rejection["skills"][0]["available_profiles"] == ["dev"]
+
+
+def test_real_loader_roundtrip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """At least one test exercises the real Hermes Agent loader end to end."""
+    _use_real_loader(monkeypatch)
+    root = tmp_path / "hermes"
+    _skill(root / "profiles" / "dev" / "skills", "real", name="real")
+
+    skills_tool, _constants = resolution._require_agent_modules()
+    assert callable(getattr(skills_tool, "skill_view", None))
+
+    ok, _detail = resolution._explicit_load_ok("dev", "real", root)
+    assert ok is True
+    assert resolution.validate_required_skills("dev", ["real"], root) is None
+
+
+def test_rejected_validation_mutates_nothing(tmp_path: Path):
+    """A rejection leaves plan-adjacent state byte-identical (no mutation)."""
+    root = tmp_path / "hermes"
+    _skill(root / "profiles" / "dev" / "skills", "kept", name="kept")
+    sentinel = root / "profiles" / "dev" / "sentinel.txt"
+    sentinel.write_text("do-not-touch", encoding="utf-8")
+    before = {p: p.read_bytes() for p in sorted(root.rglob("*")) if p.is_file()}
+
+    rejection = resolution.validate_required_skills("dev", ["ghost-skill"], root)
+    assert rejection is not None
+
+    after = {p: p.read_bytes() for p in sorted(root.rglob("*")) if p.is_file()}
+    assert after == before

@@ -39,6 +39,7 @@ GATE_ENVS = [
     oauth_auth.OAUTH_SCOPE_ENV,
     server.TRUSTED_PROXY_IPS_ENV,
     server.ALLOWED_HOSTS_ENV,
+    server.op_autopilot.AUTOPILOT_ENV,
 ]
 
 
@@ -228,6 +229,12 @@ def test_terminal_timeout_is_capped_when_enabled(monkeypatch):
     assert captured["timeout"] == 120
 
 
+    monkeypatch.setattr(server, "terminal_tool", SimpleNamespace(terminal_tool=fake_terminal_tool))
+
+    assert server.hermes_run_command("echo ok", timeout=999) == "ok"
+    assert captured["timeout"] == 120
+
+
 def test_vision_analyze_is_disabled_by_default(monkeypatch):
     clear_gate_envs(monkeypatch)
     monkeypatch.setattr(server, "require_imports", lambda: None)
@@ -388,7 +395,8 @@ def test_http_asgi_app_exposes_confidential_oauth_and_protects_mcp(monkeypatch):
                 "redirect_uri": "https://chatgpt.com/connector/oauth/callback",
                 "scope": "openid hermes offline_access",
                 "resource": "https://mcp.example.com/mcp",
-                # PKCE (RFC 7636) is mandatory at the authorize endpoint.
+                # PKCE (RFC 7636) is mandatory at the authorize endpoint
+                # (fork hardening retained across the v0.13 adoption).
                 "code_challenge": base64.urlsafe_b64encode(
                     hashlib.sha256(b"a" * 64).digest()
                 ).rstrip(b"=").decode(),
@@ -1470,11 +1478,7 @@ def test_http_initialize_smoke(monkeypatch):
         errors="replace",
     )
     try:
-        # Do not assume a quiet runner: on a loaded shared self-hosted runner,
-        # spawning the server (uvicorn + full module import) can take well over
-        # 10s. Healthy startup still breaks on the first successful response;
-        # the generous deadline only tolerates slow process spawn under load.
-        deadline = time.time() + 60
+        deadline = time.time() + 10
         last_error = None
         response_text = None
         payload = {
@@ -1506,13 +1510,7 @@ def test_http_initialize_smoke(monkeypatch):
                 last_error = exc
                 time.sleep(0.25)
         if response_text is None:
-            stdout_tail = proc.stdout.read() if proc.stdout else ""
-            stderr_tail = proc.stderr.read() if proc.stderr else ""
-            raise AssertionError(
-                f"HTTP MCP server did not respond: {last_error}\n"
-                f"server stdout tail:\n{stdout_tail[-2000:]}\n"
-                f"server stderr tail:\n{stderr_tail[-2000:]}"
-            )
+            raise AssertionError(f"HTTP MCP server did not respond: {last_error}")
 
         parsed = json.loads(response_text)
         assert parsed["result"]["serverInfo"]["name"] == "hermes-gpt"
@@ -1603,7 +1601,7 @@ def test_v09_connector_surface_acceptance(monkeypatch):
     assert len(set(names)) == len(names), "duplicate tool registration"
 
     # serverInfo.version must track the checkout version, not the SDK version.
-    assert (built.version if hasattr(built, "version") else built._mcp_server.version) == versioning.VERSION == "0.12.0"
+    assert (built.version if hasattr(built, "version") else built._mcp_server.version) == versioning.VERSION == "0.13.0"
 
 
 def test_history_enabled_connector_surface_acceptance(monkeypatch):
@@ -1636,4 +1634,31 @@ def test_history_enabled_connector_surface_acceptance(monkeypatch):
         schema = enabled_by_name[name].model_dump(by_alias=True)["inputSchema"]
         assert schema["properties"]["profile"]["default"] == "default"
 
-    assert (enabled.version if hasattr(enabled, "version") else enabled._mcp_server.version) == versioning.VERSION == "0.12.0"
+    assert (enabled.version if hasattr(enabled, "version") else enabled._mcp_server.version) == versioning.VERSION == "0.13.0"
+
+
+AUTOPILOT_TOOLS = {"hermes_autopilot_start", "hermes_autopilot_status", "hermes_autopilot_stop"}
+
+
+def test_autopilot_tools_register_only_behind_their_machine_gate(monkeypatch):
+    clear_gate_envs(monkeypatch)
+    monkeypatch.setenv(server.op_finance.ENABLE_FINANCE_ENV, "1")
+    monkeypatch.setenv("HERMES_HOME", str(Path(server.__file__).resolve().parent))
+
+    default_names = tool_names(server.build_server())
+    assert len(default_names) == V09_CONNECTOR_TOOL_COUNT  # unchanged while the gate is unset
+    assert not AUTOPILOT_TOOLS & set(default_names)
+
+    monkeypatch.setenv(server.op_autopilot.AUTOPILOT_ENV, "1")
+    armed = server.build_server()
+    armed_names = tool_names(armed)
+    assert set(armed_names) - set(default_names) == AUTOPILOT_TOOLS
+    assert set(default_names) - set(armed_names) == set()
+    assert len(armed_names) == len(set(armed_names)) == V09_CONNECTOR_TOOL_COUNT + len(AUTOPILOT_TOOLS)
+
+    # The start tool exposes the full limit set with its documented defaults.
+    schema = tools_by_name(armed)["hermes_autopilot_start"].model_dump(by_alias=True)["inputSchema"]["properties"]
+    assert schema["max_concurrency"]["default"] == 3 and schema["max_replans"]["default"] == 2
+    assert schema["max_attempts_per_node"]["default"] == 3 and schema["max_runtime_seconds"]["default"] == 86400
+    assert schema["dry_run"]["default"] is True and schema["confirm"]["default"] is False
+
