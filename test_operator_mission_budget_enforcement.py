@@ -159,14 +159,23 @@ def _spool_lines(root: Path) -> list[dict]:
 def _store_fingerprint(root: Path) -> tuple:
     """Everything the enforcement path could touch, hashed for zero-write proofs.
 
-    Includes the WAL sidecar: budget/mission writes go through WAL, so a
-    write can land in ``-wal`` before the main db file changes.
+    The missions db is hashed via a logical dump (iterdump), NOT raw file
+    bytes: the store runs in WAL mode, and a background auto-checkpoint
+    (flushing ``-wal`` into the main db with zero logical writes) changes
+    the raw-byte digest of both files while leaving content identical —
+    a checkpoint racing the before/after reads was a hosted-CI flake
+    (2026-10-01..02, this test failing green code). A logical dump is
+    invariant under checkpoint/repack and still catches any real write.
     """
     h = __import__("hashlib").sha256()
     dbp = mission._db_path(root)
-    for p in (dbp, dbp.parent / (dbp.name + "-wal")):
-        if p.is_file():
-            h.update(p.read_bytes())
+    if dbp.is_file():
+        con = sqlite3.connect(f"file:{dbp}?mode=ro", uri=True)
+        try:
+            for line in con.iterdump():
+                h.update(line.encode())
+        finally:
+            con.close()
     spool = root / "missions" / "controller_attention_spool.jsonl"
     if spool.is_file():
         h.update(spool.read_bytes())
