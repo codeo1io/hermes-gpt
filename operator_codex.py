@@ -18,6 +18,7 @@ from uuid import uuid4
 
 import operator_job_supervisor as job_supervisor
 import operator_policy as op
+import operator_workspace as op_workspace
 
 ENABLE_CODEX_RUNNER_ENV = "HERMES_GPT_ENABLE_CODEX_RUNNER"
 ALLOW_CODEX_WRITE_ENV = "HERMES_GPT_ALLOW_CODEX_WRITE"
@@ -54,13 +55,12 @@ def _request_path(job_id: str, hermes_root: Path | None = None) -> Path:
 def _save_request(job_id: str, value: dict[str, Any], hermes_root: Path | None = None) -> None:
     path = _request_path(job_id, hermes_root)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    temp = path.with_suffix(path.suffix + ".tmp")
-    temp.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
-    try:
-        temp.chmod(0o600)
-    except OSError:
-        pass
-    temp.replace(path)
+    # Durable atomic write (rm-067): unique staging + fsync — the request
+    # envelope is read by the codex worker process, so a truncated file or
+    # a clobbered shared ".tmp" name is a real failure mode.
+    op_workspace._atomic_write_text(
+        path, json.dumps(value, ensure_ascii=False), mode=0o600
+    )
 
 
 def _safe_error(code: str, message: str, action: str) -> dict[str, Any]:
@@ -88,10 +88,7 @@ def _normalize_execution_mode(execution_mode: str) -> str | dict[str, Any]:
 
 def _save(meta: dict[str, Any], hermes_root: Path | None = None) -> None:
     path, _ = _paths(meta["job_id"], hermes_root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_suffix(".tmp")
-    temp.write_text(json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
-    temp.replace(path)
+    op_workspace._atomic_write_text(path, json.dumps(meta, indent=2, sort_keys=True))
 
 
 def _load(job_id: str, hermes_root: Path | None = None) -> dict[str, Any] | None:

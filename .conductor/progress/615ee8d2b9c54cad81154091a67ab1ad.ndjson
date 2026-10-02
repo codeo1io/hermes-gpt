@@ -1,0 +1,2 @@
+{"step":1,"ts":"2026-09-29T19:49:15Z","summary":"research done: upstream +8c skill delta unadopted; SDK 1.x EOL@1.30.0; 2.1 error/structured-output changes; 2026-07-28 GA stateless; RFC9728/8707 gap; actions 3 majors stale","touched":[]}
+{"step":2,"ts":"2026-09-29T19:50:19Z","summary":"phase_result JSON written+validated to spool; tracked tree untouched","touched":["/home/agent/.hermes/conductor-delegate-spool-infra-deploy/delegate/615ee8d2b9c54cad81154091a67ab1ad.json"]}

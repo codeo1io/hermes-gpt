@@ -1,0 +1,8 @@
+{"step":1,"ts":"2026-09-29T21:29:18Z","summary":"Reviewed B1 diff surface (20 modified + new test_server_tool_error_client_path.py) vs cycle goals","touched":[]}
+{"step":2,"ts":"2026-09-29T21:30:18Z","summary":"rm-077: clean_error->ToolError, 11 raise sites, mcp_compat fallback chain, 7 test migrations, no RuntimeError consumers","touched":[server.py,mcp_compat.py]}
+{"step":3,"ts":"2026-09-29T21:31:18Z","summary":"rm-080: _budget_would_pause fail-closed review; live probe invalid-id->True contradicts docstring","touched":[operator_controller.py]}
+{"step":4,"ts":"2026-09-29T21:32:18Z","summary":"rm-067: _atomic_write_bytes standard + adopter modes + fixed-.tmp sweep (only fabric_artifacts:226/597 left)","touched":[operator_workspace.py,token_store.py]}
+{"step":5,"ts":"2026-09-29T21:33:18Z","summary":"rm-082 setattr->plain assignment verified; uses co-locate; compound artifacts audited vs code","touched":[oauth_auth.py,CHANGELOG.md,ROADMAP.md,docs/maintenance-cycle-log.md]}
+{"step":6,"ts":"2026-09-29T21:34:18Z","summary":"Verification: ruff clean; mission-budget/token-store/skill-discovery green; SDK-1 lane 18/18; 2.x lane suites green","touched":[]}
+{"step":7,"ts":"2026-09-29T21:35:18Z","summary":"Findings consolidated (3 medium, 2 low); verdict NEEDS_CHANGES","touched":[]}
+{"step":8,"ts":"2026-09-29T21:36:18Z","summary":"phase_result JSON written to delegate spool","touched":[/home/agent/.hermes/conductor-delegate-spool-infra-deploy/delegate/889dc91819e241589643d5347f25d816.json]}

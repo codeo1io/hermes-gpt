@@ -26,6 +26,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import operator_workspace as op_workspace
+
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 try:
@@ -121,13 +123,18 @@ def _key_from_file(hermes_root: Path) -> bytes | None:
 
 
 def _write_key_file(hermes_root: Path, key: bytes) -> None:
+    """Durably replace the key file (operator_workspace._atomic_write_bytes).
+
+    Unique staging name + fsync-before-rename + pre-rename 0o600: a crash
+    cannot leave a truncated master key (which would make every stored
+    credential undecryptable), and concurrent writers — including
+    cross-process callers the ``_StoreLock`` does not cover — cannot clobber
+    each other's staging file the way the old fixed ``.tmp`` name could.
+    """
     d = _secrets_dir(hermes_root)
     d.mkdir(parents=True, exist_ok=True)
     path = key_file_path(hermes_root)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_bytes(key)
-    os.chmod(tmp, 0o600)
-    tmp.replace(path)
+    op_workspace._atomic_write_bytes(path, key, mode=0o600)
     try:
         os.chmod(path, 0o600)
     except OSError:
@@ -154,18 +161,15 @@ def _rotate_active_key(hermes_root: Path) -> dict[str, Any]:
         if _store_key_in_keyring(fresh):
             return {"outcome": "rotated", "source": "keyring"}
         return {"outcome": "failed", "source": "keyring"}
-    # key file (or nothing yet): rotate ATOMICALLY — generate and write the
-    # new key to a temp file, then rename over the old one. A failure at any
-    # point leaves the old key intact, so a reported rotation failure can
-    # truthfully say the old key remains active.
+    # key file (or nothing yet): rotate ATOMICALLY — write the new key to a
+    # uniquely named, fsynced staging file, then rename over the old one. A
+    # failure at any point removes the staging file and leaves the old key
+    # intact, so a reported rotation failure can truthfully say the old key
+    # remains active.
     try:
         fresh = secrets.token_bytes(32)
         path = key_file_path(hermes_root)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".new")
-        tmp.write_bytes(fresh)
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
+        op_workspace._atomic_write_bytes(path, fresh, mode=0o600)
     except Exception:
         return {"outcome": "failed", "source": "keyfile"}
     return {"outcome": "rotated", "source": "keyfile"}
@@ -240,10 +244,9 @@ def _write_envelope(hermes_root: Path, kid: str, plaintext: dict[str, Any], key:
     d = _secrets_dir(hermes_root)
     d.mkdir(parents=True, exist_ok=True)
     path = envelope_path(hermes_root)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(envelope, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.chmod(tmp, 0o600)
-    tmp.replace(path)
+    op_workspace._atomic_write_text(
+        path, json.dumps(envelope, ensure_ascii=False, indent=2), mode=0o600
+    )
     try:
         os.chmod(path, 0o600)
     except OSError:

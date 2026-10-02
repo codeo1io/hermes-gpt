@@ -25,7 +25,6 @@ Safety rules:
 from __future__ import annotations
 
 import json
-import os
 import re
 import shutil
 import time
@@ -33,6 +32,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import operator_policy as op
+import operator_workspace as op_workspace
 
 # ---------------------------------------------------------------------------
 # Key safety rules
@@ -327,10 +327,9 @@ def hermes_config_set(
 
         policy.require_mutation(dry_run)
         backup = _backup_file(path)
-        tmp = path.with_suffix(".yaml.tmp")
-        with open(tmp, "w", encoding="utf-8") as fh:
-            yaml.safe_dump(new_cfg, fh, sort_keys=False, default_flow_style=False)
-        os.replace(tmp, path)
+        op_workspace._atomic_write_text(
+            path, yaml.safe_dump(new_cfg, sort_keys=False, default_flow_style=False)
+        )
         result = {
             "success": True,
             "dry_run": False,
@@ -436,10 +435,7 @@ def hermes_config_patch(
 
         policy.require_mutation(dry_run)
         backup = _backup_file(path)
-        tmp = path.with_suffix(".yaml.tmp")
-        with open(tmp, "w", encoding="utf-8") as fh:
-            fh.write(new_content)
-        os.replace(tmp, path)
+        op_workspace._atomic_write_text(path, new_content)
         result = {
             "success": True,
             "dry_run": False,
@@ -612,10 +608,7 @@ def _write_env_key(env_path: Path, key: str, value: str) -> None:
         if out and out[-1].strip() != "":
             out.append("\n")
         out.append(new_line)
-    tmp = env_path.with_suffix(".env.tmp")
-    with open(tmp, "w", encoding="utf-8") as fh:
-        fh.writelines(out)
-    os.replace(tmp, env_path)
+    op_workspace._atomic_write_text(env_path, "".join(out))
 
 
 def hermes_env_set_nonsecret(

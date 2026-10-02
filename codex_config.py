@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import secrets
 import re
 import shutil
 import subprocess
@@ -164,9 +165,15 @@ def _write_direct(path: Path, argv: list[str], name: str = SERVER_NAME, toolset:
         return {"changed": False, "backup": None}
     path.parent.mkdir(parents=True, exist_ok=True)
     backup = _backup(path)
-    temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(updated, encoding="utf-8", newline="\n")
+    # rm-067: uniquely named, fsynced staging file (validated before the
+    # rename below) — a fixed ".{name}.tmp" let concurrent writers clobber
+    # each other's staging file, and a crash could leave it half-written.
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
     try:
+        with open(temporary, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(updated)
+            fh.flush()
+            os.fsync(fh.fileno())
         read_config(temporary)
         temporary.replace(path)
     finally:
@@ -237,9 +244,12 @@ def uninstall(*, project: bool = False, cwd: Path | None = None, name: str = SER
     if not removed:
         return {"ok": True, "changed": False, "config_path": str(path), "message": f"No {name} entry exists."}
     backup = _backup(path)
-    temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(updated, encoding="utf-8", newline="\n")
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
     try:
+        with open(temporary, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(updated)
+            fh.flush()
+            os.fsync(fh.fileno())
         if updated.strip():
             read_config(temporary)
         temporary.replace(path)

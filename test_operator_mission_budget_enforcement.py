@@ -614,3 +614,92 @@ def test_controller_seam_armed_enforces_on_pass(hermes_root, monkeypatch):
     # actions_taken records the enforcement for telemetry.
     actions = {a["action"] for a in result["actions_taken"]}
     assert "budget_enforce" in actions
+
+
+# ---------------------------------------------------------------------------
+# rm-080 regression: _budget_would_pause must fail CLOSED on corrupt data
+# ---------------------------------------------------------------------------
+
+
+def test_budget_would_pause_true_when_crossed_and_armed(hermes_root):
+    """Sanity anchor: a genuinely crossing, armed envelope reads True."""
+    _armed(hermes_root, "msn-b")
+    with budget._connect(budget._db_path(hermes_root), write=False) as db:
+        assert ctl._budget_would_pause(db, "msn-b") is True
+
+
+def test_budget_would_pause_false_for_missing_account(hermes_root):
+    """The documented no-budget outcomes still evaluate False."""
+    _make_mission(hermes_root, "msn-b")
+    with budget._connect(budget._db_path(hermes_root), write=False) as db:
+        assert ctl._budget_would_pause(db, "msn-b") is False
+
+
+def test_budget_would_pause_fails_closed_on_malformed_policy(hermes_root):
+    """rm-080: a malformed policy_json row reads as WOULD-PAUSE, not False.
+
+    Legacy behavior swallowed the parse error and returned False, silently
+    skipping the D3 breaker in the L2 pass. Fail-closed routes the pass into
+    enforce_budget_breaker, which surfaces BUDGET_ENFORCE_REJECTED.
+    """
+    _armed(hermes_root, "msn-b")
+    path = budget._db_path(hermes_root)
+    with sqlite3.connect(path) as db:
+        db.execute(
+            "UPDATE budget_accounts SET policy_json = ? WHERE mission_id = ?",
+            ("{not valid json", "msn-b"),
+        )
+        db.commit()
+    with budget._connect(path, write=False) as db:
+        assert ctl._budget_would_pause(db, "msn-b") is True
+
+
+def test_budget_would_pause_fails_closed_on_malformed_amounts(hermes_root):
+    """rm-080: non-numeric spend/quota on an existing row also reads True."""
+    _armed(hermes_root, "msn-b")
+    path = budget._db_path(hermes_root)
+    with sqlite3.connect(path) as db:
+        db.execute(
+            "UPDATE budget_accounts SET spend = ? WHERE mission_id = ?",
+            ("twelve-dollars", "msn-b"),
+        )
+        db.commit()
+    with budget._connect(path, write=False) as db:
+        assert ctl._budget_would_pause(db, "msn-b") is True
+
+
+def test_budget_would_pause_fails_closed_on_unreadable_store(hermes_root, tmp_path):
+    """rm-080: an unreadable (garbage) budget store reads as WOULD-PAUSE."""
+    garbage = tmp_path / "garbage-budget.db"
+    garbage.write_bytes(b"this is definitely not a sqlite database")
+    with budget._connect(garbage, write=False) as db:
+        assert ctl._budget_would_pause(db, "msn-b") is True
+
+
+def test_enforce_breaker_surfaces_diagnostic_on_malformed_policy(hermes_root):
+    """The downstream gate records an explicit rejection, not a silent skip."""
+    _armed(hermes_root, "msn-b")
+    _full_gates_on(pytest.MonkeyPatch())
+    path = budget._db_path(hermes_root)
+    with sqlite3.connect(path) as db:
+        db.execute(
+            "UPDATE budget_accounts SET policy_json = ? WHERE mission_id = ?",
+            ("{not valid json", "msn-b"),
+        )
+        db.commit()
+    out = _j(
+        budget.enforce_budget_breaker(
+            "msn-b", confirm=True, hermes_root=hermes_root
+        )
+    )
+    assert out["success"] is False
+    assert "BUDGET_ENFORCE_REJECTED" in json.dumps(out)
+
+
+def test_budget_would_pause_invalid_mission_id_is_fail_closed(tmp_path):
+    """Invalid mission ids cannot match a budget row, so the pause check fails closed (review pinning test)."""
+    store = tmp_path / "budget.sqlite3"
+    _write_budget_row(store)
+    assert (
+        _budget_would_pause(store, mission_id="not a valid mission id!!") is True
+    )

@@ -18,6 +18,7 @@ from starlette.testclient import TestClient
 
 import oauth_auth
 import server
+from mcp_compat import ToolError
 import versioning
 
 
@@ -180,7 +181,7 @@ def test_memory_write_actions_are_disabled_by_default(monkeypatch):
         SimpleNamespace(memory_tool=lambda **kwargs: "should not be called"),
     )
 
-    with pytest.raises(RuntimeError, match=server.ENABLE_MEMORY_WRITE_ENV):
+    with pytest.raises(ToolError, match=server.ENABLE_MEMORY_WRITE_ENV):
         server.hermes_memory(action="add", target="memory", content="x")
 
 
@@ -208,7 +209,7 @@ def test_terminal_direct_call_is_disabled_by_default(monkeypatch):
         SimpleNamespace(terminal_tool=lambda **kwargs: "should not be called"),
     )
 
-    with pytest.raises(RuntimeError, match=server.ENABLE_TERMINAL_ENV):
+    with pytest.raises(ToolError, match=server.ENABLE_TERMINAL_ENV):
         server.hermes_run_command("echo nope")
 
 
@@ -235,7 +236,7 @@ def test_vision_analyze_is_disabled_by_default(monkeypatch):
         vision_analyze_tool=lambda **kwargs: "should not be called",
     ))
 
-    with pytest.raises(RuntimeError, match=server.ENABLE_VISION_ENV):
+    with pytest.raises(ToolError, match=server.ENABLE_VISION_ENV):
         asyncio.run(server.hermes_vision_analyze(image_url="https://example.com/img.jpg"))
 
 
@@ -246,7 +247,7 @@ def test_web_search_is_disabled_by_default(monkeypatch):
         web_search_tool=lambda **kwargs: "should not be called",
     ))
 
-    with pytest.raises(RuntimeError, match=server.ENABLE_WEB_ENV):
+    with pytest.raises(ToolError, match=server.ENABLE_WEB_ENV):
         server.hermes_web_search(query="test")
 
 
@@ -257,7 +258,7 @@ def test_web_extract_is_disabled_by_default(monkeypatch):
         web_extract_tool=lambda **kwargs: "should not be called",
     ))
 
-    with pytest.raises(RuntimeError, match=server.ENABLE_WEB_ENV):
+    with pytest.raises(ToolError, match=server.ENABLE_WEB_ENV):
         asyncio.run(server.hermes_web_extract(urls=["https://example.com"]))
 
 

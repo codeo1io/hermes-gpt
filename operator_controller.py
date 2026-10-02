@@ -1761,13 +1761,25 @@ def _budget_would_pause(db: sqlite3.Connection, mission_id: str) -> bool:
     hard-block policy armed. Pure evaluation on the pass's own connection —
     no writes. Missions without a budget account (or stores without the
     budget tables) simply evaluate False.
+
+    Fail-closed for corrupt data: an account row that exists but cannot be
+    read or parsed (unreadable store, malformed ``policy_json``/spend/quota)
+    evaluates True so the pass routes into ``enforce_budget_breaker``, whose
+    own gate chain surfaces a ``BUDGET_ENFORCE_REJECTED`` error envelope in
+    the durable decision output. Only the documented "no budget feature"
+    outcomes (missing table, missing row, invalid mission id) stay False —
+    returning False on malformed data would silently skip the D3 hard-block.
     """
     try:
         if not op_mission_budget._account_table_exists(db):
             return False
         account = op_mission_budget._get_account_row(db, mission_id)
-    except (LookupError, ValueError, sqlite3.Error):
+    except LookupError:
         return False
+    except (ValueError, sqlite3.Error):
+        # Unreadable store/row with the budget feature present: route into
+        # enforce_budget_breaker, which surfaces BUDGET_ENFORCE_REJECTED.
+        return True
     try:
         policy_obj = json.loads(account["policy_json"])
         env = op_mission_budget._envelope_status(
@@ -1777,7 +1789,9 @@ def _budget_would_pause(db: sqlite3.Connection, mission_id: str) -> bool:
             op_mission_budget._would_block(env, policy_obj)["would_pause"]
         )
     except (ValueError, TypeError, KeyError, json.JSONDecodeError):
-        return False
+        # Malformed policy/amounts on an existing row: route into
+        # enforce_budget_breaker, which surfaces BUDGET_ENFORCE_REJECTED.
+        return True
 
 
 def reconcile_pass(
