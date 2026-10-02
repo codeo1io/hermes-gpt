@@ -1,6 +1,6 @@
 # Operator Mode for Hermes GPT
 
-Operator Mode is the policy-gated control plane for trusted MCP clients such as ChatGPT. This document describes the current v0.12.0 behavior, including the durable Mission lifecycle, unified delegation lineage, live-event bus, and Fabric-backed cross-machine Swarm execution, plus the vNext slice-1 additive surfaces (MissionPlan DAG, derived capability-manifest / mission-ledger views, budget envelope, placement scoring, failure classification + recovery matrix, and the shadow/observe mission controller) and the vNext slice-2 gated execution rungs (budget D3 hard-block enforcement behind `HERMES_GPT_BUDGET_HARD_BLOCK=1`, and the controller L2 rung behind `HERMES_GPT_CONTROLLER_EXECUTE=1`). The slice-1 surfaces are decision-only; the slice-2 rungs are default-off, add no tools, and keep every existing surface byte-identical until their gates are armed. They are documented further in [vnext-capability-manifest-and-mission-ledger.md](vnext-capability-manifest-and-mission-ledger.md) and [design/](design/).
+Operator Mode is the policy-gated control plane for trusted MCP clients such as ChatGPT. This document describes the current v0.13.0 behavior, including the durable Mission lifecycle, unified delegation lineage, live-event bus, and Fabric-backed cross-machine Swarm execution, plus the vNext slice-1 additive surfaces (MissionPlan DAG, derived capability-manifest / mission-ledger views, budget envelope, placement scoring, failure classification + recovery matrix, and the shadow/observe mission controller) and the vNext slice-2 gated execution rungs (budget D3 hard-block enforcement behind `HERMES_GPT_BUDGET_HARD_BLOCK=1`, and the controller L2 rung behind `HERMES_GPT_CONTROLLER_EXECUTE=1`). The slice-1 surfaces are decision-only; the slice-2 rungs are default-off, add no tools, and keep every existing surface byte-identical until their gates are armed. They are documented further in [vnext-capability-manifest-and-mission-ledger.md](vnext-capability-manifest-and-mission-ledger.md) and [design/](design/).
 
 For documentation authority and historical-artifact rules, see [docs/README.md](README.md).
 
@@ -104,23 +104,6 @@ $env:HERMES_GPT_OWNER_ACK="I_UNDERSTAND_THIS_CAN_MUTATE_MY_MACHINE"
 
 Configured `owner` authority is clamped unless the Owner activation and exact acknowledgement are present. Owner Mode still cannot access denied secret paths.
 
-### Owner command scratch directory
-
-On non-Windows hosts, before the Owner direct-command surface
-(`hermes_owner_run_command`) executes a command, the process's scratch
-environment (`TMPDIR`, `TEMP`, `TMP`) is pointed at a dedicated tree so
-pytest/tempfile/build scratch from delegated subprocesses lands in one
-janitorable place instead of shared `/tmp`:
-
-```text
-HERMES_GPT_OPERATOR_TMPDIR=<absolute-path>   # default: ~/.hermes/tmp/operator
-```
-
-The directory is created with mode `0700` (and re-chmodded `0700` if it
-already exists). It can be cleared safely while no owner command is running;
-nothing durable is stored there: entries older than 7 days are pruned
-automatically (best-effort, at most hourly per process).
-
 Do not use Owner Mode for a public, shared, or always-on connector.
 
 ## Dry-run and confirmation semantics
@@ -188,19 +171,6 @@ Do not describe the unset state as deny-by-default. The implementation deliberat
 
 Mission Control requires only `read_only` authority and never needs direct apply mode.
 
-## Skill validation gates (plans and placement)
-
-Since the profile-aware skill-resolution slice, Mission Plan and placement surfaces enforce fail-closed skill validation in two stages. Canonical module: `operator_skill_resolution.py`.
-
-- **Stage 1 — plan create/validate and plan readiness:** every skill declared in a node's `capability_req.skills` must resolve somewhere (the global skills root or any profile's `skills/` directory). A declared skill that exists nowhere fails the operation with `skill_not_found`; plan readiness additionally requires every declared parent node to exist and be completed.
-- **Stage 2 — placement scoring:** `hermes_placement_score` hard-rejects an assignee profile that cannot resolve a required skill (`skill_not_resolvable_for_assignee`), listing the profiles where the skill is available. The check re-runs on every placement decision, so reassigning a node to a different profile revalidates before any mutation. The pure scoring core additionally hard-filters zero-skill targets when skills are required; Fabric-style targets with no skill list stay placeable for skill-less requirements.
-
-Skill names follow one shared grammar everywhere (resolver and executor alike): `^[a-z0-9][a-z0-9._-]*$`, at most 64 characters, matched against the raw string — whitespace-padded or upper-case names are rejected at stage 1 rather than normalized, so a name that passes validation is byte-identical to the name the skill executor will later run.
-
-The lower-case strings quoted above (`skill_not_found`, `skill_not_resolvable_for_assignee`) are the message-level prefixes raised by `operator_skill_resolution.py`. Tool-call error envelopes surface them under the `code` field in upper case: `SKILL_NOT_FOUND` from plan create/validate/readiness surfaces (`operator_mission_plan.py`), `SKILL_NOT_RESOLVABLE_FOR_ASSIGNEE` from placement scoring (`operator_placement.py`).
-
-`hermes_placement_candidates` returns the same candidate preview without the stage-2 assignee check (the scoring tool is the validating surface); controller personas (`owner`, `tony`) pass through stage 2 with local authority.
-
 ## Missions lifecycle (v0.9)
 
 Beyond the read-only Mission Control overview, v0.9 adds a first-class durable Mission object as the bounded parent record for a larger objective. A Mission groups an objective, acceptance criteria, bounded context references, an explicit skills manifest, Swarm/work/delegation attachments, lifecycle state, and a final Owner approval that defaults on.
@@ -245,6 +215,12 @@ Work Contracts add a structured, verifiable work-order layer through `hermes_con
 | `hermes_contract_dispatch(contract_json, confirm, dry_run)` | workspace | Dispatch a validated contract through the existing fleet authority model. |
 | `hermes_contract_validate(contract_json)` | read-only by default | Validate completion from observed evidence. |
 | `hermes_contract_status(contract_json)` | read-only | Link the contract to bounded observed run/delegation state. |
+
+For contracts that carry `capability_req`, dispatch revalidates the requested
+skills against the assigned profile's effective Hermes Agent loader immediately
+before invoking the runner. This is a live guard against profile changes after
+planning; rejection is non-mutating. Fabric eligibility remains separate from
+logical profile skill ownership.
 
 ### Validation model
 
@@ -300,6 +276,15 @@ Default caps, unless explicitly overridden by the supported environment variable
 - 3 concurrent stages per workflow;
 - 4 concurrent stages per board;
 - 12 stages per workflow.
+
+A Swarm stage may carry an optional `capability_req` with the logical profile and
+required skills. The generated Work Contract preserves that requirement, and
+dispatch revalidates it against the live Hermes Agent loader before invoking a
+runner. The probe uses `skill_view(..., preprocess=False)`, matching Hermes
+preload, so validating a required skill does not execute `skills.inline_shell`
+snippets. Removing a required skill after workflow creation therefore rejects the
+dispatch without starting work; Fabric remains a separate physical placement
+question.
 
 Failed validation can return a stage for one bounded rework retry. A second failure blocks the stage for human attention.
 
@@ -459,18 +444,17 @@ For Codex acting as an MCP client, use [docs/codex.md](codex.md). For the Window
 
 ## Audit behavior
 
-The audit log location is resolved per call, most-preferred first:
+Preferred audit path on Windows:
 
-1. `HERMES_HOME/logs/hermes_gpt_operator_audit.jsonl` — when `HERMES_HOME` is set; the value is normalized with `normalize_hermes_data_root` (install layouts like `.../hermes-agent` or `.../profiles/<p>` resolve to their data root), matching every other `HERMES_HOME` consumer;
-2. Windows state home: `%USERPROFILE%\AppData\Local\hermes\logs\hermes_gpt_operator_audit.jsonl`;
-3. POSIX state home: `~/.hermes/logs/hermes_gpt_operator_audit.jsonl`;
-4. last-resort fallback: `<hermes-gpt>\logs\hermes_gpt_operator_audit.jsonl` (package-local).
+```text
+%USERPROFILE%\AppData\Local\hermes\logs\hermes_gpt_operator_audit.jsonl
+```
 
-The first candidate whose parent directory exists wins. If no state home exists yet (fresh host), the platform state home — `AppData\Local\hermes` on Windows, `~/.hermes` elsewhere — is used rather than the package-local fallback, so first-run state lands in the same tree as tokens and ledgers; directories are created on first write. Tests may pin an explicit path via `set_audit_log_override`.
+Fallback:
 
-The log is append-only JSONL with size-capped rotation: once the active file reaches 5 MiB it is rotated to a single archived generation `hermes_gpt_operator_audit.jsonl.1` (the previous archive is replaced). Tail reads (`audit_tail`) parse only the final 512 KiB of the active file, while task reconciliation (`iter_audit_for_task`) scans the archive and the active file so pre-rotation records are not lost; if a legacy package-local audit log still exists (pre-rotation hosts), it is also read for task reconciliation so older evidence stays reachable after the state home takes over.
-
-Audit writes are best-effort: a failed write must never break the tool call. Failures are counted and surfaced through `audit_write_diagnostics()` and reported by `hermes_operator_doctor` as `AUDIT_WRITE_FAILURES` (`WARN`) instead of silently dropping audit evidence.
+```text
+<hermes-gpt>\logs\hermes_gpt_operator_audit.jsonl
+```
 
 Audit records contain bounded operational metadata such as tool, level, apply mode, dry-run state, changed/success state, relevant IDs, and length/hash metadata for content-bearing operations.
 
@@ -480,13 +464,9 @@ Audit records do not intentionally persist raw prompts, `.env` values, vault con
 
 ### `hermes_operator_doctor`
 
-Read-only deep health check across the Operator surface. Checks include gateway state, config/env readability, cron/skills, policy, audit readability, UI mount, long-running UI dispatch (`ui_cron_dispatch`), and connector capability.
-
-The `ui_cron_dispatch` check reads the in-memory dispatch registry of the process running the doctor call only. When the browser UI is served by a different process than the one executing `hermes_operator_doctor`, dispatches handled by that other process are invisible to this check — `0 active` there means "no dispatches in this process", not "none anywhere".
+Read-only deep health check across the Operator surface. Checks include gateway state, config/env readability, cron/skills, policy, audit readability, and connector capability.
 
 Gateway state is fail-closed: `hermes_operator_doctor` never reports the gateway as healthy on a heartbeat file alone. A heartbeat with no live gateway PID fails with `GATEWAY_PID_MISSING`; a dead PID fails with `GATEWAY_DEAD_PID`; an unreachable gateway fails with `GATEWAY_UNREACHABLE`. Stale heartbeat files surface as `GATEWAY_STALE_HEARTBEAT` warnings.
-
-The browser UI mount is checked too: when the UI is explicitly enabled (`HERMES_GPT_UI_ENABLED=1`) but its route mount fails (for example a broken or missing `ui_api` module), the failure is recorded as an audit record and a `ui_mount_failed` live event at boot, and the doctor reports it as `UI_MOUNT_FAILED` (`WARN`) instead of the server silently degrading to MCP-only with a single log line.
 
 Status vocabulary:
 
@@ -504,16 +484,6 @@ Returns one bounded current-state summary with a recommended next action.
 Conservative recovery planner. Dry-run is the default. Use `apply=false` first.
 
 Actual recovery mutation requires `apply=true` plus the normal direct/workspace policy gates.
-
-### Corrupt `jobs.json` recovery
-
-If a profile's cron `jobs.json` is unparseable (invalid JSON or non-UTF-8 bytes), cron reads treat the schedule as empty instead of crashing, and before the next write replaces the file the corrupt payload is preserved as `jobs.json.corrupt-<timestamp>` next to it (distinct payloads backed up within the same second get a `-N` suffix — glob `jobs.json.corrupt-*` to enumerate them). The sidecar's presence is the operator-visible signal: restore jobs from the sidecar (or delete it once inspected) with the normal profile file tools. Backups are best-effort and deduplicated — unchanged corrupt payloads are not backed up twice.
-
-### Schedule grammar and fire-time preview
-
-`hermes_cron_create` accepts interval (`30m`, `every 2h`), weekly/daily natural language (`every monday 9am`, `weekdays at 9am`, plural forms like `every mondays 9am` and mixed lists like `tuesdays and fri 8:30am`), 5-field cron expressions (`0 9 * * *`), one-shot delays (`in 30m`), and ISO timestamps. Interval schedules must be at least 1 minute — zero/negative intervals are rejected loudly (`Interval schedules must be at least 1 minute`) instead of being stored as a no-op/hot-loop `minutes: 0` job; use a one-shot `in <duration>` schedule for immediate runs.
-
-The dry-run plan carries a `schedule_preview` object: at least three computed future fire times (one for one-shot schedules, labeled as such) plus the effective timezone the times were resolved against — the server's local timezone, since the standalone distribution has no configured Hermes timezone. The preview confirms WHEN the parsed schedule will fire, before the job is armed; the external scheduler remains the authority at run time.
 
 ### `hermes_release_doctor`
 
@@ -719,3 +689,8 @@ Local runner timeout and explicit-cancellation cleanup share one platform-aware
 path. POSIX signals the runner process group. Windows uses `taskkill /T /F` for
 the process tree and falls back to direct process termination if `taskkill` is
 unavailable, times out, or reports failure.
+
+## Autopilot (v0.13)
+
+Autopilot is an optional, default-off runtime that drives one Mission through its MissionPlan. It is enabled by the machine gate `HERMES_GPT_AUTOPILOT=1`, which registers `hermes_autopilot_start`, `hermes_autopilot_status`, and `hermes_autopilot_stop`; with the gate unset none of them exist. Starting needs `workspace` level, direct apply mode, `dry_run=false`, and `confirm=true` (a dry run previews and writes nothing); stopping never needs the machine gate. It adds no authority: every dispatch goes through the existing placement, Work Contract, and delegation surfaces, it never dispatches or advances an approval or `high_impact` node, and it cannot approve a Mission. See [autopilot.md](autopilot.md).
+

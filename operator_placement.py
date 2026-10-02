@@ -52,7 +52,7 @@ import operator_capability_manifest as cm
 import operator_mission_budget as budget
 import operator_mission_runtime as mission
 import operator_policy as op
-import operator_skill_resolution as skill_res
+import operator_skill_resolution as skill_resolution
 
 SCHEMA_VERSION = "0.9-placement.1"
 PLACEMENT_SCHEMA = "hermes.placement/v1"
@@ -214,10 +214,20 @@ def _audit(
         return
 
 
-def _error(exc: Exception, code: str, action: str) -> str:
+def _error(
+    exc: Exception,
+    code: str,
+    action: str,
+    *,
+    extra: dict[str, Any] | None = None,
+) -> str:
     return json.dumps(
         op.error_from_exception(
-            exc, layer="operator", code=code, suggested_action=action
+            exc,
+            layer="operator",
+            code=code,
+            suggested_action=action,
+            extra=extra,
         )
     )
 
@@ -448,25 +458,9 @@ def load_manifest_targets(
             continue
         for ent in readers[src](root):
             try:
-                target = _target_from_entity(ent)
+                targets.append(_target_from_entity(ent))
             except ValueError:
                 continue
-            # Canonical skill view (rm-027): profile-kind targets carry the
-            # resolver's RECURSIVE per-profile walk, unioned with the
-            # manifest's top-level snapshot. Keeps the hard filter pure
-            # (dict access in _apply_hard_filters) while making placement's
-            # target view agree with stage-1/2 validation semantics — a
-            # nested-only skill must not make a capable target unplaceable.
-            if target.get("kind") == "profile":
-                try:
-                    resolved = skill_res.profile_skills(str(target.get("name", "")), root)
-                except ValueError:
-                    resolved = []
-                if resolved:
-                    target["skills"] = sorted(
-                        set(target.get("skills") or []) | set(resolved)
-                    )
-            targets.append(target)
             if len(targets) >= MAX_TARGETS:
                 break
         if len(targets) >= MAX_TARGETS:
@@ -494,9 +488,6 @@ def _apply_hard_filters(
     Codes (stable, testable):
     - disabled / unreachable / identity_unconfigured
     - required_features_missing
-    - required_skills_missing (profile-scoped: only when skills are required;
-      zero-skill targets such as Fabric nodes stay placeable for skill-less
-      requirements — see operator_skill_resolution for the canonical view)
     - auth_ceiling_exceeded
     - profile_out_of_scope
     - workspace_out_of_scope
@@ -519,20 +510,6 @@ def _apply_hard_filters(
         target_features = set(target.get("features") or [])
         if not set(required_features) <= target_features:
             optouts.append("required_features_missing")
-
-    # F2b required skills: when the requirement declares skills, the target's
-    # canonical skill view must cover them. Profile-kind targets are enriched
-    # with the resolver's recursive walk at manifest-load time
-    # (load_manifest_targets), so this gate stays pure dict access while
-    # agreeing with stage-1/2 semantics; the I/O-ful assignee validation
-    # (live profile tree) runs at the placement entry points via
-    # operator_skill_resolution.validate_assignee_skills.
-    required_skills = requirement.get("skills") or []
-    if required_skills:
-        target_skills = set(target.get("skills") or [])
-        missing = [s for s in required_skills if s not in target_skills]
-        if missing:
-            optouts.append("required_skills_missing")
 
     # F3 authorization ceiling not exceeded.
     ceiling_rank = _auth_rank_of(target)
@@ -1035,14 +1012,12 @@ def hermes_placement_score(
         requirement["kind"] = node_def["kind"]
         requirement["owner"] = node_def["owner"]
 
-        # Canonical skill resolution, stage 2: the assignee profile must
-        # resolve every required skill against the live profile tree, before
-        # any decision is built or recorded. Runs on every placement call, so
-        # re-running placement for an existing node (reassignment) revalidates.
-        skill_res.validate_assignee_skills(
-            str(requirement.get("profile", "")),
-            [str(s) for s in (requirement.get("skills") or [])],
-            mission._root(hermes_root),
+        # Profile capability is a precondition for placement.  Fabric remains
+        # a separate physical target question and is not filtered by skills.
+        skill_resolution.require_required_skills(
+            requirement["profile"],
+            requirement.get("skills", []),
+            cm._resolve_root(hermes_root),
         )
 
         ctx = {"priority": priority}
@@ -1097,7 +1072,7 @@ def hermes_placement_score(
         decision["dry_run"] = False
         decision["persisted"] = persisted
         return json.dumps(decision, ensure_ascii=False, indent=2)
-    except skill_res.SkillNotResolvableForAssigneeError as exc:
+    except skill_resolution.SkillRequirementsError as exc:
         _audit(
             "hermes_placement_score",
             op.OperatorPolicy(),
@@ -1109,23 +1084,9 @@ def hermes_placement_score(
         )
         return _error(
             exc,
-            "SKILL_NOT_RESOLVABLE_FOR_ASSIGNEE",
-            "Install the skill in the assignee profile, or change the node's profile.",
-        )
-    except skill_res.SkillNotFoundError as exc:
-        _audit(
-            "hermes_placement_score",
-            op.OperatorPolicy(),
-            dry_run=dry_run,
-            success=False,
-            changed=False,
-            mission_id=mission_id,
-            node_id=node_id,
-        )
-        return _error(
-            exc,
-            "SKILL_NOT_FOUND",
-            "Create the skill (global root or the profiles that need it).",
+            "PLACEMENT_SKILL_REQUIREMENTS_REJECTED",
+            "Install the required skills in the requested Hermes profile before placement.",
+            extra={"skill_validation": exc.rejection},
         )
     except (
         ValueError,
@@ -1227,6 +1188,11 @@ def hermes_placement_candidates(
                 maximum_items=64,
                 item_max=64,
             )
+        skill_resolution.require_required_skills(
+            requirement["profile"],
+            requirement.get("skills", []),
+            cm._resolve_root(hermes_root),
+        )
         targets = load_manifest_targets(hermes_root, source=source)
         verdict = score_targets(_stance(requirement), targets, {})
         envelope = {
@@ -1258,6 +1224,13 @@ def hermes_placement_candidates(
             },
         )
         return json.dumps(envelope, ensure_ascii=False, indent=2)
+    except skill_resolution.SkillRequirementsError as exc:
+        return _error(
+            exc,
+            "PLACEMENT_SKILL_REQUIREMENTS_REJECTED",
+            "Install the required skills in the requested Hermes profile before placement.",
+            extra={"skill_validation": exc.rejection},
+        )
     except (
         ValueError,
         TypeError,

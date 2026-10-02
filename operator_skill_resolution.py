@@ -1,324 +1,585 @@
-"""Canonical profile-aware skill resolution for Operator placement/plan paths.
+"""Adapter to the Hermes Agent's effective skill loader.
 
-Problem (upstream issue #74): before this module, four code paths each
-answered "does profile X have skill Y?" differently:
+This module deliberately owns no skill registry and does not scan ``SKILL.md``
+files itself. Hermes Agent already owns loading semantics (profile scope,
+external/project directories, exclusions, disabled skills and platform gates),
+so Operator surfaces consume that loader and only add bounded validation
+provenance around its result.
 
-* ``server.skill_roots()`` — global + per-profile skill *roots* (directories);
-* ``operator_skills._find_skill_dir`` — recursive ``SKILL.md`` lookup under a
-  single profile home;
-* ``operator_capability_manifest._list_profile_skills`` — top-level-only
-  skills snapshot used for placement targets;
-* placement ranking used the manifest snapshot with **no hard gate**, so a
-  zero-skill target could win a skill-requiring node.
+Authority model (review follow-up):
 
-This module is the single canonical, read-only projection over that state
-(no persisted registry; always derived from the live tree):
-
-* ``resolve_skill(name, hermes_root)`` -> ``SkillResolution`` (resolvable,
-  found paths, resolving profiles, scope);
-* ``profile_skills(profile, hermes_root)`` -> sorted skill names for one
-  profile (recursive ``SKILL.md`` walk, same semantics as
-  ``operator_skills._find_skill_dir``);
-* two-stage validation:
-  - stage 1 (plan creation): ``validate_required_skills`` — every declared
-    skill must exist *somewhere* (global root or any profile) else
-    ``SkillNotFoundError``;
-  - stage 2 (placement/assignment, re-run on every placement decision, so
-    reassignment revalidates): ``validate_assignee_skills`` — the assignee
-    profile must resolve every required skill else
-    ``SkillNotResolvableForAssigneeError`` (message lists the profiles that
-    *do* resolve it).
-
-Placement hard-filtering itself stays pure: ``operator_placement`` gates on
-target["skills"] (manifest snapshot) so scoring remains I/O-free and
-deterministic; this module is used for the I/O-ful surfaces around it —
-profile-kind targets are enriched with the recursive resolver view at
-manifest-load time, so the hard gate and the validator agree on semantics.
-
-Scope note (deliberate): ``server.skill_roots()`` additionally reads a
-global ``<HERMES_ROOT>/skills`` root for MCP ``discover_skills``
-presentation. This resolver intentionally mirrors the *execution* view
-(``operator_skills`` per-profile scoping) instead: a skill shipped only in
-the presentation root is advertised but not executable by any profile, and
-plan validation fails closed on it rather than green-lighting a plan whose
-skills no assignee can run.
-
-Listings cap RESULT SIZE (``MAX_SKILL_ENTRIES_PER_ROOT``) and walks cap
-TRAVERSAL (``MAX_WALKED_ENTRIES`` directories visited per root) — a runaway
-tree degrades to a partial, deterministic listing instead of hanging.
-Within one validation call each root is walked at most once.
-
-Skill names reuse ``operator_skills``' grammar verbatim (single source of
-truth): lowercase alphanumerics plus ``.`` ``_`` ``-``, max 64 chars —
-anything ``operator_skills`` accepts as a name resolves here too.
+- The dispatch hard gate probes the *explicit-load* path
+  (``skill_view(..., preprocess=False)``, the same loader ``--skills`` /
+  ``build_preloaded_skills_prompt`` uses), fresh on every call with no
+  discovery-cache TTL. Preprocessing is disabled so a validation probe
+  cannot execute ``skills.inline_shell`` snippets.
+- The cross-profile catalog (``_find_all_skills`` + plugin skill metadata)
+  is provenance/diagnostics only: it classifies a rejection as
+  ``skill_not_found`` vs ``skill_not_resolvable_for_profile`` and reports
+  ``available_profiles``. It never overrules an explicit-load probe.
+- ``environments:``/``requires_apps:`` are offer-time filters. An explicit
+  load bypasses them, so the gate does too.
+- Loader/import failures are fail-closed as ``skill_resolution_unavailable``,
+  never as ``skill_not_found``.
 """
 
 from __future__ import annotations
 
+import importlib
+import importlib.metadata
+import json
 import os
-from dataclasses import dataclass, field
+import shutil
+import sys
+from collections.abc import Callable, Iterable
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import operator_policy as op
-import operator_skills
-
-# Grammar is operator_skills' own (dots/underscores allowed, 64-char cap):
-# the resolver must accept exactly the names the executor can run — a
-# divergent grammar here would make placement reject runnable skills or
-# accept unrunnable ones. Single source of truth, imported not copied.
-SKILL_NAME_RE = operator_skills._VALID_NAME_RE
-MAX_SKILL_NAME_LENGTH = operator_skills._MAX_NAME_LENGTH
-
-# Bounds: MAX_SKILL_ENTRIES_PER_ROOT caps the RESULT SIZE of one root's
-# listing; MAX_WALKED_ENTRIES caps TRAVERSAL (directories visited per
-# root) so a pathological tree degrades instead of hanging a validation.
-MAX_SKILL_ENTRIES_PER_ROOT = 2048
-MAX_WALKED_ENTRIES = 50_000
-MAX_LISTED_NAMES = 24
-SKILL_FILE = "SKILL.md"
-
-# Authority personas are controller-local; they have no skills directory and
-# never fail skill resolution (documented pass-through).
-CONTROLLER_PERSONAS = ("owner", "tony")
-
-__all__ = [
-    "CONTROLLER_PERSONAS",
-    "SkillNotFoundError",
-    "SkillNotResolvableForAssigneeError",
-    "SkillResolution",
-    "SkillResolutionError",
-    "profile_skills",
-    "resolve_skill",
-    "validate_assignee_skills",
-    "validate_required_skills",
-]
 
 
-class SkillResolutionError(ValueError):
-    """Base class for skill-resolution validation failures."""
+@dataclass(frozen=True)
+class SkillEntry:
+    """One skill exposed by the Agent loader for a logical profile."""
 
-
-class SkillNotFoundError(SkillResolutionError):
-    """A required skill does not exist in the global root or any profile."""
-
-    def __init__(self, skill: str, available: list[str]) -> None:
-        self.skill = skill
-        self.available = available
-        shown = ", ".join(sorted(available)[:MAX_LISTED_NAMES])
-        more = len(available) - min(len(available), MAX_LISTED_NAMES)
-        suffix = f" (+{more} more)" if more > 0 else ""
-        super().__init__(
-            f"skill_not_found: {skill!r} is not defined in the global skills root "
-            f"or any profile; available skills: [{shown}{suffix}]"
-        )
-
-
-class SkillNotResolvableForAssigneeError(SkillResolutionError):
-    """The skill exists, but the assignee profile cannot resolve it."""
-
-    def __init__(
-        self,
-        skill: str,
-        assignee: str,
-        resolvable_profiles: list[str],
-        *,
-        global_only: bool,
-    ) -> None:
-        self.skill = skill
-        self.assignee = assignee
-        self.resolvable_profiles = resolvable_profiles
-        self.global_only = global_only
-        where = (
-            "the global skills root only"
-            if global_only
-            else "profiles: " + ", ".join(sorted(resolvable_profiles)[:MAX_LISTED_NAMES])
-        )
-        super().__init__(
-            f"skill_not_resolvable_for_assignee: profile {assignee!r} cannot resolve "
-            f"skill {skill!r}; the skill is available via {where}"
-        )
+    name: str
+    profile: str
+    category: str | None = None
+    description: str | None = None
 
 
 @dataclass(frozen=True)
 class SkillResolution:
-    """Read-only projection: where does (did) a skill resolve?"""
+    """Cross-profile provenance for one requested skill name."""
 
-    skill: str
-    resolvable: bool = False
-    found_paths: tuple[str, ...] = field(default_factory=tuple)
-    profiles: tuple[str, ...] = field(default_factory=tuple)
-    scope: str = ""  # "global" | "profile" | "mixed" | "" (unresolvable)
+    name: str
+    defined_in: tuple[str, ...]
+    available_to: tuple[str, ...]
+    scope: str
+    entries: tuple[SkillEntry, ...]
+
+    @property
+    def exists(self) -> bool:
+        return bool(self.defined_in)
 
 
-def validate_skill_name(name: Any) -> str:
-    """Validate a skill name with the shared grammar (ValueError on bad).
+@dataclass(frozen=True)
+class SkillCatalog:
+    entries: tuple[SkillEntry, ...]
+    known_profiles: tuple[str, ...]
 
-    Same grammar and length cap as ``operator_skills`` (the executor): a
-    name that fails here is a name no profile can run. The grammar is
-    enforced on the RAW string — whitespace-padded names are rejected, not
-    silently normalized — so a name that passes this gate is byte-identical
-    to the name the executor will later validate.
-    """
-    if not isinstance(name, str):
-        raise TypeError("skill name must be a string")
-    if len(name) > MAX_SKILL_NAME_LENGTH:
-        raise ValueError(
-            f"skill name exceeds {MAX_SKILL_NAME_LENGTH} characters: {name!r}"
+
+class SkillRequirementsError(ValueError):
+    """A structured profile/required-skills preflight rejection."""
+
+    def __init__(self, rejection: dict[str, Any]):
+        self.rejection = rejection
+        super().__init__(str(rejection.get("message", "skill requirements are invalid")))
+
+
+SCOPE_GLOBAL = "global"
+SCOPE_PROFILE_LOCAL = "profile_local"
+ERROR_NOT_FOUND = "skill_not_found"
+ERROR_NOT_RESOLVABLE = "skill_not_resolvable_for_profile"
+ERROR_UNAVAILABLE = "skill_resolution_unavailable"
+
+# Tests can inject an Agent-loader-shaped provider without making the unit
+# suite depend on a separately installed Hermes Agent checkout. Production
+# code leaves this unset and uses the real loader below.
+_skill_loader_override: Callable[[str, Path], Iterable[dict[str, Any]]] | None = None
+
+
+class _LoaderUnavailable(RuntimeError):
+    """The Agent loader could not be reached; fail closed, never not_found."""
+
+
+def _default_root() -> Path:
+    env_home = os.environ.get("HERMES_HOME")
+    if env_home:
+        normalized = op.normalize_hermes_data_root(Path(env_home).expanduser())
+        if normalized is not None:
+            return normalized
+    for candidate in (
+        Path.home() / "AppData" / "Local" / "hermes",
+        Path.home() / ".hermes",
+    ):
+        if candidate.is_dir():
+            return candidate
+    return Path.home() / ".hermes"
+
+
+def _root(hermes_root: Path | None) -> Path:
+    return Path(hermes_root) if hermes_root is not None else _default_root()
+
+
+def _agent_root_candidates() -> list[Path]:
+    candidates: list[Path] = []
+    for variable in ("HERMES_AGENT_ROOT", "HERMES_ROOT"):
+        value = os.environ.get(variable)
+        if value:
+            candidates.append(Path(value).expanduser())
+    executable = shutil.which("hermes")
+    if executable:
+        bin_dir = Path(executable).resolve().parent
+        candidates.extend((bin_dir.parent / "hermes-agent", bin_dir.parent))
+    for package in ("hermes-agent", "hermes_agent"):
+        try:
+            base = Path(importlib.metadata.distribution(package).locate_file(""))
+        except (importlib.metadata.PackageNotFoundError, OSError):
+            continue
+        candidates.extend((base, base / "hermes-agent"))
+    candidates.extend(
+        (
+            Path.home() / "AppData" / "Local" / "hermes" / "hermes-agent",
+            Path.home() / ".hermes" / "hermes-agent",
         )
-    if not SKILL_NAME_RE.fullmatch(name):
-        raise ValueError(
-            "skill name must be lowercase alphanumerics with '.', '_' or '-' "
-            f"(max {MAX_SKILL_NAME_LENGTH} chars): {name!r}"
-        )
-    return name
+    )
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.expanduser().resolve()
+        except OSError:
+            continue
+        key = str(resolved).casefold()
+        if key not in seen:
+            seen.add(key)
+            unique.append(resolved)
+    return unique
 
 
-def _walk_skill_names(root: Path) -> dict[str, Path]:
-    """Return {skill name -> observed SKILL.md directory} for one root.
+def _require_agent_modules() -> tuple[Any, Any]:
+    """Return ``(skills_tool, hermes_constants)`` or raise _LoaderUnavailable."""
+    last_error: Exception | None = None
+    for candidate in [None, *_agent_root_candidates()]:
+        if candidate is not None and candidate.is_dir():
+            value = str(candidate)
+            if value not in sys.path:
+                sys.path.insert(0, value)
+            # The hermes-gpt checkout has a namespace ``tools/`` directory for
+            # package-hygiene scripts. Remove that empty namespace only when
+            # the real Agent package is about to be loaded; never replace a
+            # concrete, already-loaded package.
+            loaded_tools = sys.modules.get("tools")
+            if (
+                loaded_tools is not None
+                and getattr(loaded_tools, "__file__", None) is None
+                and (candidate / "tools" / "__init__.py").is_file()
+            ):
+                sys.modules.pop("tools", None)
+        try:
+            skills_tool = importlib.import_module("tools.skills_tool")
+            constants = importlib.import_module("hermes_constants")
+            if callable(getattr(skills_tool, "_find_all_skills", None)):
+                return skills_tool, constants
+        except Exception as exc:  # noqa: BLE001 - optional Agent runtime
+            last_error = exc
+            continue
+    raise _LoaderUnavailable(
+        "Hermes Agent loader is unavailable; refusing to validate skills"
+        + (f": {last_error}" if last_error is not None else "")
+    )
 
-    Recursive, mirroring ``operator_skills._find_skill_dir`` semantics: any
-    directory under the root containing ``SKILL.md`` declares a skill named
-    after the directory. Bounded two ways — result size
-    (``MAX_SKILL_ENTRIES_PER_ROOT``) and traversal
-    (``MAX_WALKED_ENTRIES`` directories visited) — and best-effort
-    (unreadable trees degrade to empty/partial).
-    """
-    names: dict[str, Path] = {}
-    if not root.is_dir():
-        return names
-    visited = 0
+
+def _agent_modules() -> tuple[Any, Any] | None:
+    """Return ``(skills_tool, hermes_constants)`` when Agent is available."""
     try:
-        for dirpath, dirnames, filenames in os.walk(root):
-            dirnames.sort()  # deterministic traversal (lexicographic DFS)
-            if SKILL_FILE in filenames:
-                pdir = Path(dirpath)
-                nm = pdir.name
-                if SKILL_NAME_RE.fullmatch(nm) and nm not in names:
-                    names[nm] = pdir
-                if len(names) >= MAX_SKILL_ENTRIES_PER_ROOT:
-                    break
-            visited += 1
-            if visited >= MAX_WALKED_ENTRIES:
-                break
-    except OSError:
-        return names
-    return names
-
-
-def global_skills_root(hermes_root: Path | None) -> Path | None:
-    """The global (non-profile) skills root: ``<hermes_root>/skills``."""
-    if hermes_root is None:
+        return _require_agent_modules()
+    except _LoaderUnavailable:
         return None
-    return hermes_root / "skills"
 
 
-def profile_skills(profile: str, hermes_root: Path | None) -> list[str]:
-    """Sorted skill names resolvable inside one profile home."""
-    canon = op.validate_profile_name(profile)
-    if hermes_root is None:
-        return []
-    home = op.resolve_profile_home(canon, hermes_root)
-    return sorted(_walk_skill_names(home / "skills"))
-
-
-def _name_maps(
-    hermes_root: Path | None,
-) -> tuple[dict[str, Path], dict[str, dict[str, Path]]]:
-    """Walk every resolution root once: (global map, {profile: map})."""
-    global_map: dict[str, Path] = {}
-    profile_maps: dict[str, dict[str, Path]] = {}
-    if hermes_root is None:
-        return global_map, profile_maps
-    groot = global_skills_root(hermes_root)
-    if groot is not None:
-        global_map = _walk_skill_names(groot)
-    for profile in op.list_existing_profiles(hermes_root):
-        home = op.resolve_profile_home(profile, hermes_root)
-        profile_maps[profile] = _walk_skill_names(home / "skills")
-    return global_map, profile_maps
-
-
-def resolve_skill(name: str, hermes_root: Path | None) -> SkillResolution:
-    """Resolve one skill name across the global root and every profile.
-
-    Deterministic: paths and profiles are sorted; the first occurrence wins
-    per root, and every declaring profile is reported. ``found_paths`` are
-    OBSERVED ``SKILL.md`` directories (may be nested), never synthesized.
-    """
-    skill = validate_skill_name(name)
-    found: list[str] = []
-    profiles: list[str] = []
-    global_hit = False
-
-    global_map, profile_maps = _name_maps(hermes_root)
-    gdir = global_map.get(skill)
-    if gdir is not None:
-        global_hit = True
-        found.append(str(gdir))
-    for profile in sorted(profile_maps):
-        pdir = profile_maps[profile].get(skill)
-        if pdir is not None:
-            profiles.append(profile)
-            found.append(str(pdir))
-
-    scope = (
-        "global"
-        if global_hit and not profiles
-        else "profile"
-        if profiles and not global_hit
-        else "mixed"
-        if global_hit and profiles
-        else ""
-    )
-    return SkillResolution(
-        skill=skill,
-        resolvable=bool(found),
-        found_paths=tuple(sorted(found)),
-        profiles=tuple(sorted(profiles)),
-        scope=scope,
-    )
-
-
-def validate_required_skills(skills: list[str], hermes_root: Path | None) -> None:
-    """Stage 1: every declared skill must exist somewhere (fail closed).
-
-    Walks each resolution root at most once per call (not once per skill).
-    """
-    global_map, profile_maps = _name_maps(hermes_root)
-    for raw in skills:
-        skill = validate_skill_name(raw)
-        if skill in global_map or any(skill in pm for pm in profile_maps.values()):
-            continue
-        available: set[str] = set(global_map)
-        for pm in profile_maps.values():
-            available.update(pm)
-        raise SkillNotFoundError(skill, sorted(available))
-
-
-def validate_assignee_skills(
-    profile: str,
-    skills: list[str],
-    hermes_root: Path | None,
-) -> None:
-    """Stage 2: the assignee profile must resolve every required skill.
-
-    Controller personas (``owner`` / ``tony``) run with local authority and
-    pass through. Re-run on every placement decision, so reassignment of a
-    node to a different profile revalidates before any mutation.
-    """
-    canon = op.validate_profile_name(profile)
-    if canon in CONTROLLER_PERSONAS or not skills:
+@contextmanager
+def _profile_scope(profile_home: Path, constants: Any):
+    setter = getattr(constants, "set_hermes_home_override", None)
+    resetter = getattr(constants, "reset_hermes_home_override", None)
+    if not callable(setter) or not callable(resetter):
+        yield
         return
-    own = set(profile_skills(canon, hermes_root))
-    for raw in skills:
-        skill = validate_skill_name(raw)
-        if skill in own:
+    token = setter(profile_home)
+    try:
+        yield
+    finally:
+        resetter(token)
+
+
+def _plugin_entries(skills_tool: Any) -> list[dict[str, Any]]:
+    """Plugin-provided skill metadata, mirroring ``skills_list`` filtering.
+
+    Best-effort provenance for the catalog: a plugin-registry failure here
+    must not mask flat-tree skills, because the explicit-load probe resolves
+    ``plugin:skill`` directly through ``skill_view``.
+    """
+    try:
+        from hermes_cli.plugins import discover_plugins, get_plugin_manager
+
+        discover_plugins()
+        raw = get_plugin_manager().list_plugin_skill_metadata()
+    except Exception:  # noqa: BLE001 - best-effort plugin provenance
+        return []
+    entries: list[dict[str, Any]] = []
+    for item in raw if isinstance(raw, list) else ():
+        if not isinstance(item, dict):
             continue
-        res = resolve_skill(skill, hermes_root)
-        raise SkillNotResolvableForAssigneeError(
-            skill,
-            canon,
-            list(res.profiles),
-            global_only=(not res.profiles and res.resolvable),
+        meta = dict(item)
+        frontmatter = meta.pop("frontmatter", {})
+        if not isinstance(frontmatter, dict):
+            frontmatter = {}
+        name = str(meta.get("name") or "").strip()
+        if not name:
+            continue
+        try:
+            if not skills_tool.skill_matches_platform(frontmatter):
+                continue
+            if skills_tool._is_skill_disabled(name):
+                continue
+        except Exception:  # noqa: BLE001, S112 - per-skill best effort
+            continue
+        entries.append(
+            {
+                "name": name,
+                "category": meta.get("category"),
+                "description": meta.get("description"),
+            }
         )
+    return entries
+
+
+def _discovery_entries(profile: str, hermes_root: Path) -> list[dict[str, Any]]:
+    """Catalog entries for one profile; raises _LoaderUnavailable on failure."""
+    skills_tool, constants = _require_agent_modules()
+    profile_home = op.resolve_profile_home(profile, hermes_root)
+    try:
+        with _profile_scope(profile_home, constants):
+            raw = skills_tool._find_all_skills()
+            plugin_raw = _plugin_entries(skills_tool)
+    except Exception as exc:
+        raise _LoaderUnavailable(
+            f"Hermes Agent loader failed for profile '{profile}': {exc}"
+        ) from exc
+    entries: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in raw if isinstance(raw, list) else ():
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        entries.append(
+            {
+                "name": name,
+                "category": item.get("category"),
+                "description": item.get("description"),
+            }
+        )
+    for item in plugin_raw:
+        name = str(item.get("name") or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        entries.append(item)
+    return entries
+
+
+def _agent_entries(profile: str, hermes_root: Path) -> list[dict[str, Any]]:
+    """Backward-compatible discovery wrapper; loader failure yields []."""
+    try:
+        return _discovery_entries(profile, hermes_root)
+    except _LoaderUnavailable:
+        return []
+
+
+def _explicit_load_ok(
+    profile: str, name: str, hermes_root: Path
+) -> tuple[bool, str]:
+    """Probe the explicit-load path (``skill_view``) for one skill.
+
+    Returns ``(True, detail)`` when the requested profile can load the skill
+    right now, ``(False, detail)`` when it cannot. Raises _LoaderUnavailable
+    when the loader itself cannot be reached. No discovery cache is consulted,
+    so a skill removed between planning and dispatch fails immediately.
+
+    The probe calls ``skill_view(..., preprocess=False)``. Hermes preload
+    also disables preprocessing at load time and renders later; the default
+    ``preprocess=True`` would execute ``!`cmd``` snippets when
+    ``skills.inline_shell`` is enabled.
+    """
+    requested = str(name).strip()
+    if not requested:
+        return False, "empty skill name"
+    if _skill_loader_override is not None:
+        try:
+            entries = list(_skill_loader_override(profile, hermes_root))
+        except Exception as exc:
+            raise _LoaderUnavailable(
+                f"skill loader override failed for profile '{profile}': {exc}"
+            ) from exc
+        for item in entries:
+            if (
+                isinstance(item, dict)
+                and str(item.get("name") or "").strip() == requested
+            ):
+                return True, "explicit-loadable via test override"
+        return False, "not present in test override entries"
+    skills_tool, constants = _require_agent_modules()
+    try:
+        profile_home = op.resolve_profile_home(profile, hermes_root)
+    except Exception as exc:  # noqa: BLE001 - invalid profile is a state
+        return False, f"invalid profile: {exc}"
+    try:
+        with _profile_scope(profile_home, constants):
+            raw = skills_tool.skill_view(requested, preprocess=False)
+    except Exception as exc:
+        raise _LoaderUnavailable(
+            f"Hermes Agent loader failed for profile '{profile}': {exc}"
+        ) from exc
+    try:
+        payload = json.loads(raw) if isinstance(raw, str) else {}
+    except Exception:  # noqa: BLE001 - malformed loader response is a state
+        return False, "unparseable skill_view response"
+    if isinstance(payload, dict) and payload.get("success"):
+        return True, "explicit-loadable"
+    detail = ""
+    if isinstance(payload, dict):
+        detail = str(payload.get("error") or payload.get("message") or "")[:200]
+    return False, detail or "not loadable via skill_view"
+
+
+def profile_skill_entries(
+    profile: str, hermes_root: Path | None = None
+) -> list[SkillEntry]:
+    """Return the Agent loader's effective skills for one profile."""
+    root = _root(hermes_root)
+    canon = op.validate_profile_name(profile)
+    if _skill_loader_override is not None:
+        raw = list(_skill_loader_override(canon, root))
+    else:
+        raw = _discovery_entries(canon, root)
+    return [
+        SkillEntry(
+            name=str(item["name"]),
+            profile=canon,
+            category=(str(item["category"]) if item.get("category") else None),
+            description=(
+                str(item["description"]) if item.get("description") else None
+            ),
+        )
+        for item in raw
+        if isinstance(item, dict) and item.get("name")
+    ]
+
+
+def build_catalog(hermes_root: Path | None = None) -> SkillCatalog:
+    """Build provenance from the effective Agent loader, without persistence."""
+    root = _root(hermes_root)
+    profiles = tuple(op.list_existing_profiles(root))
+    entries: list[SkillEntry] = []
+    for profile in profiles:
+        entries.extend(profile_skill_entries(profile, root))
+    return SkillCatalog(entries=tuple(entries), known_profiles=profiles)
+
+
+def resolve_name(name: str, catalog: SkillCatalog | None = None) -> SkillResolution:
+    """Resolve one skill name across the effective profile loaders."""
+    requested = str(name).strip()
+    catalog = catalog or build_catalog()
+    matches = tuple(entry for entry in catalog.entries if entry.name == requested)
+    defined = tuple(sorted({entry.profile for entry in matches}))
+    return SkillResolution(
+        name=requested,
+        defined_in=defined,
+        available_to=defined,
+        scope=SCOPE_GLOBAL if "default" in defined else SCOPE_PROFILE_LOCAL,
+        entries=matches,
+    )
+
+
+def resolution_for_profile(
+    resolution: SkillResolution,
+    profile: str,
+    known_profiles: Iterable[str] | None = None,
+) -> dict[str, Any]:
+    """Return a bounded, actionable profile-specific resolution view."""
+    known = list(known_profiles or ())
+    if profile not in known:
+        return {
+            "profile": profile,
+            "unknown_profile": True,
+            "resolvable": False,
+            "available_profiles": list(resolution.available_to),
+            "known_profiles": known,
+            "reason": f"profile '{profile}' is not a known Hermes profile",
+        }
+    resolvable = profile in resolution.available_to
+    return {
+        "profile": profile,
+        "unknown_profile": False,
+        "resolvable": resolvable,
+        "available_profiles": list(resolution.available_to),
+        "reason": (
+            f"skill is defined in profile '{profile}' and can be loaded at execution"
+            if resolvable
+            else f"skill exists, but is not defined in profile '{profile}'"
+        ),
+    }
+
+
+def _unavailable(profile: str, detail: str) -> dict[str, Any]:
+    return {
+        "error": ERROR_UNAVAILABLE,
+        "profile": profile,
+        "message": (
+            "The Hermes Agent skill loader is unavailable; skill requirements "
+            "cannot be verified and dispatch is refused."
+        ),
+        "detail": detail[:300],
+    }
+
+
+def validate_required_skills(
+    profile: str,
+    skills: Iterable[str] | None,
+    hermes_root: Path | None = None,
+    *,
+    catalog: SkillCatalog | None = None,
+) -> dict[str, Any] | None:
+    """Validate required skills against the Agent's explicit-load path.
+
+    The hard gate is the explicit load (``skill_view``): a skill the worker
+    could load via ``--skills`` passes, including environment-filtered and
+    ``plugin:skill`` names. The catalog only classifies failures and reports
+    ``available_profiles``. Loader failures are fail-closed as
+    ``skill_resolution_unavailable``.
+    """
+    requested: list[str] = []
+    for skill in skills or ():
+        value = str(skill).strip()
+        if value and value not in requested:
+            requested.append(value)
+    if not requested:
+        return None
+
+    root = _root(hermes_root)
+    if _skill_loader_override is None:
+        try:
+            _require_agent_modules()
+        except _LoaderUnavailable as exc:
+            return _unavailable(profile, str(exc))
+    try:
+        cat = catalog or build_catalog(root)
+    except _LoaderUnavailable as exc:
+        return _unavailable(profile, str(exc))
+    except Exception as exc:  # noqa: BLE001 - fail-closed catalog
+        return _unavailable(profile, f"skill catalog failed: {exc}")
+
+    not_found: list[str] = []
+    not_resolvable: list[dict[str, Any]] = []
+    for name in requested:
+        try:
+            ok, detail = _explicit_load_ok(profile, name, root)
+        except _LoaderUnavailable as exc:
+            return _unavailable(profile, str(exc))
+        if ok:
+            continue
+        resolution = resolve_name(name, cat)
+        if not resolution.exists:
+            not_found.append(name)
+            continue
+        view = resolution_for_profile(resolution, profile, cat.known_profiles)
+        if not view["resolvable"]:
+            not_resolvable.append(
+                {
+                    "skill": name,
+                    "profile": profile,
+                    "available_profiles": view["available_profiles"],
+                    "reason": view["reason"],
+                    "detail": detail[:200],
+                }
+            )
+        else:
+            # Catalog claims this profile, but the live explicit load just
+            # failed (removed/disabled/platform-gated after the catalog
+            # snapshot, or stale discovery cache): fail closed.
+            not_resolvable.append(
+                {
+                    "skill": name,
+                    "profile": profile,
+                    "available_profiles": view["available_profiles"],
+                    "reason": (
+                        f"skill is catalogued for profile '{profile}' but "
+                        f"failed the live explicit-load check: {detail[:160]}"
+                    ),
+                }
+            )
+
+    if not_found and not_resolvable:
+        return {
+            "error": "skill_requirements_invalid",
+            "profile": profile,
+            "skills_not_found": sorted(not_found),
+            "skills_not_resolvable": not_resolvable,
+            "message": "One or more required skills are invalid for the requested profile.",
+        }
+    if not_found:
+        return {
+            "error": ERROR_NOT_FOUND,
+            "profile": profile,
+            "skills_not_found": sorted(not_found),
+            "message": (
+                "The following required skill names do not exist in the Hermes "
+                f"skill catalog: {', '.join(sorted(not_found))}."
+            ),
+        }
+    if not_resolvable:
+        return {
+            "error": ERROR_NOT_RESOLVABLE,
+            "profile": profile,
+            "skills": not_resolvable,
+            "incompatible_skills": [item["skill"] for item in not_resolvable],
+            "message": (
+                "One or more required skills exist but are not resolvable by "
+                f"profile '{profile}'."
+            ),
+        }
+    return None
+
+
+def require_required_skills(
+    profile: str,
+    skills: Iterable[str] | None,
+    hermes_root: Path | None = None,
+) -> None:
+    rejection = validate_required_skills(profile, skills, hermes_root)
+    if rejection is not None:
+        raise SkillRequirementsError(rejection)
+
+
+def skill_names_for_home(
+    profile_home: Path, profile: str | None = None
+) -> list[str]:
+    """Return effective loader names for a manifest profile entity.
+
+    Diagnostics only (Capability Manifest): best-effort, never raises, so a
+    loader failure yields an empty skill list rather than a manifest outage.
+    The dispatch hard gate uses ``validate_required_skills`` instead.
+    """
+    home = Path(profile_home)
+    profile = profile or "default"
+    root = home if profile == "default" else home.parent.parent
+    try:
+        if _skill_loader_override is not None:
+            raw = list(_skill_loader_override(profile, root))
+        else:
+            raw = _discovery_entries(profile, root)
+    except Exception:  # noqa: BLE001 - diagnostics never raise
+        return []
+    return sorted(
+        {
+            str(item["name"])
+            for item in raw
+            if isinstance(item, dict) and item.get("name")
+        }
+    )
