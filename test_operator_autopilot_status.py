@@ -244,14 +244,39 @@ def test_mission_awaiting_approval_needs_the_owner(env):
 
 
 def _snapshot(root: Path) -> dict[str, bytes]:
-    return {
-        str(p.relative_to(root)): p.read_bytes()
-        for p in sorted(root.rglob("*"))
-        if p.is_file()
-        and "audit" not in p.name
-        and not p.name.endswith((".lock", "-shm"))
-        and not (p.name.endswith("-wal") and p.stat().st_size == 0)
-    }  # SQLite read-only connections may create empty WAL bookkeeping files; nonempty WAL data stays covered.
+    def entry(p: Path) -> bytes:
+        # Logical content only for SQLite stores: the store runs in WAL mode,
+        # and a background auto-checkpoint (flushing -wal into the main db with
+        # zero logical writes) changes raw bytes of both files while leaving
+        # content identical — a checkpoint racing the before/after reads was a
+        # hosted-CI flake (2026-10-03, 3.12 leg; same family as the budget
+        # fingerprint fix 62484c9967). A logical iterdump reads through the WAL,
+        # is invariant under checkpoint/repack, and still catches any real write.
+        import sqlite3
+        try:
+            con = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
+        except sqlite3.Error:
+            return p.read_bytes()
+        try:
+            h = __import__("hashlib").sha256()
+            for line in con.iterdump():
+                h.update(line.encode())
+            return h.digest()
+        except sqlite3.Error:
+            return p.read_bytes()  # not a live SQLite db: raw bytes are fine
+        finally:
+            con.close()
+
+    out: dict[str, bytes] = {}
+    for p in sorted(root.rglob("*")):
+        if not p.is_file() or "audit" in p.name or p.name.endswith((".lock", "-shm")):
+            continue
+        if p.name.endswith("-wal") and p.with_name(p.name[: -len("-wal")]).is_file():
+            continue  # sidecar of a hashed db: its content is in the logical dump
+        if p.name.endswith("-wal") and p.stat().st_size == 0:
+            continue  # empty WAL bookkeeping from read-only connections
+        out[str(p.relative_to(root))] = entry(p)
+    return out
 
 
 def test_snapshot_keeps_nonempty_wal_data_and_ignores_only_empty_wal(tmp_path: Path):
