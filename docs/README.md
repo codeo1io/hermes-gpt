@@ -93,6 +93,10 @@ These should remain true across documentation and implementation:
 
 Do not describe the unset state as "deny by default". The implementation defaults to all read-only Mission Control surfaces when the variable is absent.
 
+## Maintenance tooling
+
+- `tools/upstream_delta.py` — one-command upstream census for maintenance/catch-up cycles: HEAD sha, merge-base with the upstream remote, ahead/behind counts, upstream tip and tags, PyPI latest, and a missing-symbol census for the configured symbol list. `--json` emits machine-readable output; `--no-network` skips the PyPI probe. Exit codes: `0` census complete, `1` repository/git failure, `2` usage error. Run `python tools/upstream_delta.py --help` for the full contract.
+
 ## Historical release notes
 
 These are version records, not current setup instructions:

@@ -909,8 +909,20 @@ def classify(mission_id: str, node_id: str, env: dict[str, Any]) -> dict[str, An
         )
 
     # ---- 7. Semantic failure (implementation/QA defect) ---------------------
+    # A FAILED run always fails its contract's run-state criterion, so a
+    # NOT_SATISFIED/INVALID_CONTRACT verdict on a failed delegation is a
+    # consequence of the failure, not independent evidence about the work.
+    # Submitted as-is it would outrank every error-text signal below and label
+    # a rate-limited run as a semantic defect. The verdict is therefore
+    # withheld for failed delegations: the failure's own error channel
+    # (worker-exit kind, throughput tokens) decides, and unflavored failures
+    # fail closed as unknown. A verdict on a delegation whose run SUCCEEDED is
+    # independent evidence and still classifies semantic. (Same rule the
+    # upstream Autopilot observation builder applies envelope-side.)
+    verdict_semantic = dl_verdict in ("NOT_SATISFIED", "INVALID_CONTRACT")
+    verdict_withheld = verdict_semantic and dl_state == "failed"
     semantic_evidence = (
-        dl_verdict in ("NOT_SATISFIED", "INVALID_CONTRACT")
+        (verdict_semantic and not verdict_withheld)
         or bool(evidence["semantic"])
         or (worker_exit is not None and worker_exit["kind"] == "clean_exit")
     )
@@ -920,7 +932,7 @@ def classify(mission_id: str, node_id: str, env: dict[str, Any]) -> dict[str, An
             CLASS_SEMANTIC,
             reason=(
                 "validation verdict not satisfied"
-                if dl_verdict in ("NOT_SATISFIED", "INVALID_CONTRACT")
+                if verdict_semantic and not verdict_withheld
                 else "worker protocol violation (clean exit while running)"
                 if worker_exit is not None and worker_exit["kind"] == "clean_exit"
                 else "defect-flavored failure evidence"

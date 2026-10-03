@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import inspect
 import json
+import subprocess
+import sys
+import textwrap
+import threading
 from pathlib import Path
 
 import pytest
@@ -881,3 +885,163 @@ def test_write_jobs_removes_staging_file_on_failure(hermes_root: Path, monkeypat
     with pytest.raises(OSError):
         cron_mod._write_jobs(hermes_root, [{"id": "j1", "name": "x"}])
     assert list((hermes_root / "cron").glob("*.tmp")) == []
+
+
+# ---------------------------------------------------------------------------
+# rm-103: jobs.json read-modify-write serialization
+# ---------------------------------------------------------------------------
+
+
+def test_create_concurrent_all_jobs_survive(hermes_root, clean_env, audit_override, monkeypatch):
+    """Concurrent creates on one profile must not lose each other's writes.
+
+    Regression for the unlocked read-modify-write race (rm-103): two creates
+    that both read the same jobs.json snapshot each wrote a one-job file and
+    the other job silently vanished. With _jobs_lock across the RMW, every
+    create observes its predecessors' writes.
+    """
+    monkeypatch.setenv(op.OPERATOR_ENABLED_ENV, "1")
+    monkeypatch.setenv(op.OPERATOR_LEVEL_ENV, "cron")
+    monkeypatch.setenv(op.OPERATOR_APPLY_MODE_ENV, "direct")
+
+    threads_count = 6
+    barrier = threading.Barrier(threads_count)
+    results: list[dict] = []
+    results_lock = threading.Lock()
+
+    def create_one(i: int) -> None:
+        barrier.wait()
+        out = oc.hermes_cron_create(
+            profile="default", schedule="0 9 * * *", prompt=f"job {i}",
+            name=f"race-job-{i}", dry_run=False, hermes_root=hermes_root,
+        )
+        with results_lock:
+            results.append(json.loads(out))
+
+    threads = [threading.Thread(target=create_one, args=(i,)) for i in range(threads_count)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert all(r["success"] for r in results), results
+    jobs = oc._read_jobs(hermes_root)
+    ids = [j["id"] for j in jobs]
+    # Every create survived: no lost append, no duplicated id.
+    assert len(jobs) == threads_count
+    assert len(set(ids)) == threads_count
+    assert {j["name"] for j in jobs} == {f"race-job-{i}" for i in range(threads_count)}
+
+
+def test_state_update_survives_concurrent_create(hermes_root, clean_env, audit_override, monkeypatch):
+    """A state transition racing a create must not revert (rm-103).
+
+    The scheduler's double-run hazard: if a "paused" transition is lost to
+    a concurrent create that read the pre-transition snapshot, the job
+    reverts to "scheduled" and fires again. The lock serializes both RMWs.
+    """
+    monkeypatch.setenv(op.OPERATOR_ENABLED_ENV, "1")
+    monkeypatch.setenv(op.OPERATOR_LEVEL_ENV, "cron")
+    monkeypatch.setenv(op.OPERATOR_APPLY_MODE_ENV, "direct")
+
+    out = oc.hermes_cron_create(
+        profile="default", schedule="0 9 * * *", prompt="first",
+        name="first-job", dry_run=False, hermes_root=hermes_root,
+    )
+    first = json.loads(out)
+    assert first["success"] is True
+
+    profile_home = op.resolve_profile_home("default", hermes_root)
+    barrier = threading.Barrier(2)
+    errors: list[BaseException] = []
+    results: list[dict] = []
+    results_lock = threading.Lock()
+
+    def transition_state() -> None:
+        barrier.wait()
+        try:
+            # A locked state transition, the shape every in-module mutation
+            # now uses (the same helper the pause/finish paths go through).
+            with oc._jobs_lock(profile_home):
+                jobs = oc._read_jobs(profile_home)
+                jobs[0]["state"] = "paused"
+                oc._write_jobs(profile_home, jobs)
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    def create_second() -> None:
+        barrier.wait()
+        out2 = oc.hermes_cron_create(
+            profile="default", schedule="0 9 * * *", prompt="second",
+            name="second-job", dry_run=False, hermes_root=hermes_root,
+        )
+        with results_lock:
+            results.append(json.loads(out2))
+
+    t1 = threading.Thread(target=transition_state)
+    t2 = threading.Thread(target=create_second)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+    assert not errors, errors
+    assert all(r["success"] for r in results), results
+
+    jobs = oc._read_jobs(hermes_root)
+    assert len(jobs) == 2, "both writers' effects must be visible"
+    by_name = {j["name"]: j for j in jobs}
+    # The transition survived the concurrent create: no revert to
+    # "scheduled", so the scheduler will not double-run the paused job.
+    assert by_name["first-job"]["state"] == "paused"
+    assert by_name["second-job"]["state"] == "scheduled"
+
+
+def test_jobs_lock_serializes_cross_process(hermes_root, clean_env, tmp_path):
+    """The flock half of _jobs_lock must serialize two real processes (rm-103).
+
+    An RLock alone cannot see a second interpreter: without the flock on
+    jobs.json.lock, two subprocesses racing append-only RMWs lose writes.
+    """
+    worktree = Path(__file__).resolve().parent
+    per_process = 25
+    script = textwrap.dedent(
+        """
+        import sys
+        from pathlib import Path
+        sys.path.insert(0, __WORKTREE__)
+        import operator_cron as oc
+
+        profile_home = Path(__HOME__)
+        tag = sys.argv[1]
+        for i in range(__N__):
+            with oc._jobs_lock(profile_home):
+                jobs = oc._read_jobs(profile_home)
+                jobs.append({"id": f"{tag}-{i}", "name": f"{tag}-{i}", "state": "scheduled", "enabled": True})
+                oc._write_jobs(profile_home, jobs)
+        """
+    )
+    script = (
+        script.replace("__WORKTREE__", repr(str(worktree)))
+        .replace("__HOME__", repr(str(op.resolve_profile_home("default", hermes_root))))
+        .replace("__N__", str(per_process))
+    )
+
+    script_path = tmp_path / "cross_proc_writer.py"
+    script_path.write_text(script, encoding="utf-8")
+
+    procs = [
+        subprocess.Popen(
+            [sys.executable, str(script_path), tag],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        for tag in ("p1", "p2")
+    ]
+    for p in procs:
+        out, err = p.communicate(timeout=120)
+        assert p.returncode == 0, err.decode() or out.decode()
+
+    jobs = oc._read_jobs(hermes_root)
+    ids = {j["id"] for j in jobs}
+    assert len(jobs) == 2 * per_process, "no cross-process write may be lost"
+    assert len(ids) == 2 * per_process
+    assert all(j["state"] == "scheduled" for j in jobs)

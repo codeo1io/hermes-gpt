@@ -14,7 +14,9 @@ Behavioral notes:
   ``get_session``, ``try_acquire_session_turn_lease``, and
   ``release_session_turn_lease``.
 - The full ``SessionDB`` API is **not** implemented.  Any code that calls
-  unimplemented methods will fail fast with ``NotImplementedError``.
+  unimplemented methods fails fast with ``AttributeError`` (rm-108: raised
+  from ``__getattr__`` so ``hasattr``/``getattr``-with-default capability
+  probing — e.g. ``server.py``'s session adapter — works correctly).
 - ``source='webui'`` sessions are filtered by ``list_sessions_rich`` exactly as
   the chat UI expects.
 - This is **not** a drop-in replacement for the real SessionDB; it is a runtime
@@ -32,6 +34,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("hermes_gpt.ui_state")
+
+
+def _like_escape(value: str) -> str:
+    """Escape SQL LIKE wildcards so user text matches literally."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -234,6 +241,32 @@ class SessionDB:
         include_hidden: bool = False,
         **kwargs: Any,
     ) -> List[Dict[str, Any]]:
+        """List sessions with the filter subset the shim can honor (rm-108).
+
+        Honored: ``source``/``sources``/``exclude_sources``, ``id_query``,
+        ``min_message_count``, ``search_query`` (substring match against
+        ``title`` and ``id`` — the shim has no FTS5 message index),
+        ``archived_only`` (provably empty: the shim schema has no archived
+        concept), ``limit``/``offset``, both orderings.
+
+        Accepted and inert by construction: ``include_archived`` (no
+        session can be archived in the shim schema, so there is nothing to
+        exclude) and ``include_children`` (no parent/child hierarchy, so
+        there are no children to include or exclude).
+
+        Rejected explicitly: ``cwd_prefix`` (no cwd column — silently
+        ignoring it would return sessions from unrelated directories).
+        """
+        if cwd_prefix:
+            raise ValueError(
+                "hermes_gpt SessionDB shim does not support cwd_prefix "
+                "filtering (no cwd column in the shim schema)"
+            )
+        if archived_only:
+            # No archived concept in the shim schema: no session can ever be
+            # archived, so "only archived" is provably empty. Previously
+            # this silently returned every session (rm-108).
+            return []
         clauses = ["1=1"]
         params: List[Any] = []
         if source is not None:
@@ -250,6 +283,10 @@ class SessionDB:
         if id_query:
             clauses.append("id LIKE ?")
             params.append(f"%{id_query}%")
+        if search_query:
+            needle = f"%{_like_escape(search_query)}%"
+            clauses.append("(title LIKE ? ESCAPE '\\' OR id LIKE ? ESCAPE '\\')")
+            params.extend([needle, needle])
         if min_message_count:
             clauses.append("message_count >= ?")
             params.append(min_message_count)
@@ -329,6 +366,9 @@ class SessionDB:
 
     def __getattr__(self, name: str) -> Any:
         # Fail closed on any SessionDB method the chat UI does not exercise.
-        raise NotImplementedError(
+        # AttributeError (not NotImplementedError): __getattr__ contract —
+        # only AttributeError makes hasattr()/getattr(x, n, default) report
+        # "missing" instead of blowing up the probe itself (rm-108).
+        raise AttributeError(
             f"hermes_gpt SessionDB shim does not implement '{name}'"
         )

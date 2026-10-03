@@ -16,7 +16,8 @@ Safety rules:
 - Direct mutation requires operator enabled + level >= cron + apply_mode=direct + dry_run=false.
 - Run/pause use a fixed argv (``hermes cron run <job_id>`` / ``hermes cron pause <job_id>``)
   via ``run_argv`` (shell=False).
-- Copy/move read/write the cron ``jobs.json`` file directly. This is safe
+- Copy/move read/write the cron ``jobs.json`` file directly, under a
+  per-file lock (rm-103: in-process RLock + cross-process flock). This is safe
   because we control exactly which fields are reset (no provider/secret
   leakage), and we never touch .env / vault / auth files.
 - Cross-profile copy requires both profiles to be in the allowed list.
@@ -26,15 +27,17 @@ Safety rules:
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
 import re
 import secrets
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 import operator_policy as op
 
@@ -315,6 +318,104 @@ def _jobs_shape_key(profile_home: Path) -> str:
         return str(profile_home)
 
 
+IS_WINDOWS = os.name == "nt"
+
+# One RLock per jobs.json path (rm-103): MCP sync tools execute on worker
+# threads inside one server, so two cron tools can interleave
+# read-modify-write cycles on the same profile.
+_jobs_rlocks: dict[str, threading.RLock] = {}
+_jobs_rlocks_guard = threading.Lock()
+_jobs_lock_depth = threading.local()
+
+
+def _jobs_rlock(path: Path) -> threading.RLock:
+    key = str(path)
+    with _jobs_rlocks_guard:
+        lock = _jobs_rlocks.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _jobs_rlocks[key] = lock
+        return lock
+
+
+@contextlib.contextmanager
+def _jobs_lock(profile_home: Path) -> Iterator[None]:
+    """Serialize jobs.json read-modify-write cycles (rm-103).
+
+    Two layers, mirroring the owned idioms ``operator_job_supervisor.
+    _record_lock`` and ``operator_token_store._StoreLock``:
+
+    - in-process: an RLock per jobs.json path (MCP sync tools run on worker
+      threads, so tool-vs-tool interleaving is real within one server);
+    - cross-process: an exclusive flock on a ``jobs.json.lock`` sibling
+      (Windows: msvcrt byte-range lock), because more than one process
+      rewrites jobs.json (tool server vs a second server instance).
+
+    Reentrant within a thread: only the outermost acquisition takes the OS
+    lock, so a locked mutation may call other locked helpers. Direct
+    writers MUST hold this lock across the whole read-modify-write — the
+    bare ``_read_jobs``/``_write_jobs`` primitives stay lock-free (single
+    reads are safe via the atomic replace; uncovered RMW is a race).
+    """
+    path = _jobs_file(profile_home)
+    path_key = str(path)
+    depths = getattr(_jobs_lock_depth, "depths", None)
+    if depths is None:
+        depths = {}
+        _jobs_lock_depth.depths = depths
+    rlock = _jobs_rlock(path)
+    rlock.acquire()
+    depth = depths.get(path_key, 0)
+    handle = None
+    if depth == 0:
+        lock_path = path.with_name(path.name + ".lock")
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            handle = lock_path.open("a+b")
+            try:
+                lock_path.chmod(0o600)
+            except OSError:
+                pass
+            if IS_WINDOWS:
+                import msvcrt
+
+                handle.seek(0, os.SEEK_END)
+                if handle.tell() == 0:
+                    handle.write(b"0")
+                    handle.flush()
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        except OSError:
+            # A lock file we cannot create/lock (e.g. read-only filesystem)
+            # must not brick cron tooling: degrade to in-process only.
+            if handle is not None:
+                handle.close()
+                handle = None
+    depths[path_key] = depth + 1
+    try:
+        yield
+    finally:
+        depths[path_key] = depth
+        if depth == 0 and handle is not None:
+            try:
+                if IS_WINDOWS:
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                handle.close()
+        rlock.release()
+
+
 def _backup_corrupt_jobs(path: Path) -> None:
     """Preserve an unparseable jobs.json before the next atomic write
     replaces it (rm-021: silent overwrite destroyed the only copy).
@@ -372,6 +473,8 @@ def _write_jobs(profile_home: Path, jobs: list[dict[str, Any]]) -> None:
 
     The staging file is uniquely named (pid + random token) so concurrent
     writers never clobber each other, and it is fsynced before the rename.
+    RMW callers must hold ``_jobs_lock`` across read+write (rm-103); a bare
+    write only ever replaces, it never merges.
     """
     cron_dir = _cron_dir(profile_home)
     cron_dir.mkdir(parents=True, exist_ok=True)
@@ -872,8 +975,19 @@ def hermes_cron_copy(
             )
 
         policy.require_mutation(dry_run)
-        target_jobs.append(new_job)
-        _write_jobs(target_home, target_jobs)
+        with _jobs_lock(target_home):
+            # Re-read under the lock and re-check: the pre-plan read above is
+            # stale by the time the mutation lands (rm-103 concurrent copy).
+            target_jobs_now = _read_jobs(target_home)
+            if _is_duplicate(target_jobs_now, source_job):
+                raise ValueError(
+                    f"Target profile {target_profile!r} already has an active job "
+                    f"with the same name {source_job.get('name')!r} and schedule "
+                    f"{source_job.get('schedule_display') or source_job.get('schedule')!r}. "
+                    "Refusing to create a duplicate."
+                )
+            target_jobs_now.append(new_job)
+            _write_jobs(target_home, target_jobs_now)
         result = {
             "success": True,
             "dry_run": False,
@@ -1002,8 +1116,15 @@ def hermes_cron_move(
 
         # Step 1: copy (write to target).
         try:
-            target_jobs_after = list(target_jobs) + [new_job]
-            _write_jobs(target_home, target_jobs_after)
+            with _jobs_lock(target_home):
+                target_jobs_now = _read_jobs(target_home)
+                if _is_duplicate(target_jobs_now, source_job):
+                    raise ValueError(
+                        f"Target profile {target_profile!r} already has an active job "
+                        f"with the same name and schedule. Refusing to create a duplicate."
+                    )
+                target_jobs_after = list(target_jobs_now) + [new_job]
+                _write_jobs(target_home, target_jobs_after)
         except Exception as exc:
             op.audit_record(
                 tool="hermes_cron_move",
@@ -1193,7 +1314,6 @@ def hermes_cron_create(
             )
 
         profile_home = op.resolve_profile_home(profile, hermes_root)
-        jobs = _read_jobs(profile_home)
 
         new_id = _new_job_id()
         job_name = (
@@ -1272,8 +1392,12 @@ def hermes_cron_create(
             )
 
         policy.require_mutation(dry_run)
-        jobs.append(new_job)
-        _write_jobs(profile_home, jobs)
+        with _jobs_lock(profile_home):
+            # Re-read under the lock: concurrent appends since the pre-plan
+            # read must survive this write (rm-103).
+            jobs_now = _read_jobs(profile_home)
+            jobs_now.append(new_job)
+            _write_jobs(profile_home, jobs_now)
 
         result = {
             "success": True,

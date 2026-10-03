@@ -53,6 +53,7 @@ _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]|\x1b(?:\[[0-?]*[ -/]
 _AUTH_CLASSES = frozenset({"none", "read_only", "reversible_write", "high_impact"})
 _MAX_REMOTE_BYTES = 1_048_576
 _MAX_MANIFEST_BYTES = 64_000
+_READ_CHUNK_BYTES = 65_536
 _MAX_TEXT = 4_000
 _MAX_ITEMS = 64
 _BUILTIN_PROFILES = {
@@ -219,13 +220,34 @@ def _a2a_peers_with_resolved_tokens() -> dict[str, dict[str, Any]]:
     return out
 
 
+def _read_body_bounded(resp: Any, limit: int = _MAX_REMOTE_BYTES) -> bytes:
+    """Stream-read a peer response body, failing closed past ``limit`` (rm-109).
+
+    A single ``resp.read()`` materializes whatever the peer chooses to send
+    before any size check runs, so a misbehaving peer — or a MITM on a
+    plaintext http:// peer — can exhaust memory before the limit applies
+    (a socket timeout bounds waits, not body size). Chunked reads bound
+    memory to one chunk and abort with an error as soon as the peer exceeds
+    the limit; the surrounding ``with urlopen`` closes the connection, and
+    the raised ValueError means no partial body is ever parsed.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = resp.read(_READ_CHUNK_BYTES)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > limit:
+            raise ValueError("A2A peer response exceeded the bounded response limit")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def _http_get_json(url: str, headers: dict[str, str], timeout: int) -> dict[str, Any]:
     req = urllib.request.Request(url, headers=headers, method="GET")
     with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
-        data = resp.read()
-        if len(data) > _MAX_REMOTE_BYTES:
-            raise ValueError("A2A discovery response exceeded the bounded response limit")
-        return json.loads(data.decode("utf-8"))
+        return json.loads(_read_body_bounded(resp).decode("utf-8"))
 
 
 def _http_get_json_threaded(url: str, headers: dict[str, str], timeout: int) -> dict[str, Any]:
@@ -245,7 +267,7 @@ def _http_post_json(url: str, body: dict[str, Any], headers: dict[str, str], tim
     hdrs = {"Content-Type": "application/json", "A2A-Version": "1.0", **headers}
     req = urllib.request.Request(url, data=data, headers=hdrs, method="POST")
     with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
-        return json.loads(resp.read().decode("utf-8"))
+        return json.loads(_read_body_bounded(resp).decode("utf-8"))
 
 
 def _card_url(base_url: str) -> str:

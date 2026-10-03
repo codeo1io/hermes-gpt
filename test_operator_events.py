@@ -300,3 +300,117 @@ def test_query_and_tail_do_not_warn_without_allowlist(hermes_root, monkeypatch):
     query = json.loads(ev.hermes_events_query(limit=5, hermes_root=hermes_root))
     assert set(query["sources_queried"]) == set(ev.EVENT_SOURCES)
     assert query["warnings"] == []
+
+
+# ---------------------------------------------------------------------------
+# rm-104: audit source keeps the NEWEST records (bounded, sibling semantics)
+# ---------------------------------------------------------------------------
+
+
+def _audit_row(i: int, ts: str) -> dict:
+    return {
+        "timestamp": ts,
+        "profile": "dev",
+        "tool": "hermes_cron_list",
+        "task_id": f"task-{i}",
+        "success": True,
+        "summary": f"record {i}",
+    }
+
+
+def test_audit_source_keeps_newest_window_over_cap(hermes_root: Path):
+    """With more audit rows than MAX_PER_SOURCE, the visible window is the
+    latest one (rm-104 regression: the old top-down break kept the OLDEST
+    500, so the newest events were invisible and count_total undercounted
+    every in-window query)."""
+    rows = [
+        _audit_row(i, (datetime(2026, 9, 29) + timedelta(days=0.001 * i)).isoformat())
+        for i in range(600)
+    ]
+    _write_audit(hermes_root, rows)
+
+    out = json.loads(ev.hermes_events_query(hermes_root=hermes_root, source="audit", limit=20))
+    assert out["success"] is True
+    events = out["events"]
+    assert len(events) == 20
+    # Newest visible record is the last one written, not record 499.
+    assert events[0]["summary"] == "record 599"
+    # count_total reflects the returned window's population (600 written,
+    # newest 500 kept) — not 400 of 600 counted against the oldest window.
+    assert out["count_total"] == ev.MAX_PER_SOURCE
+    # Distinct, stable event ids across the cap boundary.
+    assert len({e["event_id"] for e in events}) == 20
+
+
+def test_audit_source_full_cap_window_is_contiguous_newest(hermes_root: Path):
+    rows = [_audit_row(i, (datetime(2026, 9, 29) + timedelta(days=0.001 * i)).isoformat()) for i in range(600)]
+    _write_audit(hermes_root, rows)
+
+    # MAX_QUERY_LIMIT clamps the page size; the full kept window is visible
+    # through count_total.
+    out = json.loads(ev.hermes_events_query(hermes_root=hermes_root, source="audit", limit=ev.MAX_QUERY_LIMIT))
+    events = out["events"]
+    assert len(events) == ev.MAX_QUERY_LIMIT
+    assert out["count_total"] == ev.MAX_PER_SOURCE
+    summaries = [e["summary"] for e in events]
+    # Newest-first ordering from the newest record down; the oldest side
+    # beyond the cap (records < 100) is the dropped side, not the newest.
+    assert summaries[0] == "record 599"
+    assert summaries[-1] == "record 400"
+    assert "record 399" not in summaries
+
+
+def test_audit_cap_warning_present_at_cap_and_absent_below(hermes_root: Path):
+    below = [_audit_row(i, (datetime(2026, 9, 29) + timedelta(days=0.001 * i)).isoformat()) for i in range(10)]
+    _write_audit(hermes_root, below)
+    out = json.loads(ev.hermes_events_query(hermes_root=hermes_root, source="audit", limit=5))
+    assert out["success"] is True
+    assert out["count_total"] == 10
+    assert all("capped" not in w for w in out["warnings"])
+
+    ev._cache.clear()
+    at_cap = below + [
+        _audit_row(i, (datetime(2026, 10, 1) + timedelta(days=0.001 * i)).isoformat())
+        for i in range(ev.MAX_PER_SOURCE)
+    ]
+    _write_audit(hermes_root, at_cap)
+    out2 = json.loads(ev.hermes_events_query(hermes_root=hermes_root, source="audit", limit=5))
+    assert any(f"capped at newest {ev.MAX_PER_SOURCE}" in w for w in out2["warnings"]), out2["warnings"]
+
+
+def test_events_tail_sees_newest_audit_rows(hermes_root: Path):
+    rows = [_audit_row(i, (datetime(2026, 9, 29) + timedelta(days=0.001 * i)).isoformat()) for i in range(600)]
+    _write_audit(hermes_root, rows)
+
+    out = json.loads(ev.hermes_events_tail(hermes_root=hermes_root, limit=3))
+    assert out["success"] is True
+    summaries = [e["summary"] for e in out["events"]]
+    assert summaries[0] == "record 599"
+    assert set(summaries) == {"record 599", "record 598", "record 597"}
+
+
+def test_audit_since_filter_applies_within_newest_window(hermes_root: Path):
+    rows = [_audit_row(i, (datetime(2026, 9, 29) + timedelta(days=0.001 * i)).isoformat()) for i in range(600)]
+    _write_audit(hermes_root, rows)
+
+    since = (datetime(2026, 9, 29) + timedelta(days=0.55)).isoformat()
+    out = json.loads(ev.hermes_events_query(hermes_root=hermes_root, source="audit", since=since, limit=ev.MAX_QUERY_LIMIT))
+    events = out["events"]
+    # Newest 500 kept are records 100..599; the since cutoff (~record 550)
+    # lands inside that window, so all returned rows satisfy it.
+    assert events, "in-window rows must be visible"
+    assert all(e["ts"] >= since for e in events)
+    assert events[0]["summary"] == "record 599"
+
+
+def test_audit_malformed_lines_do_not_break_newest_scan(hermes_root: Path):
+    with open(hermes_root / "logs" / "hermes_gpt_operator_audit.jsonl", "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(_audit_row(0, "2026-09-29T00:00:00")) + "\n")
+        fh.write("not json at all\n")
+        fh.write(json.dumps(_audit_row(1, "2026-09-29T00:01:00")) + "\n")
+        fh.write(json.dumps(["a", "list"]) + "\n")
+        fh.write(json.dumps(_audit_row(2, "2026-09-29T00:02:00")) + "\n")
+
+    out = json.loads(ev.hermes_events_query(hermes_root=hermes_root, source="audit", limit=10))
+    summaries = [e["summary"] for e in out["events"]]
+    assert summaries == ["record 2", "record 1", "record 0"]

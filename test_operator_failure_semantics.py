@@ -133,13 +133,35 @@ MATRIX_CASES: list[Case] = [
     # -- semantic_failure ----------------------------------------------------
     Case(
         "semantic: NOT_SATISFIED validation verdict",
-        {"delegation": {"state": "failed", "backend_state": "failed",
-                         "outcome": "failed",
+        {"delegation": {"state": "succeeded", "backend_state": "succeeded",
+                         "outcome": "succeeded",
                          "validation_verdict": "NOT_SATISFIED"}},
         fs.CLASS_SEMANTIC,
         row_key="escalate_semantic",
         replan=True,
-        note="D8 replan proposal allowed while attempts < max",
+        note="D8 replan proposal allowed while attempts < max; run SUCCEEDED so "
+             "the verdict is independent evidence (rm-102: withheld on failed runs)",
+    ),
+    Case(
+        "semantic withheld: NOT_SATISFIED verdict on a FAILED run is not evidence",
+        {"delegation": {"state": "failed", "backend_state": "failed",
+                         "outcome": "failed",
+                         "validation_verdict": "NOT_SATISFIED"}},
+        fs.CLASS_UNKNOWN,
+        uncertainty="missing_observation:unflavored_delegation_failure",
+        note="rm-102: a failed run always fails the run-state criterion, so the "
+             "verdict is a consequence of the failure — withheld, fail closed",
+    ),
+    Case(
+        "semantic withheld: rate-limited failed run with verdict → transient",
+        {"worker_exit": {"kind": "rate_limited", "code": 75},
+         "delegation": {"state": "failed", "backend_state": "failed",
+                         "outcome": "failed",
+                         "validation_verdict": "NOT_SATISFIED"}},
+        fs.CLASS_TRANSIENT,
+        row_key="retry_transient_backoff",
+        note="rm-102: withheld verdict lets the error channel rank the failure "
+             "(Level A backoff, not Level B replan)",
     ),
     Case(
         "semantic: clean_exit protocol violation",
@@ -156,15 +178,16 @@ MATRIX_CASES: list[Case] = [
     ),
     Case(
         "semantic: INVALID_CONTRACT verdict",
-        {"delegation": {"state": "failed", "backend_state": "failed",
-                         "outcome": "failed",
+        {"delegation": {"state": "succeeded", "backend_state": "succeeded",
+                         "outcome": "succeeded",
                          "validation_verdict": "INVALID_CONTRACT"}},
         fs.CLASS_SEMANTIC,
+        note="rm-102: independent evidence — the run itself succeeded",
     ),
     Case(
         "semantic: replan bound exhausted → no replan proposal",
-        {"delegation": {"state": "failed", "backend_state": "failed",
-                         "outcome": "failed",
+        {"delegation": {"state": "succeeded", "backend_state": "succeeded",
+                         "outcome": "succeeded",
                          "validation_verdict": "NOT_SATISFIED"},
          "plan": {"replan_attempts_used": 1}},
         fs.CLASS_SEMANTIC,
@@ -413,8 +436,8 @@ def run_class_action_semantics() -> None:
 def run_determinism() -> None:
     print("== determinism ==")
     obs = {
-        "delegation": {"state": "failed", "backend_state": "failed",
-                        "outcome": "failed",
+        "delegation": {"state": "succeeded", "backend_state": "succeeded",
+                        "outcome": "succeeded",
                         "validation_verdict": "NOT_SATISFIED"},
     }
     d1 = fs.finalize(fs.classify("msn-det", "node-a", fs._validate_envelope(obs)))
@@ -427,8 +450,8 @@ def run_determinism() -> None:
     # A semantically different observation changes the digest (compare within
     # the same class so the no-flavor fail-closed gate cannot mask the delta).
     obs2 = {
-        "delegation": {"state": "failed", "backend_state": "failed",
-                        "outcome": "failed",
+        "delegation": {"state": "succeeded", "backend_state": "succeeded",
+                        "outcome": "succeeded",
                         "validation_verdict": "NOT_SATISFIED"},
         "last_failure_error": "assertion error in test_foo",
     }
@@ -463,8 +486,8 @@ def run_public_surfaces(tmp_root: Path) -> None:
     # Fresh mission store for the recording test.
     _make_mission(tmp_root)
     obs = json.dumps({
-        "delegation": {"state": "failed", "backend_state": "failed",
-                        "outcome": "failed",
+        "delegation": {"state": "succeeded", "backend_state": "succeeded",
+                        "outcome": "succeeded",
                         "validation_verdict": "NOT_SATISFIED"},
     })
     # 1. Dry-run (default): read_only level, records nothing.

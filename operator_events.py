@@ -24,6 +24,7 @@ import os
 import re
 import sqlite3
 import time
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -163,10 +164,25 @@ def _cache_set(source: str, root: Path, events: list[dict[str, Any]]) -> None:
 
 
 def _read_audit_events(root: Path) -> list[dict[str, Any]]:
+    """Read the audit log keeping the NEWEST records (rm-104).
+
+    The audit JSONL is append-only and rotated at 5 MiB
+    (operator_policy._rotate_audit_log_if_needed), so a single streaming
+    pass with a ``deque(maxlen=MAX_PER_SOURCE)`` window keeps memory bounded
+    while retaining the newest records — matching the cron/kanban readers'
+    ORDER BY ... DESC LIMIT semantics. The previous top-down scan broke at
+    the cap and therefore kept the OLDEST records: on active deployments the
+    5 MiB file holds far more than 500 records, so the read-model's "newest
+    first" timeline was silently truncated at the oldest 500 and every newer
+    event was invisible (returned the file's record 499 as "newest" while
+    record 699 existed). ``event_id`` carries the overall parsed-record
+    index so ids stay unique and stable regardless of where the cap falls.
+    """
     path = root / "logs" / "hermes_gpt_operator_audit.jsonl"
     if not path.exists():
         return []
-    events: list[dict[str, Any]] = []
+    kept: deque[dict[str, Any]] = deque(maxlen=MAX_PER_SOURCE)
+    index = 0
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             for line in fh:
@@ -180,9 +196,9 @@ def _read_audit_events(root: Path) -> list[dict[str, Any]]:
                 if not isinstance(rec, dict):
                     continue
                 ts = rec.get("timestamp") or ""
-                events.append(
+                kept.append(
                     {
-                        "event_id": f"audit:{rec.get('timestamp') or ''}:{len(events)}",
+                        "event_id": f"audit:{ts}:{index}",
                         "ts": ts,
                         "source": "audit",
                         "kind": "tool_call",
@@ -195,11 +211,10 @@ def _read_audit_events(root: Path) -> list[dict[str, Any]]:
                         "trace_id": "",
                     }
                 )
-                if len(events) >= MAX_PER_SOURCE:
-                    break
+                index += 1
     except OSError:
         pass
-    return events
+    return list(kept)
 
 
 def _read_swarm_events(root: Path) -> list[dict[str, Any]]:
@@ -462,6 +477,23 @@ def _collect(
     return events
 
 
+def _warn_if_audit_capped(sources: list[str], root: Path, warnings: list[str]) -> None:
+    """Flag when the audit source hit its per-source cap (rm-104).
+
+    The audit reader keeps only the newest ``MAX_PER_SOURCE`` records, so
+    when the cap is reached ``count_total`` reflects the in-window
+    population among those newest records and older in-window events are
+    neither returned nor counted. Say so instead of truncating silently.
+    """
+    if "audit" not in sources:
+        return
+    if len(_events_for_source("audit", root)) >= MAX_PER_SOURCE:
+        warnings.append(
+            f"audit source capped at newest {MAX_PER_SOURCE} records; "
+            "count_total may undercount older in-window events"
+        )
+
+
 def _audit_events_call(tool: str, *, success: bool, summary: str, extra: dict[str, Any] | None = None) -> None:
     policy = op.OperatorPolicy()
     try:
@@ -555,6 +587,7 @@ def hermes_events_query(
     sources = _allowed_sources_queried(sources, warnings)
 
     events = _collect(root, sources=sources, since=since, until=until, subject_id=subject_id, kind=kind)
+    _warn_if_audit_capped(sources, root, warnings)
     _audit_events_call(
         tool,
         success=True,
@@ -579,6 +612,7 @@ def hermes_events_tail(limit: int = 20, hermes_root: Path | None = None) -> str:
     tail_sources = _allowed_sources_queried(list(EVENT_SOURCES), tail_warnings)
 
     events = _collect(root, sources=tail_sources)
+    _warn_if_audit_capped(tail_sources, root, tail_warnings)
     _audit_events_call(
         tool,
         success=True,

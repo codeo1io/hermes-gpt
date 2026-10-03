@@ -789,3 +789,92 @@ def test_authority_drift_skips_role_check_when_card_attests_no_role(monkeypatch,
     }, calls)
     out = json.loads(fleet.hermes_fleet_authority_drift(runner=runner, hermes_bin=HERMES, authority_manifest=authority_manifest(tmp_path)))
     assert out["findings"] == [{"agent": "nous-girl", "code": "HOST_ROLE_MISMATCH", "severity": "error"}]
+
+
+# ---------------------------------------------------------------------------
+# rm-109: peer response bodies are stream-bounded, never fully materialized
+# ---------------------------------------------------------------------------
+
+
+class _FakeBody:
+    """A response body that only honors explicitly sized reads.
+
+    ``read()`` without a size means "give me everything" — the unbounded
+    shape rm-109 removes. Any attempt at it fails the test.
+    """
+
+    def __init__(self, payload: bytes) -> None:
+        size = fleet._READ_CHUNK_BYTES
+        self.chunks = [payload[i : i + size] for i in range(0, len(payload), size)] or [b""]
+        self.sized_reads = 0
+
+    def read(self, n: int = -1) -> bytes:
+        assert n and n > 0, "bounded reader must pass an explicit chunk size"
+        self.sized_reads += 1
+        return self.chunks.pop(0) if self.chunks else b""
+
+    def close(self) -> None:
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.closed = True
+
+
+def _patch_urlopen(monkeypatch, body: bytes) -> _FakeBody:
+    fake = _FakeBody(body)
+
+    def fake_urlopen(req, timeout=None):  # noqa: ANN001
+        return fake
+
+    monkeypatch.setattr(fleet.urllib.request, "urlopen", fake_urlopen)
+    return fake
+
+
+def test_read_body_bounded_streams_in_chunks_and_accepts_at_limit(monkeypatch):
+    payload = b'{"ok": true, "pad": "' + b"x" * (fleet._MAX_REMOTE_BYTES - 23) + b'"}'
+    assert len(payload) == fleet._MAX_REMOTE_BYTES  # exactly at the bound
+    fake = _patch_urlopen(monkeypatch, payload)
+    out = fleet._http_get_json("http://peer.example/card", {}, timeout=5)
+    assert out["ok"] is True
+    # Streamed: more than one sized read for a multi-chunk body, and every
+    # read carried an explicit chunk size (enforced inside _FakeBody.read).
+    assert fake.sized_reads > 1
+
+
+def test_http_get_json_rejects_oversize_body_before_parsing(monkeypatch):
+    payload = b'{"pad": "' + b"x" * fleet._MAX_REMOTE_BYTES + b'"}'
+    _patch_urlopen(monkeypatch, payload)
+    with pytest.raises(ValueError, match="exceeded the bounded response limit"):
+        fleet._http_get_json("http://peer.example/card", {}, timeout=5)
+
+
+def test_http_post_json_rejects_oversize_body_before_parsing(monkeypatch):
+    # rm-103's sibling fix: POST previously had no bound at all.
+    payload = b'{"result": "' + b"y" * fleet._MAX_REMOTE_BYTES + b'"}'
+    _patch_urlopen(monkeypatch, payload)
+    with pytest.raises(ValueError, match="exceeded the bounded response limit"):
+        fleet._http_post_json(
+            "http://peer.example/a2a", {"jsonrpc": "2.0"}, {}, timeout=5
+        )
+
+
+def test_read_body_bounded_aborts_without_consuming_rest_of_stream():
+    # Two chunks: first at the limit, second pushes past it. The reader
+    # must raise on the second chunk rather than accumulating more.
+    fake = _FakeBody(b"z" * (fleet._MAX_REMOTE_BYTES + 1))
+    with pytest.raises(ValueError, match="bounded response limit"):
+        fleet._read_body_bounded(fake)
+    # It stopped reading: chunks beyond the abort were never pulled.
+    remaining = sum(len(c) for c in fake.chunks)
+    assert remaining < fleet._READ_CHUNK_BYTES * 2
+
+
+def test_http_post_json_normal_body_round_trips(monkeypatch):
+    _patch_urlopen(monkeypatch, json.dumps({"jsonrpc": "2.0", "result": {"id": 7}}).encode())
+    out = fleet._http_post_json(
+        "http://peer.example/a2a", {"jsonrpc": "2.0", "method": "ping"}, {}, timeout=5
+    )
+    assert out["result"]["id"] == 7

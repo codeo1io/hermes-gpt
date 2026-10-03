@@ -211,3 +211,11 @@ pre-existing environment skips; ruff clean. 14 tracked files changed,
 - **Candidate hardening:** autouse fixture resetting `set_audit_log_override`;
   additive py3.13 CI lane (ci edits were prohibited in-cycle); the two
   environment-dependent skips in the full suite remain unowned.
+
+## Cycle 2026-10-03 — repository-maintenance ff50c476 cycle 1 (run 2f81870e7a06)
+
+- scope: adversarial assess (4 findings, 2 barrier/window repros), ecosystem research (upstream v0.13 #82 Autopilot gap 9 commits; no v0.13 tag), roadmap +55 (rm-102..rm-109), prioritized batch "operator correctness & reliability hardening", stewardship request, implementation + targeted/full validation
+- implemented: rm-102 classifier verdict-withholding; rm-103 cron jobs.json RLock+flock RMW (Barrier regression proves 50/50 serialization); rm-104 newest-first bounded audit tail; rm-108 hermes_state contract tests + AttributeError; rm-109 fleet A2A body bounds; stretch rm-107 tools/upstream_delta.py census helper
+- validation (recorded, not re-run in compound): impacted lane 292 passed/25.58s; full suite local_validation_gate RC=0 'python -m pytest -q' (result-2369540-352507068.json, ~1649+5sk, workers=4); ruff 0.15.10 clean (12 surfaces); digest validation:v1:f64b8856...3c999 reproduced
+- artifacts: .conductor/prioritization-2f81870e7a06.md, .conductor/stewardship/6428dc239b36468c8399cea4cb0cf569.md, ROADMAP.md cycle block + this outcome block
+- carry-forward: rm-105 + rm-106 lead cycle 2; fleet collision scan re-run at next selection; review/landing outcomes recorded by the next cycle's assessment
