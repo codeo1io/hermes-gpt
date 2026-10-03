@@ -1402,3 +1402,130 @@ if __name__ == "__main__":
 def test_controller_loop() -> None:
     """Shadow reconciler matrix under pytest."""
     assert run() == 0, "controller shadow loop matrix reported failures"
+
+
+def test_l2_work_contract_carries_declared_artifacts():
+    """rm-186: controller contracts must carry the plan node's declared
+    expected_artifacts (twin of the landed autopilot fix, PR #26)."""
+    requirement = {
+        "profile": "operator",
+        "skills": [],
+        "authorization_class": "reversible_write",
+        "budget": {},
+        "expected_artifacts": ["work-contract.json", "evidence.json"],
+    }
+    contract = controller._l2_work_contract(
+        "m" + "a" * 39,
+        "n1",
+        requirement,
+        target_name="operator",
+        idempotency_key="k" * 16,
+        attempt_seq=0,
+        hermes_root=None,
+    )
+    assert contract["expected_artifacts"] == ["work-contract.json", "evidence.json"]
+    assert contract["completion_criteria"]["artifacts_present"] is True
+
+
+def test_l2_work_contract_parity_with_autopilot():
+    """rm-186: for the same node + requirement the controller contract and the
+    autopilot contract must agree on declared artifacts (regression adapted
+    from the assess-phase probe that proved the divergence)."""
+    autopilot = pytest.importorskip("operator_autopilot")
+    node = {"node_id": "n1", "expected_artifacts": ["work-contract.json", "evidence.json"]}
+    requirement = {
+        "profile": "operator",
+        "skills": [],
+        "authorization_class": "reversible_write",
+        "budget": {},
+        "expected_artifacts": ["work-contract.json", "evidence.json"],
+    }
+    mission = "m" + "a" * 39
+    controller_contract = controller._l2_work_contract(
+        mission, node["node_id"], requirement,
+        target_name="operator", idempotency_key="k" * 16, attempt_seq=0, hermes_root=None,
+    )
+    autopilot_contract = autopilot._build_contract(
+        mission, node, requirement=requirement, agent="operator",
+        key="k" * 16, attempt=0, hermes_root=None,
+    )
+    assert controller_contract["expected_artifacts"] == autopilot_contract["expected_artifacts"]
+    assert (
+        controller_contract["completion_criteria"]["artifacts_present"]
+        == autopilot_contract["completion_criteria"]["artifacts_present"]
+        is True
+    )
+
+
+def _write_contract_evidence(root, mission_id, node_id, artifacts, min_bytes=1):
+    contracts_dir = root / "missions" / mission_id / "contracts"
+    evidence_dir = root / "missions" / mission_id / "evidence" / node_id
+    contracts_dir.mkdir(parents=True, exist_ok=True)
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    (contracts_dir / f"{node_id}.json").write_text('{"status": "completed"}')
+    (evidence_dir / "evidence.json").write_text("x" * max(min_bytes, 1))
+    for name in artifacts:
+        (evidence_dir / name).write_text("x" * max(min_bytes, 1))
+    return evidence_dir
+
+
+def test_l2_reconcile_node_fails_closed_when_declared_evidence_missing(controller_store):
+    """rm-186: a completed plan-node state must not be trusted when the node
+    declares artifacts and the observable evidence is absent."""
+    root, conn, cursor = controller_store
+    cursor.execute(
+        "INSERT INTO plan_nodes (node_id, title, state, capability_req, budget, notes, requires_approval)"
+        " VALUES ('n1', 'node', 'completed', 'operator', '{}', '', 0)"
+    )
+    conn.commit()
+    outcome = controller._l2_reconcile_node(
+        cursor, "m" + "a" * 39, "n1",
+        requirement={"profile": "operator", "expected_artifacts": ["evidence.json"]},
+        expected_artifacts=["evidence.json"],
+        hermes_root=root,
+    )
+    assert outcome["status"] == "failed"
+    assert "declared evidence is missing" in outcome["reason"]
+    assert outcome["detail"]["expected_artifacts"] == ["evidence.json"]
+
+
+def test_l2_reconcile_node_trusts_completed_state_when_evidence_present(controller_store):
+    """rm-186: completed stays completed when the declared evidence IS
+    observable under the mission contract/evidence tree."""
+    root, conn, cursor = controller_store
+    mission = "m" + "a" * 39
+    cursor.execute(
+        "INSERT INTO plan_nodes (node_id, title, state, capability_req, budget, notes, requires_approval)"
+        " VALUES ('n1', 'node', 'completed', 'operator', '{}', '', 0)"
+    )
+    conn.commit()
+    _write_contract_evidence(root, mission, "n1", ["evidence.json"])
+    outcome = controller._l2_reconcile_node(
+        cursor, mission, "n1",
+        requirement={"profile": "operator", "expected_artifacts": ["evidence.json"]},
+        expected_artifacts=["evidence.json"],
+        hermes_root=root,
+    )
+    assert outcome == {"status": "completed", "node": "n1", "reason": "state is completed"}
+
+
+def test_l2_execute_node_dispatch_contract_carries_declared_artifacts(controller_store, monkeypatch):
+    """rm-186: the dispatch lane must feed the plan-document node's declared
+    artifacts into the work contract it dispatches."""
+    root, conn, cursor = controller_store
+    cursor.execute(
+        "INSERT INTO plan_nodes (node_id, title, state, capability_req, budget, notes, requires_approval)"
+        " VALUES ('n1', 'node', 'ready', 'operator', '{}', '', 0)"
+    )
+    conn.commit()
+    captured = {}
+
+    def fake_dispatch(cursor, contract):
+        captured["contract"] = contract
+        return {"status": "queued", "job": "j1"}
+
+    monkeypatch.setattr(controller, "_l2_execute_dispatch", fake_dispatch)
+    node = {"node_id": "n1", "expected_artifacts": ["work-contract.json", "evidence.json"]}
+    controller._l2_execute_node(cursor, node, hermes_root=None)
+    assert captured["contract"]["expected_artifacts"] == ["work-contract.json", "evidence.json"]
+    assert captured["contract"]["completion_criteria"]["artifacts_present"] is True
