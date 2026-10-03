@@ -25,6 +25,10 @@ FINANCE_ENABLE_MARKER = ".finance-enabled"
 EVIDENCE_SCHEMA = "finance.evidence/v1"
 DECISION_SCHEMA = "finance.decision/v1"
 MAX_EVIDENCE_CHARS = 48_000
+# rm-144: request_id must be an opaque identifier from a closed character set.
+# It is echoed into prompts downstream, so no metacharacter (quote, brace,
+# newline, space, unicode) may ever enter it at the boundary.
+REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 MAX_RESULT_CHARS = 32_000
 MIN_TIMEOUT = 10
 MAX_TIMEOUT = 300
@@ -147,6 +151,13 @@ def _validate_evidence(evidence_json: str) -> tuple[dict[str, Any], str] | str:
             "INVALID_REQUEST_ID",
             "Finance request_id must contain 1 to 128 characters.",
             "Provide a bounded opaque request identifier.",
+        )
+    if REQUEST_ID_RE.fullmatch(request_id) is None:
+        return _error(
+            "INVALID_REQUEST_ID",
+            "Finance request_id must use only the characters A-Z a-z 0-9 . _ : - "
+            "and must start with a letter or digit.",
+            "Provide a bounded opaque request identifier (letters, digits, dot, underscore, colon, hyphen).",
         )
     if not isinstance(intent, str) or not intent.strip() or len(intent) > 160:
         return _error(

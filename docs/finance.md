@@ -46,7 +46,7 @@ The local Hermes installation must contain a `finance` profile with a `SOUL.md`.
 
 A request uses `finance.evidence/v1` and includes:
 
-- `request_id`: opaque bounded identifier;
+- `request_id`: opaque bounded identifier of 1-128 characters from `A-Z a-z 0-9 . _ : -`, starting with a letter or digit (the boundary rejects anything else with `INVALID_REQUEST_ID`; it is copied into prompts, so no other characters may enter it);
 - `intent`: concise decision or analysis class;
 - `as_of`: source-data timestamp;
 - `coverage.status`: one of `complete`, `partial`, `recent_only`, `stale`, or `unknown`;
