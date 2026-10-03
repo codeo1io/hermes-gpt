@@ -58,6 +58,18 @@ def _make_state_db(path: Path, *, sessions: int = 2, delegations: list[dict] | N
         conn.execute(
             "INSERT OR IGNORE INTO session_model_usage VALUES (2, 'ses-1', 200, 100, 0.10, 'unknown')"
         )
+        # rm-132: a stale (30h-old) session with usage rows. The `_24h`
+        # aggregates must exclude it; an unfiltered read would report
+        # all-time totals under the `_24h` keys.
+        conn.execute(
+            "INSERT OR IGNORE INTO sessions VALUES (?,?,?,?,?,?,?)",
+            ("ses-stale", "user", "model-x", "default",
+             (datetime.now(timezone.utc) - timedelta(hours=30)).isoformat(),
+             None, (datetime.now(timezone.utc) - timedelta(hours=30)).isoformat()),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO session_model_usage VALUES (3, 'ses-stale', 1000, 500, 5.0, 'known')"
+        )
         for d in delegations or []:
             conn.execute(
                 "INSERT OR IGNORE INTO async_delegations VALUES (?,?,?,?,?,?,?,?)",
@@ -570,10 +582,67 @@ def test_usage_aggregates_across_profiles(hermes_root):
     out = _run("hermes_mission_usage_tool", hermes_root)
     assert out["data"]["sessions_24h"] == 3  # 2 default + 1 dev
     assert set(out["data"]["by_profile"].keys()) == {"default", "dev"}
-    # Each profile contributes 300 in / 150 out from the fixture usage rows.
-    assert out["data"]["tokens_24h"]["input"] == 600
-    assert out["data"]["tokens_24h"]["output"] == 300
+    # Windowed to the last 24h (rm-132): default contributes ses-0 + ses-1
+    # (300 in / 150 out); dev seeds only ses-0 (100 in / 50 out) — its orphan
+    # ses-1 usage row has no session to window against and is excluded, as is
+    # the 30h-old ses-stale row.
+    assert out["data"]["tokens_24h"]["input"] == 400
+    assert out["data"]["tokens_24h"]["output"] == 200
     assert out["data"]["estimated_cost_24h_usd"] > 0
+
+
+def test_usage_24h_window_excludes_stale_sessions(hermes_root):
+    """rm-132: the `_24h` keys must be windowed, never all-time.
+
+    The fixture seeds an out-of-window session (`ses-stale`, 30h old, usage
+    1000 in / 500 out / $5.00) in every profile. Windowed sums must exclude
+    it and the dev profile's orphan `ses-1` usage row; an unfiltered read
+    would report 1600 in / 1300 out / +$10 under the `_24h` keys.
+    """
+    out = _run("hermes_mission_usage_tool", hermes_root)
+    data = out["data"]
+    assert data["sessions_24h"] == 3  # stale session is outside the window
+    assert data["tokens_24h"]["input"] == 400  # (100 + 200) + 100
+    assert data["tokens_24h"]["output"] == 200  # (50 + 100) + 50
+    # Known costs only: default (0.05 + 0.10) + dev ses-0 (0.05).
+    assert data["estimated_cost_24h_usd"] == pytest.approx(0.20)
+    assert data["by_profile"]["default"]["tokens_in"] == 300
+    assert data["by_profile"]["dev"]["tokens_in"] == 100
+    assert out["warnings"] == []
+
+
+def test_usage_schema_drift_falls_back_to_all_time_with_warning(hermes_root):
+    """rm-132: when `session_model_usage` cannot be linked to session start
+    (schema drift — no session_id column), that profile degrades EXPLICITLY
+    to all-time sums with an `ALL-TIME` warning, never silently."""
+    # Re-shape the default profile's usage table into a session_id-less variant.
+    conn = sqlite3.connect(hermes_root / "state.db")
+    try:
+        conn.execute("ALTER TABLE session_model_usage RENAME TO session_model_usage_linked")
+        conn.execute(
+            "CREATE TABLE session_model_usage ("
+            " id INTEGER PRIMARY KEY, input_tokens INTEGER,"
+            " output_tokens INTEGER, estimated_cost_usd REAL, cost_status TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO session_model_usage"
+            " SELECT id, input_tokens, output_tokens, estimated_cost_usd, cost_status"
+            " FROM session_model_usage_linked"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    mission._cache_clear()
+
+    out = _run("hermes_mission_usage_tool", hermes_root)
+    drift = [w for w in out["warnings"] if "ALL-TIME" in w]
+    assert drift, f"expected explicit all-time degradation warning, got {out['warnings']}"
+    assert "default" in drift[0]
+    # Default falls back to all-time (100 + 200 + 1000 = 1300 in);
+    # dev still windows (100 in — ses-0 only, orphan excluded).
+    assert out["data"]["by_profile"]["default"]["tokens_in"] == 1300
+    assert out["data"]["by_profile"]["dev"]["tokens_in"] == 100
+    assert out["data"]["tokens_24h"]["input"] == 1400
 
 
 # ---------------------------------------------------------------------------

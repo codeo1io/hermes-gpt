@@ -536,3 +536,120 @@ def test_name_pair_heuristic_preserves_model_strings(ui_root):
     out = ui_security.redact_browser({"note": "mail tony.stark@example.com now"})
     assert "tony.stark@example.com" not in out["note"]
     assert "[redacted-email]" in out["note"]
+
+
+# ---------------------------------------------------------------------------
+# rm-131: status reads must not block the serving event loop
+# ---------------------------------------------------------------------------
+
+
+def test_connection_and_me_do_not_stall_event_loop(ui_root, monkeypatch):
+    """rm-131 regression: /api/connection + /api/me off-load token-store reads.
+
+    ``account_status`` reaches ``TokenStore.status`` — a synchronous sqlite
+    read (connect timeout 15.0). While that read is blocked, a trivial
+    concurrent handler served by the SAME event loop must still complete;
+    the connection store polls this endpoint to detect restarts
+    (web/src/stores/connection.ts), and a blocked loop would stall every
+    loopbound request including SSE and WS.
+
+    A sync TestClient cannot observe this, so the ASGI app is driven
+    directly: the slow request runs on a dedicated event loop in this thread
+    while a helper thread probes that loop's responsiveness from outside
+    (``run_coroutine_threadsafe``). If the status read ran on the loop (the
+    pre-rm-131 bug), the probe coroutine could never be scheduled and the
+    probe times out deterministically. No wall-clock latency assertion is
+    used, so the test stays stable on a loaded machine.
+    """
+    import asyncio
+    import threading
+    from concurrent.futures import TimeoutError as FutureTimeout
+
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse
+    from starlette.routing import Route
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked_status(_root=None):
+        entered.set()
+        assert release.wait(timeout=30.0), "test never released the status read"
+        return ui_security.ACCOUNT_STATUS_OK
+
+    monkeypatch.setattr(ui_security, "account_status", blocked_status)
+
+    async def probe(_request):
+        return JSONResponse({"probe": True})
+
+    app = Starlette(
+        routes=[*ui_security.ui_security_routes(), Route("/api/_probe", probe, methods=["GET"])]
+    )
+
+    async def asgi_call(path: str):
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "http_version": "1.1",
+            "method": "GET",
+            "path": path,
+            "raw_path": path.encode(),
+            "query_string": b"",
+            "root_path": "",
+            "scheme": "http",
+            "headers": [(b"host", b"testserver")],
+            "client": ("testclient", 50000),
+            "server": ("testserver", 80),
+        }
+        messages: list[dict] = []
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            messages.append(message)
+
+        await app(scope, receive, send)
+        return messages
+
+    loop = asyncio.new_event_loop()
+    probe_messages: list[dict] | None = None
+    probe_failed = False
+
+    def helper():
+        nonlocal probe_messages, probe_failed
+        if not entered.wait(timeout=30.0):
+            probe_failed = True
+            return
+        try:
+            future = asyncio.run_coroutine_threadsafe(asgi_call("/api/_probe"), loop)
+            probe_messages = future.result(timeout=10.0)
+        except FutureTimeout:
+            probe_failed = True
+        finally:
+            release.set()
+
+    thread = threading.Thread(target=helper)
+    thread.start()
+    try:
+        slow_messages = loop.run_until_complete(asgi_call("/api/connection"))
+        me_messages = loop.run_until_complete(asgi_call("/api/me"))
+    finally:
+        release.set()
+        thread.join(timeout=40.0)
+        loop.close()
+
+    assert not probe_failed, (
+        "serving event loop stalled by a blocked status read — /api/connection "
+        "and /api/me must off-load token-store reads (rm-131)"
+    )
+    assert probe_messages and probe_messages[0]["status"] == 200
+
+    def body(messages: list[dict]) -> bytes:
+        return b"".join(m.get("body", b"") for m in messages if m["type"] == "http.response.body")
+
+    assert b'"probe":true' in body(probe_messages)
+    assert slow_messages[0]["status"] == 200
+    assert b"accountStatus" in body(slow_messages)
+    assert me_messages[0]["status"] == 200
+    assert b"accountStatus" in body(me_messages)

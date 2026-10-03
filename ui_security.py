@@ -36,6 +36,7 @@ Import-safe: no hard dependency on Hermes internals. ``operator_mission`` and
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import time
@@ -640,11 +641,23 @@ def connection_payload(hermes_root: Path | None = None) -> dict[str, Any]:
 
 
 async def me_endpoint(_request: Request) -> JSONResponse:
-    return JSONResponse(ok(me_payload()))
+    # rm-131: the payload chain reaches TokenStore.status, a synchronous
+    # sqlite read (connect timeout 15.0); it must never run on the serving
+    # event loop. See connection_endpoint for the full rationale.
+    return JSONResponse(ok(await asyncio.to_thread(me_payload)))
 
 
 async def connection_endpoint(_request: Request) -> JSONResponse:
-    return JSONResponse(ok(connection_payload()))
+    # rm-131: the browser's connection store polls this endpoint
+    # (web/src/stores/connection.ts) to detect restarts, so it must stay
+    # responsive even when token stores are slow: account_status reaches
+    # TokenStore.status (synchronous sqlite, connect timeout=15.0) and would
+    # otherwise stall every loopbound request — including SSE and WS.
+    # Off-load the whole payload build to a worker thread (the in-file
+    # pattern ui_chat.py uses for session DB off-loads; TokenStore.status
+    # opens its own connection per call, so moving it off-loop is
+    # thread-safe).
+    return JSONResponse(ok(await asyncio.to_thread(connection_payload)))
 
 
 def ui_security_routes() -> list[BaseRoute]:
