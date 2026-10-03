@@ -39,10 +39,15 @@ Use this checklist before publishing a Hermes GPT release artifact.
 
 ## 4. Package build and hygiene
 
+- Build the web UI first so the sdist ships real assets (`rm-191`):
+  - `cd web && npm ci && npm run build && cd ..`
+  - `MANIFEST.in` grafts `assets/` and `web/dist` into the sdist. A release cut from an unbuilt tree ships zero web assets and fails the hygiene gate below with `missing_web_assets`.
 - `python -m build`
 - `python -m twine check dist/*`
 - Confirm wheel and sdist contain the current public docs expected by `pyproject.toml` / `MANIFEST.in`, including:
   - `README.md`
+  - the README hero image under `assets/` (the file referenced at the top of `README.md`)
+  - `web/dist/index.html` plus at least one hashed `web/dist/assets/*` file
   - `docs/README.md`
   - `docs/operator-mode.md`
   - `docs/codex.md`
@@ -53,6 +58,8 @@ Use this checklist before publishing a Hermes GPT release artifact.
   - `docs/retention-policy.md`
   - current release notes
 - Run `python tools/check_package_hygiene.py dist/*` and require exit `0` / `CLEAN`.
+  - For sdists this also asserts the web-asset truth above (`missing_web_assets` is release-blocking).
+- Wheels intentionally do NOT ship `web/dist`: the installed UI resolves `HERMES_GPT_UI_DIR`, else serves the not-built placeholder. For packaged installs, either build the SPA in place (`cd web && npm ci && npm run build`) or point `HERMES_GPT_UI_DIR` at an existing build — document this wherever packaged deployment is described.
 - Confirm package artifacts contain no absolute private machine paths, RFC1918/Tailscale addresses, machine hostnames, live operational metrics, or private release-planning packets.
 
 ## 5. Security invariants

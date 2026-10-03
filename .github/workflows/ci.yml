@@ -79,38 +79,27 @@ jobs:
           test_ui_fabric.py
       - name: Run binary export regression tests
         run: python -m pytest -q test_operator_export.py test_server_export.py
-      - name: Compile operator modules
-        run: >-
-          python -m py_compile
-          server.py
-          codex_core.py
-          codex_mcp.py
-          mcp_compat.py
-          codex_config.py
-          operator_codex.py
-          operator_contract.py
-          fabric_artifacts.py
-          fabric_write_guard.py
-          operator_fabric.py
-          operator_fabric_control.py
-          operator_fabric_router.py
-          operator_fabric_g4c.py
-          operator_fabric_view.py
-          operator_fleet.py
-          operator_runners.py
-          operator_swarm.py
-          operator_swarm_workflows.py
-          operator_workspace.py
-          operator_export.py
-          updater.py
-          operator_recovery.py
-          operator_review.py
-          operator_events.py
-          operator_oauth.py
-          token_store.py
-          seams.py
-          ui_api.py
-          ui_fabric.py
+      # Compile every non-test root module (rm-190). The previous folded
+      # list hand-maintained 29 of 60 modules and drifted silently — the
+      # same failure mode the lint gate fixed repo-wide (rm-017). The
+      # module set is discovered here, so a newly added root module can
+      # never be skipped by omission.
+      - name: Compile all root modules
+        run: |
+          python - <<'PY'
+          import pathlib
+          import py_compile
+
+          mods = sorted(
+              p for p in pathlib.Path(".").glob("*.py")
+              if not p.name.startswith("test_")
+          )
+          if not mods:
+              raise SystemExit("compile gate: no root modules discovered")
+          for mod in mods:
+              py_compile.compile(str(mod), doraise=True)
+          print(f"compile gate OK: {len(mods)} non-test root modules compiled")
+          PY
       - name: Check whitespace
         run: git diff --check
 
@@ -223,6 +212,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      # Build the SPA first so the sdist grafts real web/dist assets (rm-191).
+      # Mirrors the web job (node 22, no npm cache). Without this step the
+      # sdist ships zero web assets and tools/check_package_hygiene.py fails
+      # the artifact with missing_web_assets.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Build web dist for packaging
+        run: |
+          npm --prefix web ci
+          npm --prefix web run build
       - run: python -m pip install build twine
       - run: python -m build
       - run: python -m twine check dist/*

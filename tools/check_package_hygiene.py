@@ -11,6 +11,15 @@ private/operational patterns that must never ship publicly:
 - high-confidence private member names such as .env, *.pem, *.key, logs,
   __pycache__, and .pytest_cache
 
+It also asserts sdist ASSET TRUTH (rm-191): every .tar.gz must carry the built
+web UI (``web/dist/index.html`` plus at least one hashed
+``web/dist/assets/*`` member) and the README hero images under ``assets/``.
+A release cut from an unbuilt tree previously shipped zero web assets while
+still scanning CLEAN; that silent gap is now a release-blocking
+``missing_web_assets`` finding. Wheels intentionally do not ship ``web/dist``
+(documented post-install build, see RELEASE_CHECKLIST.md section 4), so the
+assertion applies to sdists only.
+
 Generic localhost (127.0.0.1), placeholder Windows paths, and explicit
 placeholder usernames (e.g. ``/home/user``) are allowed and not flagged.
 
@@ -90,6 +99,11 @@ PRIVATE_CONFIG_COMPONENTS = {
     ".gnupg",
     ".kube",
 }
+
+# sdist asset truth (rm-191): members every .tar.gz must contain.
+SDIST_REQUIRED_MEMBERS = ("web/dist/index.html",)
+# and at least one member must match each of these prefixes.
+SDIST_REQUIRED_PREFIXES = ("web/dist/assets/", "assets/")
 KNOWN_BINARY_SUFFIXES = {
     ".pyc", ".so", ".dll", ".exe", ".png", ".jpg", ".jpeg", ".gif",
     ".ico", ".woff", ".woff2", ".ttf", ".whl", ".gz", ".zip",
@@ -167,10 +181,34 @@ def scan_text(text: str) -> list[tuple[str, str]]:
     return findings
 
 
+def scan_sdist_asset_truth(names: list[str]) -> list[tuple[str, str]]:
+    """Assert the sdist ships the built web UI + README assets (rm-191).
+
+    Returns [(pattern_name, detail)] findings. Called only for .tar.gz
+    artifacts; wheels intentionally do not ship web/dist.
+    """
+    findings: list[tuple[str, str]] = []
+    # sdist members are rooted at "<name>-<version>/"; strip that single
+    # leading component so requirements can be stated relative to the source
+    # tree ("web/dist/index.html").
+    normalized = {
+        name.split("/", 1)[1] if "/" in name else name for name in names
+    }
+    for required in SDIST_REQUIRED_MEMBERS:
+        if required not in normalized:
+            findings.append(("missing_web_assets", required))
+    for prefix in SDIST_REQUIRED_PREFIXES:
+        if not any(name.startswith(prefix) for name in normalized):
+            findings.append(("missing_web_assets", f"at least one {prefix}* member"))
+    return findings
+
+
 def scan_artifact(path: Path) -> list[tuple[str, str, str]]:
     """Scan one artifact; return [(member_name, pattern, matched_text)]."""
     results: list[tuple[str, str, str]] = []
+    names: list[str] = []
     for member, data in iter_archive_members(path):
+        names.append(member)
         for pattern, matched in scan_member_name(member):
             results.append((member, pattern, matched))
         if not is_text_member(member, data):
@@ -181,6 +219,9 @@ def scan_artifact(path: Path) -> list[tuple[str, str, str]]:
             continue
         for pattern, matched in scan_text(text):
             results.append((member, pattern, matched))
+    if path.name.endswith(".tar.gz"):
+        for pattern, detail in scan_sdist_asset_truth(names):
+            results.append((str(path), pattern, detail))
     return results
 
 

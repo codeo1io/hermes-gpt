@@ -34,3 +34,11 @@ prune tmp-operator-test
 prune __pycache__
 prune .pytest_cache
 global-exclude *.py[cod] *.log *.err.log .env .env.* *.pem
+# Web UI + README hero truth (rm-191): the sdist must carry the built SPA
+# (web/dist) and the README hero images under assets/. NOTE: `prune dist`
+# above strips EVERY directory named dist — including web/dist — so these
+# grafts must stay AFTER it. web/dist is a build product (never committed):
+# build it first (`cd web && npm ci && npm run build`) or
+# tools/check_package_hygiene.py fails the release with missing_web_assets.
+graft assets
+graft web/dist
