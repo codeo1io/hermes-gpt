@@ -8,6 +8,7 @@ Contract validation run; nothing about completion is faked.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -42,7 +43,40 @@ def _observe(root: Path, task_id: str, *, state: str, outcome: str = "", error: 
     }
     if state in ("completed", "failed", "cancelled"):
         record["ended_at"] = "2026-08-21T00:00:02+00:00"
+        # A real workspace-write worker produces the contract's declared
+        # deliverables; completion validation (Stage4) fails closed without
+        # them. Materialize them from the durable validation manifest before
+        # the terminal job record lands, mirroring the peer's actual behavior.
+        for art in _declared_artifacts(root, task_id):
+            path = root / "missions" / art["path"]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f'deliverable for {task_id}\n')
     runners._atomic_json(meta_path, record)
+
+
+def _declared_artifacts(root: Path, task_id: str) -> list[dict]:
+    """Read a dispatched contract's declared artifacts from the durable
+    validation manifest (delegations.db). Fail-open to [] like a peer that
+    produced no deliverables — completion validation then fails closed."""
+    import sqlite3
+    db_path = root / "delegations" / "delegations.db"
+    if not db_path.is_file():
+        return []
+    try:
+        with sqlite3.connect(db_path) as db:
+            row = db.execute(
+                "SELECT m.manifest_json FROM delegation_validation_manifests m "
+                "JOIN delegations d ON d.delegation_id = m.delegation_id "
+                "WHERE d.task_id = ?",
+                (task_id,),
+            ).fetchone()
+    except sqlite3.Error:
+        return []
+    if not row:
+        return []
+    manifest = json.loads(row[0])
+    arts = manifest.get("context", {}).get("expected_artifacts")
+    return [a for a in arts if isinstance(a, dict) and a.get("path")] if isinstance(arts, list) else []
 
 
 def _task(backend, index: int = 0) -> str:
@@ -219,3 +253,52 @@ def test_completion_evidence_gate_accepts_only_the_full_proof():
         "success": True, "evidence_ref": f"contract:{sha}",
         "delegation": {"state": "succeeded", "validation_verdict": "SATISFIED", "contract_sha256": sha},
     }) is True
+
+
+# ---------------------------------------------------------------------------
+# Stage4 (INV-9): plan-declared artifact evidence
+# ---------------------------------------------------------------------------
+
+
+def test_contract_carries_plan_declared_artifacts(env):
+    """The dispatch contract carries the node's declared artifacts and enables
+    the artifacts_present completion gate exactly when artifacts are declared."""
+    from test_operator_autopilot_scheduler import _tick as _scheduler_tick  # noqa: F401  (import parity)
+    root, backend = env
+    _mk(root, [_node("a")])
+    _tick(root)
+    assert len(backend.calls) == 1
+    contract = backend.calls[0]
+    assert contract["expected_artifacts"] == [{"path": "work-contract.json", "must_exist": True, "min_bytes": 0}]
+    assert contract["completion_criteria"]["artifacts_present"] is True
+
+
+def test_declared_artifact_missing_completes_nothing(env):
+    """Stage4 fail-closed: a worker whose declared deliverable never lands
+    cannot complete the node, even with a terminal completed job record."""
+    root, backend = env
+    _mk(root, [_node("a"), _node("b", ["a"])])
+    assert _tick(root)["dispatched"] == ["a"]
+    # Terminal completed record, but the declared artifact never landed.
+    meta_path, _, _ = runners._job_paths(_task(backend), root)
+    runners._atomic_json(meta_path, {
+        "schema_version": runners.SCHEMA_VERSION, "task_id": _task(backend), "backend": "pi_rpc",
+        "state": "completed", "outcome": "completed", "created_at": "2026-08-21T00:00:00+00:00",
+        "started_at": "2026-08-21T00:00:01+00:00", "ended_at": "2026-08-21T00:00:02+00:00", "error": "",
+    })
+    out = _tick(root)
+    assert out["completed"] == []
+    assert _states(root) == {"a": "dispatched", "b": "pending"}
+
+
+def test_declared_artifact_materialized_completes_node(env):
+    """Stage4 happy path: the declared deliverable lands in the workspace and
+    the node completes on observed, validated evidence."""
+    root, backend = env
+    _mk(root, [_node("a"), _node("b", ["a"])])
+    assert _tick(root)["dispatched"] == ["a"]
+    _observe(root, _task(backend), state="completed")  # materializes work-contract.json
+    out = _tick(root)
+    assert out["completed"] == ["a"]
+    assert out["dispatched"] == ["b"]
+    assert (root / "missions" / "work-contract.json").is_file()

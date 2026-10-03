@@ -945,6 +945,12 @@ def _build_contract(
     """
     node_id = node["node_id"]
     profile = str(requirement.get("profile", ""))
+    # Stage4 (INV-9): plan-declared artifacts are carried into the contract so
+    # completion validation can demand artifact evidence. The plan store keeps
+    # only validated basenames (never raw content); each becomes a
+    # must-exist contract artifact resolved against the mission workspace.
+    declared = list(node.get("expected_artifacts") or [])
+    artifacts = [{"path": str(name), "must_exist": True, "min_bytes": 0} for name in declared]
     return {
         "schema": contract_mod.CONTRACT_SCHEMA,
         "task_id": _task_id(mission_id, node_id, key),
@@ -953,12 +959,12 @@ def _build_contract(
         "objective": f"autopilot dispatch: mission={mission_id} node={node_id} attempt={int(attempt)}",
         "allowed_scope": {"workspaces": [str(_data_root(hermes_root) / "missions")], "profiles": [profile]},
         "forbidden_actions": [],
-        "expected_artifacts": [],
+        "expected_artifacts": artifacts,
         "tests": [],
         "review_requirements": {},
         "completion_criteria": {
             "run_state": {"terminal": True, "outcome_ok": ["completed", "done"]},
-            "artifacts_present": False,
+            "artifacts_present": bool(artifacts),
             "tests_pass": False,
             "review_satisfied": False,
             "no_forbidden_actions": True,
