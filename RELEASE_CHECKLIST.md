@@ -8,6 +8,7 @@ Use this checklist before publishing a Hermes GPT release artifact.
 - Confirm `CHANGELOG.md` contains that version.
 - Confirm the release notes describe a final release rather than a candidate once publication is approved.
 - Read `docs/README.md` and confirm current operational docs are the documents being updated, not historical files under `docs/design/` or `docs/releases/`.
+- Confirm the `docs/README.md` release-records table marks the current release and that every file it names exists (link-check), so authority-row drift is caught before tagging.
 - Verify each distribution channel separately. A GitHub release does not prove the same version is already available from PyPI.
 
 ## 2. Core verification

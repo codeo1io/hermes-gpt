@@ -52,6 +52,7 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 import ui_security
+import live_streams
 
 logger = logging.getLogger("hermes_gpt.ui_chat")
 
@@ -74,6 +75,12 @@ SSE_HEARTBEAT_S = 15.0
 TURN_EVENT_RING_MAX = 4096
 MESSAGE_PAGE_LIMIT = 500
 SESSION_LIST_LIMIT = 200
+
+# rm-102: one live turn per session is enforced by a TTL'd lease; the turn
+# worker renews it well before expiry so long turns never lose the invariant.
+TURN_LEASE_TTL_S: float = 300.0
+# Renew at one-fifth of the TTL: four missed renewals still leave headroom.
+TURN_LEASE_REFRESH_INTERVAL_S: float = TURN_LEASE_TTL_S / 5.0
 
 
 # ── Turn state + registry ─────────────────────────────────────────────────
@@ -573,6 +580,16 @@ def _finalize_turn(turn: Turn, result: Optional[dict], db: Any) -> None:
 
 def _run_turn(turn: Turn, *, message: str, profile: str, model: str, db: Any, holder: str) -> None:
     """Daemon-thread body: build the agent, run the loop, emit done/error."""
+    # rm-102: renew the lease for the whole turn; stop it in ``finally`` so a
+    # lost lease aborts the turn instead of silently expiring under it.
+    renewal_stop = threading.Event()
+    renewal = threading.Thread(
+        target=_run_lease_renewal,
+        args=(turn, db, holder, renewal_stop),
+        daemon=True,
+        name=f"ui-chat-lease-{turn.session_id[:8]}",
+    )
+    renewal.start()
     try:
         if turn.cancel_requested:
             turn.mark_done("interrupted")
@@ -592,11 +609,61 @@ def _run_turn(turn: Turn, *, message: str, profile: str, model: str, db: Any, ho
         turn.publish("error", {"code": "INTERNAL", "message": str(exc) or exc.__class__.__name__})
         turn.mark_done("error", error=str(exc))
     finally:
+        renewal_stop.set()
+        renewal.join(timeout=TURN_LEASE_REFRESH_INTERVAL_S)
         try:
             db.release_session_turn_lease(turn.session_id, holder)
         except Exception:
             logger.debug("ui_chat: lease release failed (already free?)", exc_info=True)
         turn.agent = None
+
+
+def _request_turn_abort(turn: "Turn", reason: str) -> None:
+    """Flag a live turn for cooperative cancellation and interrupt its agent.
+
+    Shared by the client stop route and lease-loss handling (rm-102): the
+    turn worker observes ``cancel_requested`` / the agent interrupt and
+    closes the turn on the normal path instead of running unbounded.
+    """
+    turn.cancel_requested = True
+    agent = turn.agent
+    if agent is not None and hasattr(agent, "interrupt"):
+        try:
+            agent.interrupt(hard_cancel=True)
+        except Exception:
+            logger.debug("ui_chat: interrupt call failed (%s)", reason, exc_info=True)
+
+
+def _run_lease_renewal(turn: "Turn", db: Any, holder: str, stop: threading.Event) -> None:
+    """Keep the session turn lease alive while a long turn runs (rm-102).
+
+    ``_run_turn`` acquires the lease with a 300 s TTL but historically never
+    renewed it, so any turn longer than the TTL silently lost the one live
+    turn per session invariant (the next request could acquire a second
+    lease while the first turn still ran). This loop renews well before
+    expiry; when renewal reports the lease gone (expired or taken over) the
+    turn is aborted on the existing cancellation path so the invariant is
+    never silently lost. Transient store errors are retried next interval.
+    """
+    while not stop.wait(TURN_LEASE_REFRESH_INTERVAL_S):
+        try:
+            renewed = db.refresh_session_turn_lease(
+                turn.session_id, holder, ttl_seconds=TURN_LEASE_TTL_S
+            )
+        except Exception:
+            logger.warning(
+                "ui_chat: turn lease renewal failed for session %s",
+                turn.session_id[:8],
+                exc_info=True,
+            )
+            continue
+        if not renewed:
+            logger.error(
+                "ui_chat: turn lease lost for session %s; aborting turn",
+                turn.session_id[:8],
+            )
+            _request_turn_abort(turn, "turn_lease_lost")
+            return
 
 
 # ── SSE formatting / generators ───────────────────────────────────────────
@@ -615,6 +682,7 @@ _SSE_HEADERS = {
 
 async def _sse_generator(turn: Turn) -> AsyncIterator[str]:
     last = 0
+    _stream_task = live_streams.register_current()
     try:
         while True:
             batch, done = await asyncio.to_thread(turn.snapshot_after, last, SSE_HEARTBEAT_S)
@@ -629,10 +697,13 @@ async def _sse_generator(turn: Turn) -> AsyncIterator[str]:
         # Client disconnected — the turn keeps running in its worker thread
         # and remains reachable via GET /api/chat/stream (replay + tail).
         raise
+    finally:
+        live_streams.deregister(_stream_task)
 
 
 async def _replay_generator(turn: Turn, after: int) -> AsyncIterator[str]:
     last = after
+    _stream_task = live_streams.register_current()
     try:
         while True:
             batch, done = await asyncio.to_thread(turn.snapshot_after, last, SSE_HEARTBEAT_S)
@@ -645,6 +716,8 @@ async def _replay_generator(turn: Turn, after: int) -> AsyncIterator[str]:
                 yield ": ping\n\n"
     except asyncio.CancelledError:
         raise
+    finally:
+        live_streams.deregister(_stream_task)
 
 
 # ── Envelope helpers ──────────────────────────────────────────────────────
@@ -745,7 +818,7 @@ async def _handle_chat_post(request: Request) -> Response:
 
     holder = f"webui-{os.getpid()}-{uuid.uuid4().hex[:12]}"
     if not await asyncio.to_thread(
-        db.try_acquire_session_turn_lease, session_id, holder, ttl_seconds=300.0
+        db.try_acquire_session_turn_lease, session_id, holder, ttl_seconds=TURN_LEASE_TTL_S
     ):
         return _error(409, "TURN_IN_PROGRESS", "A turn is already running for this session")
 
@@ -801,13 +874,7 @@ async def _handle_chat_stop(request: Request) -> Response:
     turn = _active_turn(session_id)
     if turn is None:
         return _ok({"stopped": False})
-    turn.cancel_requested = True
-    agent = turn.agent
-    if agent is not None and hasattr(agent, "interrupt"):
-        try:
-            agent.interrupt(hard_cancel=True)
-        except Exception:
-            logger.debug("ui_chat: interrupt call failed", exc_info=True)
+    _request_turn_abort(turn, "client_requested")
     return _ok({"stopped": True})
 
 

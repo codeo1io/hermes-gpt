@@ -49,4 +49,5 @@ related_commits: [list of repo SHAs/refs, [] if none]
 | --- | --- | --- |
 | [mcp-cron-create-dead-jobs.md](mcp-cron-create-dead-jobs.md) | workaround | 2026-08-31 |
 | [gateway-state-clobbered-by-pytest.md](gateway-state-clobbered-by-pytest.md) | resolved | 2026-08-31 |
+| [session-turn-lease-expires-mid-turn.md](session-turn-lease-expires-mid-turn.md) | resolved | 2026-10-01 |
 | [runner-cancel-workspace-authority.md](runner-cancel-workspace-authority.md) | resolved | 2026-08-31 |

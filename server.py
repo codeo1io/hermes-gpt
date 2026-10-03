@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import ipaddress
 import importlib.metadata
 import inspect
@@ -22,6 +23,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import BaseRoute, Mount, Route
 
+import live_streams
 import oauth_auth
 import operator_policy as op_policy
 import operator_cron as op_cron
@@ -3123,6 +3125,14 @@ def _signal_ui_mount_failure(exc: Exception) -> None:
         eprint("ui mount failure live event could not be published")
 
 
+# rm-105: bounded graceful shutdown. The ASGI lifespan shutdown hook drains
+# registered SSE/WS streaming responses for up to SHUTDOWN_STREAM_DRAIN_S;
+# uvicorn's timeout_graceful_shutdown is the hard backstop keeping SIGTERM/
+# SIGINT from hanging on a stuck stream or in-flight request forever.
+SHUTDOWN_STREAM_DRAIN_S: float = 5.0
+SHUTDOWN_GRACE_S: float = 10.0
+
+
 def build_asgi_app(server: FastMCP, *, http: bool) -> Any:
     oauth_state = getattr(server, "_hermes_oauth_state", None)
     if oauth_state is not None and not http:
@@ -3234,7 +3244,27 @@ def build_asgi_app(server: FastMCP, *, http: bool) -> Any:
         )
     )
     routes.append(Mount("/", app=mcp_app))
-    app = Starlette(routes=routes, lifespan=raw_mcp_app.router.lifespan_context)
+
+    # rm-105: compose the MCP lifespan with a shutdown drain of registered
+    # live streams (chat SSE, operator live-events WS). Starlette calls the
+    # lifespan exactly as `async with self.lifespan_context(app)`, so the
+    # wrapper mirrors that shape and adds our cleanup on the way out.
+    _mcp_lifespan = raw_mcp_app.router.lifespan_context
+
+    @contextlib.asynccontextmanager
+    async def _lifespan_with_drain(app: Any):
+        async with _mcp_lifespan(app):
+            try:
+                yield
+            finally:
+                stats = await live_streams.drain(timeout_s=SHUTDOWN_STREAM_DRAIN_S)
+                eprint(
+                    "shutdown: drained %d live streaming responses "
+                    "(uncancelled after %.1fs timeout: %d)"
+                    % (int(stats["cancelled"]), stats["timeout_s"], int(stats["uncancelled"]))
+                )
+
+    app = Starlette(routes=routes, lifespan=_lifespan_with_drain)
     issuer = oauth_state.config.issuer if oauth_state is not None else ""
     parsed_issuer = urllib.parse.urlparse(issuer)
     issuer_origin = f"{parsed_issuer.scheme}://{parsed_issuer.netloc}" if parsed_issuer.netloc else ""
@@ -3799,7 +3829,13 @@ def _run_codex_mcp(argv: list[str]) -> None:
     # proxy trust (or the operator-set FORWARDED_ALLOW_IPS env). A wildcard
     # here would trust client-supplied X-Forwarded-For from any peer
     # (security review t_f9925699 hardening note).
-    uvicorn.run(server.streamable_http_app(), host=args.host, port=args.port, proxy_headers=True)
+    uvicorn.run(
+        server.streamable_http_app(),
+        host=args.host,
+        port=args.port,
+        proxy_headers=True,
+        timeout_graceful_shutdown=SHUTDOWN_GRACE_S,  # rm-105: bounded SIGTERM/SIGINT shutdown
+    )
 
 
 def _run_legacy_server(argv: list[str]) -> None:
@@ -3871,6 +3907,7 @@ def _run_legacy_server(argv: list[str]) -> None:
             ssl_keyfile=args.key if args.key else None,
             proxy_headers=proxy_headers,
             forwarded_allow_ips=forwarded_allow_ips,
+            timeout_graceful_shutdown=SHUTDOWN_GRACE_S,  # rm-105: bounded SIGTERM/SIGINT shutdown
         )
 
 

@@ -315,3 +315,27 @@ def test_read_since_no_match_advances_cursor(hermes_root):
     events2, _ = live.read_since(next_cursor, topic="other", hermes_root=hermes_root)
     assert [e["seq"] for e in events2] == [c["seq"]]
 
+
+
+# ── rm-105: live-event WS registration for shutdown drain ──────────────────
+
+def test_websocket_registers_with_live_streams_for_drain(hermes_root, monkeypatch):
+    import time as _time
+
+    calls = []
+    marker = object()
+
+    monkeypatch.setattr(live.live_streams, "register_current", lambda: (calls.append("register"), marker)[1])
+    monkeypatch.setattr(live.live_streams, "deregister", lambda m: calls.append(("deregister", m)))
+
+    app = Starlette(routes=live.websocket_routes(lambda: hermes_root))
+    with TestClient(app) as client:
+        with client.websocket_connect("/events/ws?mission_id=probe-drain"):
+            assert "register" in calls, "WS endpoint must register on connect"
+        # The receive poll notices the disconnect within ~0.5s; finally runs then.
+        for _ in range(60):
+            if any(c[0] == "deregister" for c in calls):
+                break
+            _time.sleep(0.05)
+    dereg = [c for c in calls if isinstance(c, tuple)]
+    assert dereg and dereg[0][1] is marker, "WS endpoint must deregister its own task"

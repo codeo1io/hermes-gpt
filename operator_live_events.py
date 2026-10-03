@@ -27,6 +27,7 @@ from typing import Any
 from starlette.routing import BaseRoute, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
+import live_streams
 import operator_policy as op
 
 SCHEMA_VERSION = "0.9-live.1"
@@ -363,6 +364,9 @@ async def _websocket_endpoint(
     topic = websocket.query_params.get("topic", "")[:MAX_TOPIC]
     kind = websocket.query_params.get("kind", "")[:MAX_KIND]
     last_heartbeat = time.monotonic()
+    # rm-105: register the connection's task so a graceful server shutdown
+    # can cancel this loop instead of waiting out its 0.5 s receive poll.
+    _stream_task = live_streams.register_current()
     try:
         while True:
             try:
@@ -445,6 +449,8 @@ async def _websocket_endpoint(
                 await websocket.send_json({"schema": STREAM_SCHEMA, "type": "error", "code": "UNSUPPORTED_CONTROL"})
     except WebSocketDisconnect:
         return
+    finally:
+        live_streams.deregister(_stream_task)
 
 
 def websocket_routes(

@@ -26,6 +26,7 @@ PyPI is an independent distribution channel. Check the PyPI badge in the root RE
 | --- | --- | --- |
 | [`../README.md`](../README.md) | current | project overview, current release, quickstart, safety invariants, entry-point selection |
 | [`solutions/README.md`](solutions/README.md) | current | per-problem solutions runbooks: verified symptoms, root causes, and fix procedures |
+| [`../CONCEPTS.md`](../CONCEPTS.md) | current | shared domain vocabulary: glossary entries for named entities and processes (e.g. session turn lease) |
 | [`runtime-checkout.md`](runtime-checkout.md) | host deployment provenance | which checkout the live `hermes-gpt-server.service` serves, and a caution that it is not the branch you happened to inspect |
 | [`oauth.md`](oauth.md) | current | static bearer and confidential-client OAuth configuration, RFC 7591 dynamic client registration (ChatGPT apps flow), token lifecycle, refresh rotation, and remote authentication limits |
 | [`gemini-spark.md`](gemini-spark.md) | current | opt-in Gemini Spark client profile: dedicated-instance or additional-client setup, exact callback discovery, verification, and rollback |
@@ -47,9 +48,12 @@ PyPI is an independent distribution channel. Check the PyPI badge in the root RE
 | [`session-control.md`](session-control.md) | current | gated asynchronous session continue/send jobs |
 | [`ui-security-boundary.md`](ui-security-boundary.md) | current | conversational UI browser security boundary and opt-in UI mount |
 | [`flight-deck-coverage.md`](flight-deck-coverage.md) | current | Flight Deck browser coverage and mutation safety decisions |
-| [`release-notes-v0.8.0.md`](release-notes-v0.8.0.md) | current release record | shipped v0.8 Fabric behavior, G6 acceptance boundary, and known limitation |
+| [`v0.12.0-release-notes.md`](releases/v0.12.0-release-notes.md) | current release record | v0.12 budget hard-block enforcement and the controller L2 rung (repository version 0.12.0; publication status per its banner — verify channels) |
+| [`v0.11.0-release-notes.md`](releases/v0.11.0-release-notes.md) | historical release record | shipped v0.11 Gemini Spark profile, MCP SDK 2, and security remediation |
+| [`v0.10-slice1-release-notes.md`](releases/v0.10-slice1-release-notes.md) | historical release record | shipped v0.10 MissionPlan decomposition and shadow controller |
+| [`release-notes-v0.8.0.md`](release-notes-v0.8.0.md) | historical release record | shipped v0.8 Fabric behavior, G6 acceptance boundary, and known limitation |
 | [`release-notes-v0.7.0.md`](release-notes-v0.7.0.md) | historical release record | shipped v0.7 behavior and gates |
-| [`release-notes-v0.6.0.md`](release-notes-v0.6.0.md) | current release record | shipped v0.6 behavior and known limitations |
+| [`release-notes-v0.6.0.md`](release-notes-v0.6.0.md) | historical release record | shipped v0.6 behavior and known limitations |
 | [`../RELEASE_CHECKLIST.md`](../RELEASE_CHECKLIST.md) | maintainer | release verification and publication gates |
 | [`../CHANGELOG.md`](../CHANGELOG.md) | historical/current | concise version history |
 
