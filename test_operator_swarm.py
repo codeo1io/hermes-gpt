@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from pathlib import Path
 
 import pytest
@@ -1342,3 +1343,103 @@ def test_server_registers_swarm_tools(monkeypatch):
         "hermes_swarm_approve",
     ):
         assert tool in names
+
+
+# ---------------------------------------------------------------------------
+# 14. State co-ownership (rm-191: swarm store writes under concurrency)
+# ---------------------------------------------------------------------------
+
+
+def test_save_workflow_concurrent_writers_leave_valid_record(hermes_root):
+    """rm-191: racing ``_save_workflow`` calls must never corrupt the store.
+
+    The staging file is uniquely named per writer, so two saves of the same
+    workflow cannot interleave into one staging file and persist truncated
+    JSON (which the next load silently drops), and no ``.tmp`` residue is
+    left behind.
+    """
+    root = hermes_root
+    workflow_id = "sw-io-stress"
+    base = {
+        "schema": swarm.WORKFLOW_SCHEMA,
+        "workflow_id": workflow_id,
+        "counter": 0,
+        "blob": "x" * 2048,
+    }
+    swarm._save_workflow(root, base)
+
+    threads_n = 8
+    rounds = 40
+    barrier = threading.Barrier(threads_n)
+    failures: list[str] = []
+
+    def writer(tid: int) -> None:
+        for rnd in range(rounds):
+            rec = {**base, "counter": tid * 1000 + rnd}
+            try:
+                barrier.wait(timeout=30)
+                swarm._save_workflow(root, rec)
+            except BaseException as exc:  # pragma: no cover - failure detail
+                failures.append(f"writer {tid} round {rnd}: {exc!r}")
+                return
+
+    threads = [threading.Thread(target=writer, args=(tid,)) for tid in range(threads_n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+    assert not any(t.is_alive() for t in threads)
+    assert failures == []
+
+    final = json.loads(swarm._workflow_path(root, workflow_id).read_text(encoding="utf-8"))
+    assert final["schema"] == swarm.WORKFLOW_SCHEMA
+    assert final["workflow_id"] == workflow_id
+    # No staging residue of any kind next to the record.
+    residue = sorted(
+        p.name for p in (root / "swarm-workflows").iterdir() if p.name != f"{workflow_id}.json"
+    )
+    assert residue == []
+
+
+def test_dispatch_does_not_clobber_concurrent_transition(hermes_root, monkeypatch):
+    """rm-191: a transition written while a runner dispatch is in flight survives.
+
+    ``hermes_swarm_stage_dispatch`` loads the record, runs the (potentially
+    minutes-long) runner dispatch, then records the stage transition. With a
+    stale write-back, any transition another writer recorded during the
+    dispatch is silently lost. The recorded transition must be merged into
+    the current store instead.
+    """
+    ws = hermes_root.parent / "ws"
+    workflow_id = "sw-race-001"
+    wf = _workflow_ready_for_dispatch(ws, workflow_id=workflow_id)
+    assert _create(wf, hermes_root, monkeypatch)["success"] is True
+
+    def racing_dispatch(*args, **kwargs):
+        # Competing writer lands a transition on the sibling stage while the
+        # runner dispatch is in flight.
+        rec = swarm._load_workflow(hermes_root, workflow_id)
+        assert rec is not None
+        sibling = swarm._stage_state(rec, "architecture")
+        assert sibling is not None
+        sibling["status"] = swarm.STAGE_STATUS_DONE
+        sibling["verdict"] = "SATISFIED"
+        sibling["ended_at"] = "2026-10-03T00:00:00+00:00"
+        swarm._save_workflow(hermes_root, rec)
+        return json.dumps({"success": True, "changed": True, "task_id": "t-race"})
+
+    monkeypatch.setattr(contract_mod, "hermes_contract_dispatch", racing_dispatch)
+
+    out = _dispatch(workflow_id, "research", hermes_root, monkeypatch)
+    assert out["success"] is True
+
+    final = swarm._load_workflow(hermes_root, workflow_id)
+    assert final is not None
+    research = swarm._stage_state(final, "research")
+    architecture = swarm._stage_state(final, "architecture")
+    # The dispatch transition is recorded...
+    assert research["status"] == swarm.STAGE_STATUS_RUNNING
+    assert research["task_id"] == f"{workflow_id}-research"
+    # ...and the concurrent sibling transition is NOT clobbered by it.
+    assert architecture["status"] == swarm.STAGE_STATUS_DONE
+    assert architecture["verdict"] == "SATISFIED"

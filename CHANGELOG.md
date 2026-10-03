@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Fixed silent state corruption in Swarm orchestration under concurrent Operator calls. All `hermes_swarm_*` writers (workflow create, stage dispatch, stage advance, approve, and restart reconcile) now serialize each workflow's load→mutate→save span on a per-workflow write lock; a stage transition recorded after a long runner dispatch or validation is merged into the current on-disk record instead of overwriting it with a stale snapshot (fail-closed: a vanished record/stage or a concurrently finished stage is never clobbered); and workflow records are staged through a uniquely named (pid + random token) fsynced temp file before `os.replace` — the same durable-write contract already used for workspace files and cron jobs — so racing writers can no longer interleave into a single staging file and persist a truncated record that the next load silently drops.
+
 ## 0.13.0 - 2026-09-29
 
 Autopilot: one durable, default-off runtime that drives a Mission through its MissionPlan without a human re-triggering every node, and never crosses an approval boundary. It is a caller of the existing Mission, plan, placement, Work Contract, delegation, budget, and live-event surfaces, not a new authority. See [docs/autopilot.md](docs/autopilot.md).

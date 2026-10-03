@@ -35,33 +35,39 @@ MAX_RECONCILE_REPORT = 64
 def _reconcile_swarm_stages(hermes_root: Path, apply: bool) -> dict[str, Any]:
     interrupted: list[dict[str, Any]] = []
     changed_records = 0
-    for record in op_swarm._list_records(hermes_root):
-        workflow_id = record.get("workflow_id", "")
-        if record.get("status") != op_swarm.WORKFLOW_STATUS_RUNNING:
-            continue
-        record_mutated = False
-        for stage in record.get("stages", []):
-            if stage.get("status") != op_swarm.STAGE_STATUS_RUNNING:
+    for snapshot in op_swarm._list_records(hermes_root):
+        workflow_id = snapshot.get("workflow_id", "")
+        # Restart reconcile co-owns the swarm store with live server writes
+        # (rm-191): re-load each record under its per-workflow write lock and
+        # decide against the current record, never the listing snapshot, so
+        # a concurrent transition is blocked-and-reported, not clobbered.
+        with op_swarm._workflow_lock(hermes_root, workflow_id):
+            record = op_swarm._load_workflow(hermes_root, workflow_id)
+            if record is None or record.get("status") != op_swarm.WORKFLOW_STATUS_RUNNING:
                 continue
-            interrupted.append(
-                {
-                    "workflow_id": workflow_id,
-                    "stage_id": stage.get("id", ""),
-                    "owner": stage.get("owner", ""),
-                    "task_id": stage.get("task_id", ""),
-                    "blocked_reason": INTERRUPTED_REASON,
-                }
-            )
-            if apply:
-                stage["status"] = op_swarm.STAGE_STATUS_BLOCKED
-                stage["blocked_reason"] = INTERRUPTED_REASON
-                record["updated_at"] = datetime.now(timezone.utc).isoformat()
-                if record.get("status") == op_swarm.WORKFLOW_STATUS_RUNNING:
-                    record["status"] = op_swarm.WORKFLOW_STATUS_BLOCKED
-                record_mutated = True
-        if apply and record_mutated:
-            op_swarm._save_workflow(hermes_root, record)
-            changed_records += 1
+            record_mutated = False
+            for stage in record.get("stages", []):
+                if stage.get("status") != op_swarm.STAGE_STATUS_RUNNING:
+                    continue
+                interrupted.append(
+                    {
+                        "workflow_id": workflow_id,
+                        "stage_id": stage.get("id", ""),
+                        "owner": stage.get("owner", ""),
+                        "task_id": stage.get("task_id", ""),
+                        "blocked_reason": INTERRUPTED_REASON,
+                    }
+                )
+                if apply:
+                    stage["status"] = op_swarm.STAGE_STATUS_BLOCKED
+                    stage["blocked_reason"] = INTERRUPTED_REASON
+                    record["updated_at"] = datetime.now(timezone.utc).isoformat()
+                    if record.get("status") == op_swarm.WORKFLOW_STATUS_RUNNING:
+                        record["status"] = op_swarm.WORKFLOW_STATUS_BLOCKED
+                    record_mutated = True
+            if apply and record_mutated:
+                op_swarm._save_workflow(hermes_root, record)
+                changed_records += 1
     return {
         "interrupted_stages": interrupted[:MAX_RECONCILE_REPORT],
         "interrupted_count": len(interrupted),

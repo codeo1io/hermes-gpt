@@ -76,6 +76,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -162,7 +163,15 @@ RETENTION_NOTE = (
 WORKTREE_PROJECT_LINKED = "project-linked"
 WORKTREE_PLAIN = "worktree"
 
+# Swarm state co-ownership (rm-191). Every writer of a workflow record runs
+# in this process (server worker threads serving ``hermes_swarm_*`` tools,
+# plus restart reconcile), so the write side is a per-workflow threading
+# lock: the module-level lock below guards only the registry, and each
+# workflow serializes its own load→mutate→save span so one workflow's
+# (potentially minutes-long) runner dispatch never blocks another
+# workflow's writes.
 _lock = threading.RLock()
+_workflow_locks: dict[str, threading.RLock] = {}
 
 # ---------------------------------------------------------------------------
 # Error / envelope helpers (mirror operator_contract)
@@ -547,6 +556,22 @@ def _workflow_path(hermes_root: Path, workflow_id: str) -> Path:
     return _workflows_dir(hermes_root) / f"{workflow_id}.json"
 
 
+def _workflow_lock(hermes_root: Path, workflow_id: str) -> threading.RLock:
+    """Return the in-process write lock for one workflow's state file.
+
+    Keyed by the resolved store path, so distinct hermes roots never share
+    a lock. Registry entries are never pruned: the set is bounded by the
+    workflows ever written in this process (one small lock object each).
+    """
+    key = str(_workflow_path(hermes_root, workflow_id))
+    with _lock:
+        lk = _workflow_locks.get(key)
+        if lk is None:
+            lk = threading.RLock()
+            _workflow_locks[key] = lk
+        return lk
+
+
 def _load_workflow(hermes_root: Path, workflow_id: str) -> dict[str, Any] | None:
     path = _workflow_path(hermes_root, workflow_id)
     if not path.exists():
@@ -562,9 +587,24 @@ def _save_workflow(hermes_root: Path, record: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     # Operational state file (like codex-jobs). Never contains raw bodies on
     # any surface; objective text is stored for contract rebuilds only.
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(record, ensure_ascii=False, sort_keys=True, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    #
+    # Durable atomic write (rm-191): the staging file is uniquely named
+    # (pid + random token) and fsynced before the rename, so concurrent
+    # writers to the same workflow can never interleave into one staging
+    # file and persist a truncated record that the next load would drop.
+    # Same contract as operator_workspace._atomic_write_text and
+    # operator_cron._write_jobs. A failed write removes its own staging file.
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
+    payload = json.dumps(record, ensure_ascii=False, sort_keys=True, indent=2)
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _list_records(hermes_root: Path) -> list[dict[str, Any]]:
@@ -1025,7 +1065,17 @@ def hermes_swarm_workflow_create(
         return json.dumps(payload, ensure_ascii=False, indent=2)
 
     record = _new_record(workflow, root)
-    _save_workflow(root, record)
+    # Insert atomically under the workflow write lock, re-running the
+    # duplicate check against the current store so two concurrent creates
+    # of the same workflow_id cannot both register (rm-191).
+    with _workflow_lock(root, workflow_id):
+        if _load_workflow(root, workflow_id) is not None:
+            payload = _swarm_error(code="WORKFLOW_ALREADY_EXISTS",
+                                   safe_message=f"workflow {workflow_id!r} already exists.",
+                                   suggested_action="Pick a new workflow_id or inspect the existing workflow.", trace_id=tid)
+            _audit_call(tool=tool, workflow_id=workflow_id, stage_id="", dry_run=False, success=False, changed=False, summary="duplicate workflow_id")
+            return json.dumps(payload, ensure_ascii=False, indent=2)
+        _save_workflow(root, record)
     payload = {
         "success": True,
         "changed": True,
@@ -1170,6 +1220,53 @@ def hermes_swarm_workflow_status(workflow_id: str, hermes_root: Path | None = No
     return mission._bounded_json(payload)
 
 
+def _record_stage_dispatch(
+    hermes_root: Path,
+    workflow_id: str,
+    stage_id: str,
+    *,
+    task_id: str,
+    sha: str,
+    plan: dict[str, Any] | None,
+    running: bool,
+) -> bool:
+    """Merge a dispatched stage transition into the current on-disk record.
+
+    The runner dispatch that precedes this call runs outside any lock and
+    can take minutes, so the record loaded before it may be stale (rm-191).
+    Re-load under the per-workflow write lock and apply the transition to
+    the fresh stage state so concurrent writers (another stage's dispatch or
+    advance, approve, restart reconcile) are preserved instead of clobbered
+    by this thread's older snapshot.
+
+    Fail-closed skips (returns False, nothing written): the record or stage
+    vanished mid-dispatch, the stage already completed or blocked under a
+    concurrent advance, or a competing dispatch already recorded a
+    different task for this stage.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    with _workflow_lock(hermes_root, workflow_id):
+        record = _load_workflow(hermes_root, workflow_id)
+        if record is None:
+            return False
+        st = _stage_state(record, stage_id)
+        if st is None:
+            return False
+        if st.get("status") in (STAGE_STATUS_DONE, STAGE_STATUS_VALIDATED, STAGE_STATUS_BLOCKED):
+            return False
+        if st.get("status") == STAGE_STATUS_RUNNING and st.get("task_id") not in (None, "", task_id):
+            return False
+        st["task_id"] = task_id
+        st["contract_sha256"] = sha
+        st["worktree_plan"] = plan
+        if running:
+            st["status"] = STAGE_STATUS_RUNNING
+            st["started_at"] = now
+        record["updated_at"] = now
+        _save_workflow(hermes_root, record)
+        return True
+
+
 # ---------------------------------------------------------------------------
 # Stage dispatch (mutation, workspace + direct, dry-run-first)
 # ---------------------------------------------------------------------------
@@ -1303,17 +1400,15 @@ def hermes_swarm_stage_dispatch(
     success = bool(result_payload.get("success", False))
     changed = bool(result_payload.get("changed", False))
 
-    # Record the stage state transition on a real dispatch.
-    st = _stage_state(record, stage_id)
-    if st is not None and changed:
-        st["task_id"] = task_id
-        st["contract_sha256"] = sha
-        st["worktree_plan"] = plan
-        if not effective:
-            st["status"] = STAGE_STATUS_RUNNING
-            st["started_at"] = datetime.now(timezone.utc).isoformat()
-        record["updated_at"] = datetime.now(timezone.utc).isoformat()
-        _save_workflow(root, record)
+    # Record the stage state transition on a real dispatch. The runner call
+    # above can run for minutes, so the record this dispatch was decided
+    # against may already be stale; merge the transition into the current
+    # store under the workflow write lock instead of writing the stale
+    # snapshot back (rm-191).
+    if changed:
+        _record_stage_dispatch(
+            root, workflow_id, stage_id, task_id=task_id, sha=sha, plan=plan, running=not effective
+        )
 
     result_payload["tool"] = tool
     result_payload["workflow_id"] = workflow_id
@@ -1361,6 +1456,126 @@ def _workflow_stages_for_dispatch(record: dict[str, Any]) -> list[dict[str, Any]
         }
         out.append(stage)
     return out
+
+
+def _advance_noop_payload(*, workflow_id: str, stage_id: str, st: dict[str, Any], tid: str) -> dict[str, Any]:
+    """Idempotent re-advance payload (ADR-007): the stage is already terminal."""
+    payload = {
+        "success": True,
+        "changed": False,
+        "idempotent": True,
+        "schema_version": SCHEMA_VERSION,
+        "tool": "hermes_swarm_stage_advance",
+        "surface": "swarm_stage_advance",
+        "workflow_id": workflow_id,
+        "stage_id": stage_id,
+        "stage_status": st.get("status"),
+        "verdict": st.get("verdict") or ("SATISFIED" if st.get("status") == STAGE_STATUS_DONE else ""),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "trace_id": tid,
+    }
+    _audit_call(tool="hermes_swarm_stage_advance", workflow_id=workflow_id, stage_id=stage_id, dry_run=False, success=True, changed=False,
+                owner=st.get("owner", ""), verdict=payload["verdict"], summary=f"stage {stage_id} already {st.get('status')}; no-op")
+    return payload
+
+
+def _recompute_workflow_status(record: dict[str, Any]) -> str:
+    """Promotion ladder after a stage transition (D-SW8: approval never auto)."""
+    has_approval = any(s.get("kind") == "approval" for s in record.get("stages", []))
+    all_non_approval_done = all(
+        s.get("status") == STAGE_STATUS_DONE or s.get("kind") == "approval" for s in record.get("stages", [])
+    )
+    if all_non_approval_done and has_approval:
+        return WORKFLOW_STATUS_AWAITING
+    if all_non_approval_done:
+        return WORKFLOW_STATUS_DONE
+    if any(s.get("status") == STAGE_STATUS_BLOCKED for s in record.get("stages", [])):
+        return WORKFLOW_STATUS_BLOCKED
+    return WORKFLOW_STATUS_RUNNING
+
+
+def _apply_advance_failure(
+    hermes_root: Path,
+    workflow_id: str,
+    stage_id: str,
+    *,
+    verdict: str,
+    first_rejected: str,
+) -> tuple[str, dict[str, Any] | None, str]:
+    """Apply the D-SW6 failure transition against the CURRENT record (rm-191).
+
+    Validation runs a runner call and may take minutes, so the record loaded
+    before it can be stale: re-load under the per-workflow write lock and
+    apply the rework/blocked transition to the fresh stage state so
+    concurrent writers are preserved instead of clobbered.
+
+    Returns ``(outcome, stage_state, summary)``: ``"applied"`` on a recorded
+    transition; ``"noop"`` when a concurrent advance already finished the
+    stage (the ADR-007 idempotent re-advance wins); ``"workflow-gone"`` or
+    ``"stage-gone"`` when the record/stage vanished mid-validation
+    (fail-closed: nothing is written).
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    with _workflow_lock(hermes_root, workflow_id):
+        record = _load_workflow(hermes_root, workflow_id)
+        if record is None:
+            return "workflow-gone", None, ""
+        st = _stage_state(record, stage_id)
+        if st is None:
+            return "stage-gone", None, ""
+        if st.get("status") in (STAGE_STATUS_DONE, STAGE_STATUS_VALIDATED):
+            return "noop", st, ""
+        st["verdict"] = verdict
+        st["rework_count"] = int(st.get("rework_count", 0)) + 1
+        if st["rework_count"] >= 2:
+            st["status"] = STAGE_STATUS_BLOCKED
+            st["blocked_reason"] = f"validation failed twice: {first_rejected}"
+            record["status"] = WORKFLOW_STATUS_BLOCKED
+            summary = f"stage {stage_id} blocked after second failed validation"
+        else:
+            st["status"] = STAGE_STATUS_REWORK
+            st["blocked_reason"] = ""
+            summary = f"stage {stage_id} returned for rework ({st['rework_count']}/1)"
+        record["updated_at"] = now
+        _save_workflow(hermes_root, record)
+        return "applied", st, summary
+
+
+def _apply_advance_success(
+    hermes_root: Path,
+    workflow_id: str,
+    stage_id: str,
+    *,
+    handoff: dict[str, Any],
+    workflow: dict[str, Any],
+) -> tuple[str, dict[str, Any] | None, dict[str, Any] | None, list[dict[str, Any]]]:
+    """Apply the satisfied transition against the CURRENT record (rm-191).
+
+    Same merge rule as ``_apply_advance_failure``: re-load under the
+    per-workflow write lock, apply the done transition to the fresh stage
+    state, and recompute promotion from the fresh record so concurrent
+    transitions survive. Returns ``(outcome, stage_state, record,
+    next_ready)`` with the same outcome vocabulary.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    with _workflow_lock(hermes_root, workflow_id):
+        record = _load_workflow(hermes_root, workflow_id)
+        if record is None:
+            return "workflow-gone", None, None, []
+        st = _stage_state(record, stage_id)
+        if st is None:
+            return "stage-gone", None, None, []
+        if st.get("status") in (STAGE_STATUS_DONE, STAGE_STATUS_VALIDATED):
+            return "noop", st, record, []
+        st["verdict"] = "SATISFIED"
+        st["status"] = STAGE_STATUS_DONE
+        st["ended_at"] = now
+        st["handoffs"] = list(st.get("handoffs") or []) + [handoff]
+        record["updated_at"] = now
+        next_ready = _next_ready_stages(record, workflow)
+        record["status"] = _recompute_workflow_status(record)
+        _save_workflow(hermes_root, record)
+        return "applied", st, record, next_ready
 
 
 # ---------------------------------------------------------------------------
@@ -1418,23 +1633,11 @@ def hermes_swarm_stage_advance(
         # Idempotent re-advance (ADR-007): a stage already validated or done
         # returns its current state as a no-op instead of erroring. Restart
         # recovery and retries can therefore safely re-issue an advance.
-        payload = {
-            "success": True,
-            "changed": False,
-            "idempotent": True,
-            "schema_version": SCHEMA_VERSION,
-            "tool": tool,
-            "surface": "swarm_stage_advance",
-            "workflow_id": workflow_id,
-            "stage_id": stage_id,
-            "stage_status": st.get("status"),
-            "verdict": st.get("verdict") or ("SATISFIED" if st.get("status") == STAGE_STATUS_DONE else ""),
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-            "trace_id": tid,
-        }
-        _audit_call(tool=tool, workflow_id=workflow_id, stage_id=stage_id, dry_run=False, success=True, changed=False,
-                    owner=st.get("owner", ""), verdict=payload["verdict"], summary=f"stage {stage_id} already {st.get('status')}; no-op")
-        return json.dumps(payload, ensure_ascii=False, indent=2)
+        return json.dumps(
+            _advance_noop_payload(workflow_id=workflow_id, stage_id=stage_id, st=st, tid=tid),
+            ensure_ascii=False,
+            indent=2,
+        )
 
     workflow = {
         "schema": WORKFLOW_SCHEMA,
@@ -1565,19 +1768,25 @@ def hermes_swarm_stage_advance(
 
     # D-SW6: fail -> bounded rework (once), then blocked for a human.
     if not satisfied:
-        st["verdict"] = verdict
-        st["rework_count"] = int(st.get("rework_count", 0)) + 1
-        if st["rework_count"] >= 2:
-            st["status"] = STAGE_STATUS_BLOCKED
-            st["blocked_reason"] = f"validation failed twice: {rejected[0] if rejected else verdict}"
-            record["status"] = WORKFLOW_STATUS_BLOCKED
-            summary = f"stage {stage_id} blocked after second failed validation"
-        else:
-            st["status"] = STAGE_STATUS_REWORK
-            st["blocked_reason"] = ""
-            summary = f"stage {stage_id} returned for rework ({st['rework_count']}/1)"
-        record["updated_at"] = datetime.now(timezone.utc).isoformat()
-        _save_workflow(root, record)
+        outcome, st, summary = _apply_advance_failure(
+            root, workflow_id, stage_id, verdict=verdict, first_rejected=rejected[0] if rejected else verdict
+        )
+        if outcome == "workflow-gone":
+            payload = _swarm_error(code="WORKFLOW_NOT_FOUND", safe_message=f"workflow {workflow_id!r} not found.",
+                                   suggested_action="Create the workflow first.", trace_id=tid)
+            _audit_call(tool=tool, workflow_id=workflow_id, stage_id=stage_id, dry_run=False, success=False, changed=False, summary="advance not found")
+            return json.dumps(payload, ensure_ascii=False, indent=2)
+        if outcome == "stage-gone":
+            payload = _swarm_error(code="STAGE_NOT_FOUND", safe_message=f"stage {stage_id!r} not found in workflow {workflow_id!r}.",
+                                   suggested_action="Check the stage id with hermes_swarm_workflow_status.", trace_id=tid)
+            _audit_call(tool=tool, workflow_id=workflow_id, stage_id=stage_id, dry_run=False, success=False, changed=False, summary="advance stage not found")
+            return json.dumps(payload, ensure_ascii=False, indent=2)
+        if outcome == "noop":
+            return json.dumps(
+                _advance_noop_payload(workflow_id=workflow_id, stage_id=stage_id, st=st, tid=tid),
+                ensure_ascii=False,
+                indent=2,
+            )
         payload = {
             "success": False,
             "schema_version": SCHEMA_VERSION,
@@ -1607,30 +1816,30 @@ def hermes_swarm_stage_advance(
         "contract_verdict": "SATISFIED",
         "at": datetime.now(timezone.utc).isoformat(),
     }
-    st["verdict"] = "SATISFIED"
-    st["status"] = STAGE_STATUS_DONE
-    st["ended_at"] = datetime.now(timezone.utc).isoformat()
-    st["handoffs"] = list(st.get("handoffs") or []) + [handoff]
-    record["updated_at"] = datetime.now(timezone.utc).isoformat()
-
-    # Promotion: with an approval stage, the workflow reaches
-    # awaiting_approval once every other stage is done; without one, all
-    # stages done means the workflow is done. Never auto-advance the
-    # approval gate (D-SW8).
-    next_ready = _next_ready_stages(record, workflow)
-    has_approval = any(s.get("kind") == "approval" for s in record.get("stages", []))
-    all_non_approval_done = all(
-        s.get("status") == STAGE_STATUS_DONE or s.get("kind") == "approval" for s in record.get("stages", [])
+    # Pass: record verdict, freeze worktree, write handoff, promote. The
+    # validation above ran a runner call, so apply the satisfied transition
+    # to the CURRENT record under the workflow write lock (rm-191): a fresh
+    # load inside the lock, the transition merged onto the fresh stage
+    # state, and promotion recomputed from the fresh record.
+    outcome, st, record, next_ready = _apply_advance_success(
+        root, workflow_id, stage_id, handoff=handoff, workflow=workflow
     )
-    if all_non_approval_done and has_approval:
-        record["status"] = WORKFLOW_STATUS_AWAITING
-    elif all_non_approval_done:
-        record["status"] = WORKFLOW_STATUS_DONE
-    elif any(s.get("status") == STAGE_STATUS_BLOCKED for s in record.get("stages", [])):
-        record["status"] = WORKFLOW_STATUS_BLOCKED
-    else:
-        record["status"] = WORKFLOW_STATUS_RUNNING
-    _save_workflow(root, record)
+    if outcome == "workflow-gone":
+        payload = _swarm_error(code="WORKFLOW_NOT_FOUND", safe_message=f"workflow {workflow_id!r} not found.",
+                               suggested_action="Create the workflow first.", trace_id=tid)
+        _audit_call(tool=tool, workflow_id=workflow_id, stage_id=stage_id, dry_run=False, success=False, changed=False, summary="advance not found")
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+    if outcome == "stage-gone":
+        payload = _swarm_error(code="STAGE_NOT_FOUND", safe_message=f"stage {stage_id!r} not found in workflow {workflow_id!r}.",
+                               suggested_action="Check the stage id with hermes_swarm_workflow_status.", trace_id=tid)
+        _audit_call(tool=tool, workflow_id=workflow_id, stage_id=stage_id, dry_run=False, success=False, changed=False, summary="advance stage not found")
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+    if outcome == "noop":
+        return json.dumps(
+            _advance_noop_payload(workflow_id=workflow_id, stage_id=stage_id, st=st, tid=tid),
+            ensure_ascii=False,
+            indent=2,
+        )
 
     payload = {
         "success": True,
@@ -1753,21 +1962,38 @@ def hermes_swarm_approve(
         _audit_call(tool=tool, workflow_id=workflow_id, stage_id="", dry_run=False, success=False, changed=False, summary="approve confirmation required")
         return json.dumps(payload, ensure_ascii=False, indent=2)
 
-    now = datetime.now(timezone.utc).isoformat()
-    record["approval"] = {
-        "approved": True,
-        "approved_by": "owner",
-        "approval_reference": f"{workflow_id}-approval",
-        "approved_at": now,
-    }
-    record["status"] = WORKFLOW_STATUS_DONE
-    record["updated_at"] = now
-    for st in record.get("stages", []):
-        if st.get("kind") == "approval":
-            st["status"] = STAGE_STATUS_DONE
-            st["verdict"] = "SATISFIED"
-            st["ended_at"] = now
-    _save_workflow(root, record)
+    # Approval is a short load→mutate→save span: take it entirely under the
+    # workflow write lock against a fresh load, re-checking the gate, so a
+    # concurrent writer between the check above and this save cannot be
+    # clobbered (rm-191).
+    with _workflow_lock(root, workflow_id):
+        record = _load_workflow(root, workflow_id)
+        if record is None:
+            payload = _swarm_error(code="WORKFLOW_NOT_FOUND", safe_message=f"workflow {workflow_id!r} not found.",
+                                   suggested_action="Create the workflow first.", trace_id=tid)
+            _audit_call(tool=tool, workflow_id=workflow_id, stage_id="", dry_run=False, success=False, changed=False, summary="approve not found")
+            return json.dumps(payload, ensure_ascii=False, indent=2)
+        if record.get("status") != WORKFLOW_STATUS_AWAITING:
+            payload = _swarm_error(code="NOT_AWAITING_APPROVAL",
+                                   safe_message=f"workflow is {record.get('status')}; approval requires awaiting_approval.",
+                                   suggested_action="Advance all stages to completion before approving.", trace_id=tid)
+            _audit_call(tool=tool, workflow_id=workflow_id, stage_id="", dry_run=False, success=False, changed=False, summary="approve not awaiting")
+            return json.dumps(payload, ensure_ascii=False, indent=2)
+        now = datetime.now(timezone.utc).isoformat()
+        record["approval"] = {
+            "approved": True,
+            "approved_by": "owner",
+            "approval_reference": f"{workflow_id}-approval",
+            "approved_at": now,
+        }
+        record["status"] = WORKFLOW_STATUS_DONE
+        record["updated_at"] = now
+        for st in record.get("stages", []):
+            if st.get("kind") == "approval":
+                st["status"] = STAGE_STATUS_DONE
+                st["verdict"] = "SATISFIED"
+                st["ended_at"] = now
+        _save_workflow(root, record)
 
     payload = {
         "success": True,

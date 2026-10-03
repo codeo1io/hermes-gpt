@@ -251,6 +251,8 @@ Required test checks execute only through the workspace test allowlist and inher
 
 Swarm Orchestration is the `hermes_swarm_*` DAG workflow layer built on Work Contracts.
 
+Concurrent `hermes_swarm_*` calls co-own one workflow's state file safely: each workflow's load→mutate→save span takes a per-workflow write lock, a transition recorded after a long runner dispatch is merged into the current record rather than overwriting concurrent updates, and the write itself is staged through a uniquely named fsynced temp file before an atomic replace. Concurrent tool calls for the same workflow serialize briefly on that lock; a same-attempt duplicate dispatch collapses to an idempotent record write, and a transition that would overwrite a concurrently finished stage is skipped fail-closed.
+
 Canonical workflow shape:
 
 ```text
