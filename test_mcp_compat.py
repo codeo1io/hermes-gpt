@@ -1,9 +1,10 @@
 """MCP compatibility tests for hermes-gpt (S1).
 
 Asserts the running SDK's supported protocol revisions include the pinned
-floor (2024-11-05) and the latest supported revision (2025-11-25) when
-available, that FastMCP initialize negotiation accepts the floor, and that
-tool metadata advertises the expected security scheme per auth configuration.
+floor (2024-11-05) and the latest session-negotiable revision (2025-11-25)
+when available, that FastMCP initialize negotiation accepts the floor, and
+that tool metadata advertises the expected security scheme per auth
+configuration.
 """
 
 from __future__ import annotations
@@ -15,6 +16,10 @@ import pytest
 
 from conftest import wire
 
+# Legacy SESSION-handshake revisions, family-independent: under SDK 2 the
+# 2026-07-28 revision is negotiated stateless-only (initialize with
+# 2026-07-28 downgrades to 2025-11-25 — see the stateless tests in
+# test_mcp_sdk_migration.py and docs/mcp-compatibility.md).
 MIN_PROTOCOL_VERSION = "2024-11-05"
 LATEST_PROTOCOL_VERSION = "2025-11-25"
 

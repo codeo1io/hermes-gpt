@@ -29,9 +29,11 @@ from oauth_auth import (
     OAUTH_ISSUER_ENV,
     OAUTH_REDIRECT_URI_ENV,
     OAUTH_SCOPE_ENV,
+    OAuthClient,
     OAuthConfig,
     OAuthError,
     OAuthState,
+    _redirect_uri_allowed,
     authorization_metadata,
     authorize,
     config_from_env,
@@ -182,6 +184,118 @@ def test_config_rejects_subpath_issuers_and_url_userinfo(issuer: str, redirect_u
             client_secret=CLIENT_SECRET,
             redirect_uris=(redirect_uri,),
         )
+
+
+def _client_with_redirects(*redirect_uris: str) -> OAuthClient:
+    return OAuthClient(
+        client_id=CLIENT_ID,
+        client_secret=CLIENT_SECRET,
+        redirect_uris=redirect_uris,
+    )
+
+
+def test_wildcard_redirect_entry_matches_only_its_own_origin():
+    # A trailing-"*" entry is bound to its exact HTTPS origin (scheme, host,
+    # port); hosts that merely share the string prefix are a different origin
+    # and must never receive an authorization code.
+    client = _client_with_redirects("https://app.example/cb*")
+    assert _redirect_uri_allowed("https://app.example/cb", client)
+    assert _redirect_uri_allowed("https://app.example/cb/second", client)
+    assert not _redirect_uri_allowed("https://app.example.evil/cb", client)
+    assert not _redirect_uri_allowed("https://evil-app.example/cb", client)
+    assert not _redirect_uri_allowed("https://app.example:8443/cb", client)
+    assert not _redirect_uri_allowed("http://app.example/cb", client)
+    assert not _redirect_uri_allowed("https://app.example/other", client)
+
+
+def test_bare_origin_wildcard_admits_any_path_on_that_origin_only():
+    client = _client_with_redirects("https://app.example*")
+    assert _redirect_uri_allowed("https://app.example", client)
+    assert _redirect_uri_allowed("https://app.example/cb", client)
+    # Explicit default port is the same origin as the bare entry.
+    assert _redirect_uri_allowed("https://app.example:443/cb", client)
+    # The pre-fix string-prefix match let every one of these through.
+    assert not _redirect_uri_allowed("https://app.example.evil/steal", client)
+    assert not _redirect_uri_allowed("https://app.example.evil", client)
+    assert not _redirect_uri_allowed("https://app.example:9443/x", client)
+    assert not _redirect_uri_allowed("http://app.example/x", client)
+
+
+def test_wildcard_origin_compares_host_case_insensitively_and_ports_exactly():
+    client = _client_with_redirects("https://App.Example:8443/cb*")
+    assert _redirect_uri_allowed("https://app.example:8443/cb", client)
+    assert not _redirect_uri_allowed("https://app.example:443/cb", client)
+
+
+def test_exact_redirect_entries_still_match_exactly():
+    client = _client_with_redirects(REDIRECT_URI)
+    assert _redirect_uri_allowed(REDIRECT_URI, client)
+    assert not _redirect_uri_allowed(REDIRECT_URI + "/x", client)
+    assert not _redirect_uri_allowed(REDIRECT_URI + "?x=1", client)
+
+
+def test_malformed_port_in_requested_redirect_uri_is_rejected_not_raised():
+    # ``urlparse`` raises ValueError when ``.port`` is accessed on a bad port;
+    # matching must surface that as a non-match instead of a 500.
+    client = _client_with_redirects("https://app.example*")
+    assert not _redirect_uri_allowed("https://app.example:notaport/cb", client)
+
+
+def test_config_rejects_wildcard_entry_with_malformed_port():
+    with pytest.raises(ValueError, match="valid port"):
+        OAuthClient(
+            client_id=CLIENT_ID,
+            client_secret=CLIENT_SECRET,
+            redirect_uris=("https://app.example:808x*",),
+        )
+
+
+def test_authorize_boundary_rejects_host_extending_redirect_uri(oauth_scope="hermes"):
+    state = OAuthState(
+        OAuthConfig(
+            issuer=ISSUER,
+            client_id=CLIENT_ID,
+            client_secret=CLIENT_SECRET,
+            redirect_uris=("https://app.example*",),
+            scope=oauth_scope,
+        )
+    )
+
+    async def authorize_endpoint(request):
+        return authorize(request, state)
+
+    app = Starlette(routes=[Route("/oauth/authorize", authorize_endpoint)])
+    client = TestClient(app)
+    accepted = client.get(
+        "/oauth/authorize",
+        params={
+            "response_type": "code",
+            "client_id": CLIENT_ID,
+            "redirect_uri": "https://app.example/cb",
+            "scope": "openid hermes offline_access",
+            "code_challenge": s256(DEFAULT_VERIFIER),
+            "code_challenge_method": "S256",
+        },
+        follow_redirects=False,
+    )
+    assert accepted.status_code == 302
+    location = urllib.parse.urlparse(accepted.headers["location"])
+    assert dict(urllib.parse.parse_qsl(location.query))["code"]
+
+    rejected = client.get(
+        "/oauth/authorize",
+        params={
+            "response_type": "code",
+            "client_id": CLIENT_ID,
+            "redirect_uri": "https://app.example.evil/cb",
+            "scope": "openid hermes offline_access",
+            "code_challenge": s256(DEFAULT_VERIFIER),
+            "code_challenge_method": "S256",
+        },
+    )
+    assert rejected.status_code == 400
+    assert rejected.json()["error"] == "invalid_request"
+
 
 
 def test_environment_config_is_disabled_by_default_and_requires_complete_confidential_client(monkeypatch):

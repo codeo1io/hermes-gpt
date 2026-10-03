@@ -224,6 +224,10 @@ class OAuthClient:
                     raise ValueError("OAuth redirect URI wildcard prefix must be an HTTPS origin/prefix.")
                 if "*" in prefix:
                     raise ValueError("Only a single trailing wildcard is allowed in OAuth redirect URIs.")
+                try:
+                    _ = prefix_parsed.port
+                except ValueError:
+                    raise ValueError("OAuth redirect URI wildcard prefix must have a valid port.")
         object.__setattr__(self, "client_id", self.client_id.strip())
         object.__setattr__(self, "redirect_uris", tuple(dict.fromkeys(self.redirect_uris)))
 
@@ -1427,11 +1431,44 @@ def _redirect_response(redirect_uri: str, values: list[tuple[str, str]]) -> Redi
     return RedirectResponse(location, status_code=302)
 
 
+def _wildcard_redirect_matches(redirect_uri: str, allowed_prefix: str) -> bool:
+    """Origin-bound match for a wildcard redirect entry (``*`` stripped).
+
+    The requested URI must sit on the entry's own origin — scheme, hostname
+    (case-insensitively) and port compared exactly, with the scheme's default
+    port folded in — and its path must begin with the entry's path prefix.
+    A URI whose host merely shares the string prefix (``app.example.evil``
+    under ``https://app.example*``) is a different origin and never matches.
+    """
+    redirect = urllib.parse.urlparse(redirect_uri)
+    allowed = urllib.parse.urlparse(allowed_prefix)
+    try:
+        redirect_port = redirect.port
+        allowed_port = allowed.port
+    except ValueError:
+        # Malformed port in the request (e.g. ``host:notaport``): a
+        # non-match, never a crash at the authorize endpoint.
+        return False
+    if redirect.scheme != allowed.scheme:
+        return False
+    if (redirect.hostname or "").lower() != (allowed.hostname or "").lower():
+        return False
+    default_port = 443 if redirect.scheme == "https" else 80
+    if (redirect_port or default_port) != (allowed_port or default_port):
+        return False
+    return redirect.path.startswith(allowed.path)
+
+
 def _redirect_uri_allowed(redirect_uri: str, client: OAuthClient) -> bool:
-    """Exact match, or prefix match against an entry ending in ``*``."""
+    """Exact match, or an origin-bound match against an entry ending in ``*``.
+
+    A wildcard entry admits only request URIs on the entry's own HTTPS origin
+    (scheme, host and port compared exactly) whose path starts with the
+    entry's path prefix; see :func:`_wildcard_redirect_matches`.
+    """
     for allowed in client.redirect_uris:
         if allowed.endswith("*"):
-            if redirect_uri.startswith(allowed[:-1]):
+            if _wildcard_redirect_matches(redirect_uri, allowed[:-1]):
                 return True
         elif redirect_uri == allowed:
             return True

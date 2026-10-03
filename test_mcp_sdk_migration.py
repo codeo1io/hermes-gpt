@@ -1,6 +1,7 @@
 """Exercise both real server surfaces at the SDK/wire boundary."""
 
 import importlib
+import importlib.metadata
 import json
 
 import pytest
@@ -8,29 +9,40 @@ from starlette.testclient import TestClient
 
 from versioning import VERSION
 
+# Deliberate per-family protocol-revision targets for the installed SDK.
+# The wire surface is built against the MCP 2026-07-28 revision (stateless
+# requests, _meta negotiation — see the stateless tests below). A newer SDK
+# shipping a newer LATEST_PROTOCOL_VERSION must fail the revision test
+# below loudly instead of drifting silently: extend the family's entry only
+# after re-verifying negotiate/stateless/readOnlyHint behavior under the new
+# revision (mcp_compat.py + server wire handling).
+# Verified live: mcp 2.2.0 and 2.3.0 (shipped 2026-10-02) both advertise
+# 2026-07-28; SDK 1.x families advertise 2025-06-18 / 2025-11-25.
+_EXPECTED_LATEST_PROTOCOL_VERSIONS = {
+    "sdk1": frozenset({"2025-06-18", "2025-11-25"}),
+    "sdk2": frozenset({"2026-07-28"}),
+}
+
 
 def test_sdk_protocol_revision_is_deliberate():
     """The installed SDK's advertised protocol revision must match what this
-    server targets, deliberately. The wire surface is built against the MCP
-    2026-07-28 revision (stateless requests, _meta negotiation — see the
-    stateless tests below). A newer SDK shipping a newer LATEST_PROTOCOL_VERSION
-    must fail here instead of drifting silently: bump the expectation only
-    after re-verifying negotiate/stateless/readOnlyHint behavior under the new
-    revision (mcp_compat.py + server wire handling)."""
+    server targets, deliberately, per SDK family (see
+    _EXPECTED_LATEST_PROTOCOL_VERSIONS)."""
     from mcp.types import LATEST_PROTOCOL_VERSION
 
     from mcp_compat import SDK_V2
 
-    if SDK_V2:
-        assert LATEST_PROTOCOL_VERSION == "2026-07-28", (
-            "mcp SDK advertises a newer protocol revision than the server "
-            "targets; re-verify stateless/_meta negotiation before bumping"
-        )
-    else:
-        assert LATEST_PROTOCOL_VERSION in ("2025-06-18", "2025-11-25"), (
-            "SDK 1.x family drifted beyond the legacy revisions the "
-            "compat layer targets; re-verify before bumping"
-        )
+    family = "sdk2" if SDK_V2 else "sdk1"
+    try:
+        installed = importlib.metadata.version("mcp")
+    except importlib.metadata.PackageNotFoundError:
+        installed = "<unknown>"
+    assert LATEST_PROTOCOL_VERSION in _EXPECTED_LATEST_PROTOCOL_VERSIONS[family], (
+        f"installed mcp {installed} (family {family}) advertises protocol "
+        f"revision {LATEST_PROTOCOL_VERSION!r}, which this server does not "
+        "deliberately target; re-verify stateless/_meta negotiation before "
+        "extending the family's revision set"
+    )
 
 
 @pytest.mark.parametrize("surface", ["main", "codex"])

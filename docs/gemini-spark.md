@@ -26,7 +26,7 @@ Verified on 2026-09-21 against a real Gemini Spark connection to a Hermes GPT OA
 - **Default behavior is read-only.** Gemini Spark does not change that: it is an MCP client, not an Operator authority.
 - **Operator/Owner authority is process-wide, not per client.** Every registered OAuth client on an instance reaches the same policy-gated tool surface, so an additional client profile can never *lower* what another client sees — but it is not separately sandboxed either. Adding the Gemini Spark profile to an instance that already runs Operator direct mode or Owner Mode gives the Gemini connector the same authority the primary client has. Prefer a **dedicated read-only instance** for Gemini instead of adding it to an owner-mode instance.
 - **Isolated credentials.** The profile registers its own `client_id`, its own secret, and its own exact-match redirect-URI allowlist. A client can only complete an authorization request to its **own** redirect URIs and can only authenticate with its **own** secret at the token endpoint; another client's credentials or redirects fail closed.
-- **Exact-match redirects.** Redirect URIs are compared exactly. Wildcards are neither accepted nor supported.
+- **Exact-match redirects.** Redirect URIs are compared exactly. The only wildcard form is a single trailing `*`, and it is origin-bound: it admits just paths under that entry's own HTTPS origin (scheme, host and port compared exactly), never a different host that shares the string prefix.
 - **No dynamic client registration needed, by design.** Dynamic registration (RFC 7591) exists for ChatGPT connectors and is **advertised by default** (`HERMES_GPT_OAUTH_DCR`; see [OAuth behavior knobs](#oauth-behavior-knobs)). A dedicated Gemini deployment that wants Gemini's documented manual Client ID/Secret fallback — or any deployment that should not expose a public register endpoint at all — sets `HERMES_GPT_OAUTH_DCR=0` to stop advertising `registration_endpoint`.
 
 ## Configuration
@@ -108,7 +108,7 @@ Procedure:
 3. Restart the instance so the allowlist is reloaded.
 4. Retry the connection in Gemini.
 
-Never add a wildcard, a suffix, or a "close enough" variant: exact matching means anything but the verbatim value is rejected.
+Never approximate: paste the value verbatim. The only wildcard form is a single trailing `*` bound to the entry's own HTTPS origin (see [OAuth configuration](oauth.md)) — not what Google's per-callback URLs need; allowlist those exactly.
 
 ## Connecting in Gemini
 

@@ -48,12 +48,18 @@ jobs:
         sdk: ["mcp>=1.28.1,<2", "mcp>=2,<3"]
         # Exact pins run on the full matrix only (push(master)/nightly/
         # dispatch). Current upstream releases under test (research
-        # 2026-09-20): mcp 1.30.0 and 2.2.0 shipped 2026-09-07; exact pins
-        # keep them covered deliberately rather than incidentally via the
-        # range lanes.
+        # 2026-10-03): mcp 1.30.0 and 2.2.0 shipped 2026-09-07; mcp 2.3.0
+        # shipped 2026-10-02 (httpx2 pivot; same 2026-07-28 protocol
+        # revision — rm-048 verified the suites green under 2.3.0 locally);
+        # exact pins keep them covered deliberately rather than
+        # incidentally via the range lanes.
+        # Coordination: this include list is shared surface with sibling
+        # campaigns' selections (rm-151 3.10 re-green, rm-165/rm-173 floors
+        # and actions, rm-180 floors correction) — the landing gate applies
+        # their edits as one series; never pre-merge them here.
         include: >-
           ${{ github.event_name == 'pull_request' && fromJSON('[]')
-          || fromJSON('[{"python": "3.10", "sdk": "mcp==1.28.1"}, {"python": "3.10", "sdk": "mcp==2.0.0"}, {"python": "3.10", "sdk": "mcp==1.30.0"}, {"python": "3.10", "sdk": "mcp==2.2.0"}]') }}
+          || fromJSON('[{"python": "3.10", "sdk": "mcp==1.28.1"}, {"python": "3.10", "sdk": "mcp==2.0.0"}, {"python": "3.10", "sdk": "mcp==1.30.0"}, {"python": "3.10", "sdk": "mcp==2.2.0"}, {"python": "3.10", "sdk": "mcp==2.3.0"}]') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

@@ -68,7 +68,7 @@ HERMES_GPT_OAUTH_REDIRECT_URI=https://chatgpt.com/connector/oauth/<exact-callbac
 HERMES_GPT_OAUTH_SCOPE=hermes
 ```
 
-Multiple exact redirect URIs may be comma-separated. Wildcards are not accepted. The issuer must use HTTPS except for an explicitly loopback-only test server.
+Multiple exact redirect URIs may be comma-separated. A redirect URI may instead end in a single trailing `*` — e.g. `https://app.example/cb*` — to admit any path under that entry's **own HTTPS origin**: scheme, host and port are compared exactly (host case-insensitively, with the scheme's default port folded in), so `https://app.example*` admits `https://app.example/cb` and `https://app.example:443/x` but rejects `https://app.example.evil/cb` — a host that merely shares the string prefix is a different origin. The issuer must use HTTPS except for an explicitly loopback-only test server.
 
 Two optional knobs tune client-facing authorization behavior:
 
@@ -119,7 +119,7 @@ HERMES_GPT_OAUTH_GEMINI_REDIRECT_URI=https://oauth-redirect.googleusercontent.co
 ```
 
 - The profile is off unless `HERMES_GPT_OAUTH_GEMINI_ENABLE` is exactly `1`; enabling it without all three `HERMES_GPT_OAUTH_GEMINI_*` values fails startup validation with a `ValueError` naming the missing variables.
-- `HERMES_GPT_OAUTH_GEMINI_REDIRECT_URI` accepts one or more exact HTTPS URIs, comma-separated, parsed exactly like the primary redirect URI. Wildcards are not accepted.
+- `HERMES_GPT_OAUTH_GEMINI_REDIRECT_URI` accepts one or more exact HTTPS URIs, comma-separated, parsed exactly like the primary redirect URI, including the single trailing `*` origin-bound wildcard form described above.
 - Both clients share the issuer, the resource, and the one configured `HERMES_GPT_OAUTH_SCOPE`; each keeps its own secret and its own exact-match redirect allowlist, and a client can only redirect to, or authenticate with, its own credentials.
 - Set `HERMES_GPT_OAUTH_DCR=0` for the no-advertised-DCR contract this profile's manual Client ID/Secret path expects (see [Gemini Spark custom app](gemini-spark.md)).
 - The primary `HERMES_GPT_OAUTH_CLIENT_ID` / `_CLIENT_SECRET` / `_REDIRECT_URI` values are unchanged and keep working.

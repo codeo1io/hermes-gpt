@@ -16,8 +16,18 @@ existing subprocess stdio test also exercises **2025-06-18**.
 
 SDK 2 introduces the **2026-07-28** stateless protocol while retaining legacy
 client support. New-protocol clients do not use the legacy initialization
-handshake. These are SDK transport semantics, not a change to Hermes Operator
-authority. See the [SDK migration guide](https://py.sdk.modelcontextprotocol.io/migration/).
+handshake — and a legacy `initialize` that requests 2026-07-28 is negotiated
+down to **2025-11-25**, so the stateless `_meta` request path is the only way
+to exercise the new revision. These are SDK transport semantics, not a change
+to Hermes Operator authority. See the [SDK migration guide](https://py.sdk.modelcontextprotocol.io/migration/).
+
+Per-family revision lineage (verified live; `test_mcp_sdk_migration.py`
+asserts it per installed family and fails loudly on drift):
+
+| SDK family | `LATEST_PROTOCOL_VERSION` | Verified dists |
+| --- | --- | --- |
+| 1.x | `2025-06-18` / `2025-11-25` | 1.28.1 floor, 1.30.0 |
+| 2.x | `2026-07-28` (stateless-only negotiation) | 2.0.0 floor, 2.2.0, 2.3.0 (shipped 2026-10-02; httpx2 pivot, no protocol delta) |
 
 The shared `mcp_compat.HermesMCP` adapter preserves explicit HTTP/SSE options:
 SDK 1 accepts them at construction; SDK 2 accepts them at ASGI app creation.
@@ -79,7 +89,7 @@ Client notes:
   "Advanced features → Show more") because the server advertises no
   `registration_endpoint`. Google's callback
   (`https://oauth-redirect.googleusercontent.com/r/user_bound_custom-mcp-<id>-<host-with-dots-as-underscores>`)
-  must be allowlisted exactly — wildcards are not accepted, and the first
+  must be allowlisted exactly — the only wildcard form is a single trailing `*` bound to the entry's own HTTPS origin, so Google's per-callback URL is best allowlisted exactly, and the first
   attempt is rejected so the exact value can be read from the server's HTTP
   access log. PKCE S256 is supported; the OAuth boundary is streamable HTTP
   only (`--http`). See [Gemini Spark custom app](gemini-spark.md).
@@ -99,7 +109,7 @@ The minimum 1.x version is the previously documented verified SDK, rather
 than the historical untested `>=1.0` metadata floor. SDK 3 is not admitted.
 
 CI runs both SDK families on Python 3.10, 3.11 and 3.12, plus pinned 1.28.1,
-2.0.0 and 2.2.0 floor jobs on pushes to master and the nightly run.
+2.0.0, 1.30.0, 2.2.0 and 2.3.0 floor jobs on pushes to master and the nightly run.
 Pull requests run a single fast lane (Python 3.11, `mcp>=2,<3`) and defer
 the wider matrix to the post-merge runs. Tests inspect serialized MCP field
 aliases, so SDK 2's Python snake_case attributes do not alter the expected
