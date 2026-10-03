@@ -36,8 +36,10 @@ Import-safe: no hard dependency on Hermes internals. ``operator_mission`` and
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -612,13 +614,23 @@ def me_payload(hermes_root: Path | None = None) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 _STARTUP_ID: str | None = None
+_STARTUP_ID_LOCK = threading.Lock()
 
 
 def server_startup_id() -> str:
-    """Return a stable per-process startup id (restart detection)."""
+    """Return a stable per-process startup id (restart detection).
+
+    rm-151: the /api/me and /api/connection payloads are built in worker
+    threads (asyncio.to_thread), so two concurrent first requests could each
+    see the unset id and mint different ones; a mid-session id change reads
+    as a server restart in web/src/stores/connection.ts and interrupts the
+    in-flight turn. The lock keeps the mint single and the id stable.
+    """
     global _STARTUP_ID
     if _STARTUP_ID is None:
-        _STARTUP_ID = f"{os.getpid()}-{op.new_trace_id()}"
+        with _STARTUP_ID_LOCK:
+            if _STARTUP_ID is None:
+                _STARTUP_ID = f"{os.getpid()}-{op.new_trace_id()}"
     return _STARTUP_ID
 
 
@@ -640,11 +652,23 @@ def connection_payload(hermes_root: Path | None = None) -> dict[str, Any]:
 
 
 async def me_endpoint(_request: Request) -> JSONResponse:
-    return JSONResponse(ok(me_payload()))
+    # rm-151: the payload chain reaches TokenStore.status, a synchronous
+    # sqlite read (connect timeout 15.0); it must never run on the serving
+    # event loop. See connection_endpoint for the full rationale.
+    return JSONResponse(ok(await asyncio.to_thread(me_payload)))
 
 
 async def connection_endpoint(_request: Request) -> JSONResponse:
-    return JSONResponse(ok(connection_payload()))
+    # rm-151: the browser's connection store polls this endpoint
+    # (web/src/stores/connection.ts) to detect restarts, so it must stay
+    # responsive even when token stores are slow: account_status reaches
+    # TokenStore.status (synchronous sqlite, connect timeout=15.0) and would
+    # otherwise stall every loopbound request — including SSE and WS.
+    # Off-load the whole payload build to a worker thread (the in-file
+    # pattern ui_chat.py uses for session DB off-loads; TokenStore.status
+    # opens its own connection per call, so moving it off-loop is
+    # thread-safe).
+    return JSONResponse(ok(await asyncio.to_thread(connection_payload)))
 
 
 def ui_security_routes() -> list[BaseRoute]:

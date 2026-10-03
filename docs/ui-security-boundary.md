@@ -135,6 +135,13 @@ degraded or the level is below `workspace`; read-only lanes stay).
   persisted messages + turn lease), never as running.
 - `is_stale_lease(ts)` treats a turn lease older than
   `HERMES_GPT_UI_STALE_LEASE_S` (default 600) as stale → interrupted UX.
+- Both `/api/me` and `/api/connection` build their payloads off the serving
+  event loop (`asyncio.to_thread`, rm-151): the account-status chain reaches
+  the token store (a synchronous sqlite read with a 15s connect timeout),
+  and `/api/connection` is the connection store's poll — a slow token read
+  must never stall loopbound traffic (SSE and WS included). Wiring the
+  browser-side stores/banners to these payloads remains a separate flight
+  card.
 - `web/src/shared/ConnectionStatus.tsx` renders transport health;
   `web/src/shared/AccountStatusBanner.tsx` renders the expired/revoked/
   unauthorized recovery UX (re-auth affordance, mutating controls disabled,

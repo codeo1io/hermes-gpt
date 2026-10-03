@@ -1419,13 +1419,38 @@ def hermes_mission_usage(hermes_root: Path | None = None, trace_id: str | None =
                 prof_sessions = int(s_row["c"] or 0)
                 sessions_24h += prof_sessions
 
-                # Tokens + cost from session_model_usage where a started_at exists.
+                # Tokens + cost from session_model_usage, windowed to the
+                # last 24h by joining the owning session's started_at (the
+                # `_24h` keys previously reported all-time totals — rm-152).
+                # Rows with no resolvable session cannot be windowed and are
+                # excluded from the 24h aggregates. When the usage schema has
+                # drifted (no session_id column), degrade EXPLICITLY to
+                # all-time sums with a warning — never silently all-time.
                 if cols:
-                    q = "SELECT * FROM session_model_usage"
-                    try:
-                        rows = conn.execute(q).fetchall()
-                    except sqlite3.Error:
-                        rows = []
+                    sess_cols = {r[1] for r in conn.execute("PRAGMA table_info(sessions)")}
+                    can_window = "session_id" in cols and {"id", "started_at"} <= sess_cols
+                    if can_window:
+                        q = (
+                            "SELECT u.* FROM session_model_usage u"
+                            " JOIN sessions s ON s.id = u.session_id"
+                            " WHERE s.started_at >= ?"
+                        )
+                        try:
+                            rows = conn.execute(q, (cutoff_24h,)).fetchall()
+                        except sqlite3.Error:
+                            rows = []
+                    else:
+                        q = "SELECT * FROM session_model_usage"
+                        try:
+                            rows = conn.execute(q).fetchall()
+                        except sqlite3.Error:
+                            rows = []
+                        if rows:
+                            warnings.append(
+                                f"usage:{profile}:session_model_usage cannot be"
+                                " windowed to 24h (no session_id/started_at link);"
+                                " token/cost aggregates are ALL-TIME"
+                            )
                     prof_in = prof_out = 0
                     prof_cost = 0.0
                     prof_cost_known = 0.0
