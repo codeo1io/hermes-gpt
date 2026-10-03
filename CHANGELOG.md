@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Security (rm-170): the UI console (`/api`) and OAuth (`/oauth`) surfaces are now behind a fail-closed browser trust middleware. Requests must carry a `Host` the server was configured for (loopback + bound host:port + `HERMES_GPT_ALLOWED_HOSTS` extras + the OAuth issuer — the same allowlist `/mcp` enforces via `TransportSecuritySettings`, now shared through one helper); mutating `/api` requests must declare `Content-Type: application/json`; and mutating `/api` requests carrying browser markers (`Sec-Fetch-Site`/`Origin`) must be same-origin or user-initiated. This closes the loopback CSRF and DNS-rebinding gaps (a cross-site `text/plain` form post used to reach the gated action dispatch; a rebound `Host` used to be served on both `/api` reads and `/oauth`), while non-browser callers (curl, MCP clients) and the same-origin Flight Deck UI are byte-for-byte unaffected. See [docs/operator-mode.md](docs/operator-mode.md) "Browser trust boundary".
+- Fixed (rm-174): the browser redaction pipeline no longer corrupts ISO-8601 dates and full-precision timestamps. The phone heuristic in `ui_security` matched the digit cluster inside timestamps like `2026-10-03T04:23:45.123456+00:00` (redacting whole dates and mangling sub-second clusters), which corrupted every `fetched_at`/`next_run_at` the Flight Deck rendered from `/api/ops/cron`. ISO dates are now masked around the PII passes and restored verbatim; phone-shaped strings — including digit runs adjacent to timestamps — are still redacted.
+
 ## 0.13.0 - 2026-09-29
 
 Autopilot: one durable, default-off runtime that drives a Mission through its MissionPlan without a human re-triggering every node, and never crosses an approval boundary. It is a caller of the existing Mission, plan, placement, Work Contract, delegation, budget, and live-event surfaces, not a new authority. See [docs/autopilot.md](docs/autopilot.md).

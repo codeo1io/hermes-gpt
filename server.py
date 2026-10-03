@@ -3288,6 +3288,16 @@ def build_asgi_app(server: FastMCP, *, http: bool) -> Any:
     )
     routes.append(Mount("/", app=mcp_app))
     app = Starlette(routes=routes, lifespan=raw_mcp_app.router.lifespan_context)
+
+    # rm-170: browser-surface trust boundary. Order is CORS → bearer → trust
+    # → routes, so preflights are answered by CORS, authentication challenges
+    # stay on BearerAuthMiddleware, and the /api + /oauth surfaces fail
+    # closed on foreign Hosts, cross-site form posts, and non-JSON mutations.
+    bind_host, bind_port = getattr(server, "_hermes_bind", ("127.0.0.1", 7677))
+    app = RequestTrustMiddleware(
+        app, allowed_hosts=_transport_allowed_hosts(bind_host, bind_port, oauth_state)
+    )
+
     issuer = oauth_state.config.issuer if oauth_state is not None else ""
     parsed_issuer = urllib.parse.urlparse(issuer)
     issuer_origin = f"{parsed_issuer.scheme}://{parsed_issuer.netloc}" if parsed_issuer.netloc else ""
@@ -3301,6 +3311,159 @@ def build_asgi_app(server: FastMCP, *, http: bool) -> Any:
     )
 
 
+def _transport_allowed_hosts(
+    host: str, port: int, oauth_state: oauth_auth.OAuthState | None = None
+) -> list[str]:
+    """Host allowlist shared by the /mcp transport guard and the UI trust
+    middleware (RequestTrustMiddleware): the bound address, loopback names,
+    ``HERMES_GPT_ALLOWED_HOSTS`` extras, and — when OAuth is configured — the
+    issuer host. Both guards must stay in lockstep: a host accepted on /mcp
+    is accepted on /api and /oauth, and nothing else is.
+    """
+    allowed = [
+        host,
+        f"{host}:{port}",
+        "127.0.0.1",
+        f"127.0.0.1:{port}",
+        "localhost",
+        f"localhost:{port}",
+    ]
+    extra_allowed_hosts = [
+        item.strip()
+        for item in os.environ.get(ALLOWED_HOSTS_ENV, "").split(",")
+        if item.strip()
+    ]
+    allowed.extend(extra_allowed_hosts)
+    if oauth_state is not None:
+        issuer = urllib.parse.urlparse(oauth_state.config.issuer)
+        if issuer.hostname:
+            allowed.append(issuer.hostname)
+            if issuer.port:
+                allowed.append(f"{issuer.hostname}:{issuer.port}")
+    return list(dict.fromkeys(allowed))
+
+
+_MUTATING_HTTP_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+_TRUSTED_FETCH_SITES = frozenset({"same-origin", "none"})
+
+
+def _trust_guarded(path: str) -> bool:
+    """True for the UI console API and OAuth surfaces guarded by the trust
+    middleware. /mcp is deliberately excluded: the SDK's
+    TransportSecuritySettings already enforces the same Host allowlist plus
+    origin rules there, and MCP clients must not be forced into browser
+    request shapes."""
+    return (
+        path == "/api"
+        or path.startswith("/api/")
+        or path == "/oauth"
+        or path.startswith("/oauth/")
+    )
+
+
+class RequestTrustMiddleware:
+    """Browser-surface trust boundary for /api and /oauth (rm-170).
+
+    The default deployment serves the Flight Deck console and the OAuth
+    endpoints on loopback without bearer authentication, relying on the OS
+    network boundary for isolation. That boundary alone does not stop other
+    origins in the same browser from issuing "simple" cross-site form posts
+    (CSRF against mutating /api routes) or DNS-rebinding requests with a
+    forged Host header. This middleware closes both gaps:
+
+    - every guarded request must carry a Host the server was configured for
+      (loopback + bound host + ``HERMES_GPT_ALLOWED_HOSTS`` extras + OAuth
+      issuer); a missing or foreign Host is refused (fail-closed, matching
+      the /mcp transport guard);
+    - mutating /api requests must declare ``Content-Type: application/json``
+      — browser cross-site "simple" form posts cannot — so plain curl and
+      MCP-style JSON callers are unaffected;
+    - mutating /api requests that carry browser markers (``Sec-Fetch-Site``
+      or ``Origin``) must be same-origin or user-initiated (``none``).
+
+    Cross-origin browser access on authenticated deployments stays governed
+    by the CORS allowlist wrapping this middleware; non-browser callers send
+    none of the browser markers and are never affected. Rejections use the
+    standard ``{"ok": false, "error": {"code", "message"}}`` envelope.
+    """
+
+    def __init__(self, app: Any, allowed_hosts: List[str]) -> None:
+        self.app = app
+        self.allowed_hosts = frozenset(host.lower() for host in allowed_hosts)
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("type") != "http" or not _trust_guarded(str(scope.get("path", ""))):
+            await self.app(scope, receive, send)
+            return
+        headers = {
+            key.decode("latin-1").lower(): value.decode("latin-1")
+            for key, value in scope.get("headers") or []
+        }
+        path = str(scope.get("path", ""))
+        host = headers.get("host", "").strip().lower()
+        if host not in self.allowed_hosts:
+            await self._reject(
+                scope,
+                receive,
+                send,
+                status=403,
+                code="BAD_HOST",
+                message=(
+                    "unrecognized Host header; the UI console and OAuth "
+                    "surfaces only accept requests addressed to this server "
+                    "(see HERMES_GPT_ALLOWED_HOSTS)"
+                ),
+            )
+            return
+        method = str(scope.get("method", "GET")).upper()
+        is_api = path == "/api" or path.startswith("/api/")
+        if is_api and method in _MUTATING_HTTP_METHODS:
+            content_type = headers.get("content-type", "")
+            media_type = content_type.split(";", 1)[0].strip().lower()
+            if media_type != "application/json":
+                await self._reject(
+                    scope,
+                    receive,
+                    send,
+                    status=415,
+                    code="UNSUPPORTED_MEDIA_TYPE",
+                    message=(
+                        "mutating /api requests require Content-Type: "
+                        f"application/json, got {content_type!r}"
+                    ),
+                )
+                return
+            fetch_site = headers.get("sec-fetch-site", "").strip().lower()
+            origin = headers.get("origin", "").strip()
+            if fetch_site:
+                browser_trusted = fetch_site in _TRUSTED_FETCH_SITES
+            elif origin:
+                expected_origin = f"{str(scope.get('scheme', 'http'))}://{host}".lower()
+                browser_trusted = origin.lower() == expected_origin
+            else:
+                browser_trusted = True  # no browser markers: curl/MCP caller
+            if not browser_trusted:
+                await self._reject(
+                    scope,
+                    receive,
+                    send,
+                    status=403,
+                    code="CROSS_ORIGIN",
+                    message=(
+                        "cross-origin browser request to a mutating /api "
+                        "endpoint was refused"
+                    ),
+                )
+                return
+        await self.app(scope, receive, send)
+
+    async def _reject(
+        self, scope: Any, receive: Any, send: Any, *, status: int, code: str, message: str
+    ) -> None:
+        body = {"ok": False, "error": {"code": code, "message": message}}
+        await JSONResponse(body, status_code=status)(scope, receive, send)
+
+
 def build_server(
     *,
     host: str = "127.0.0.1",
@@ -3309,13 +3472,7 @@ def build_server(
     include_local_settings: bool = False,
 ) -> FastMCP:
     oauth_state = oauth_state_from_env()
-    allowed_hosts = [host, f"{host}:{port}", "127.0.0.1", f"127.0.0.1:{port}", "localhost", f"localhost:{port}"]
-    extra_allowed_hosts = [
-        item.strip()
-        for item in os.environ.get(ALLOWED_HOSTS_ENV, "").split(",")
-        if item.strip()
-    ]
-    allowed_hosts.extend(extra_allowed_hosts)
+    allowed_hosts = _transport_allowed_hosts(host, port, oauth_state)
     allowed_origins = ["https://chatgpt.com"]
     if oauth_state is not None:
         issuer = urllib.parse.urlparse(oauth_state.config.issuer)
@@ -3340,6 +3497,10 @@ def build_server(
         ),
     )
     setattr(server, "_hermes_oauth_state", oauth_state)
+    # The UI trust middleware (RequestTrustMiddleware) needs the same bind
+    # address the /mcp transport guard was configured for; FastMCP does not
+    # expose the constructor host/port back, so stash them on the instance.
+    setattr(server, "_hermes_bind", (host, port))
     if oauth_state is not None:
         # v0.7 S5: persist every token issuance/refresh through token_store.
         # Persistence failures PROPAGATE: the strict exchange path turns them

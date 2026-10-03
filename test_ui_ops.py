@@ -18,6 +18,7 @@ import json
 import re
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -27,6 +28,7 @@ from starlette.testclient import TestClient
 import operator_policy as op
 import ui_api
 import ui_ops
+import ui_security
 
 OWNER_ACK = op.OWNER_ACK_REQUIRED_VALUE
 
@@ -294,6 +296,27 @@ def test_cron_list_envelope(client):
     data = resp.json()["data"]
     assert data["surface"] == "cron"
     assert isinstance(data["data"], dict)
+
+
+def test_cron_list_fetched_at_survives_redaction(client):
+    """rm-174: the cron envelope's ``fetched_at`` timestamp round-trips
+    through the browser redaction pipeline byte-identically.
+
+    Pre-fix, the phone heuristic in ui_security ate the sub-second cluster of
+    a full-precision ISO timestamp ("...T04:23:45.123456+00:00" ->
+    "...T04:23:[redacted-phone]+00:00"), so the Flight Deck read a corrupted
+    timestamp on every cron fetch.
+    """
+    resp = client.get("/api/ops/cron")
+    assert resp.status_code == 200
+    fetched_at = resp.json()["data"]["fetched_at"]
+    assert isinstance(fetched_at, str)
+    # Full precision intact: parseable as ISO, un-mangled by re-redaction.
+    assert "[redacted-phone]" not in fetched_at
+    datetime.fromisoformat(fetched_at)
+    assert ui_security.redact_browser({"fetched_at": fetched_at})[
+        "fetched_at"
+    ] == fetched_at
 
 
 def test_cron_detail_not_found(client):

@@ -255,6 +255,41 @@ def _restore_model_phrases(text: str, stash: list[str]) -> str:
         text = text.replace(f"{_SENTINEL_L}{index}{_SENTINEL_R}", phrase)
     return text
 
+
+# ISO-8601 dates/timestamps (date-only, date-time, fractional seconds, UTC
+# offsets). The phone heuristic in _PII_PATTERNS matches the digit clusters
+# inside full-precision timestamps (e.g. "...T04:23:45.123456+00:00" ->
+# "...T04:23:[redacted-phone]+00:00"), so timestamps surfaced by Operator
+# surfaces (fetched_at and friends) were corrupted by the redaction pipeline
+# itself. Masking them with sentinels around the PII loop preserves them
+# byte-identically (rm-174); the guard lookarounds keep the pattern from
+# slicing into longer digit runs, which stay fully redactable as phones.
+_DATE_SENTINEL_L = "\ue002"
+_DATE_SENTINEL_R = "\ue003"
+_ISO_DATETIME_RE = re.compile(
+    r"(?<!\d)\d{4}-\d{2}-\d{2}"
+    r"(?:[T ]\d{2}:\d{2}(?::\d{2}(?:[.,]\d{1,9})?)?"
+    r"(?:[Zz]|[+-]\d{2}:?\d{2})?)?"
+    r"(?!\d)"
+)
+
+
+def _mask_iso_datetimes(text: str) -> tuple[str, list[str]]:
+    """Replace ISO-8601 dates/timestamps with opaque sentinels."""
+    stash: list[str] = []
+
+    def _wrap(match: re.Match[str]) -> str:
+        stash.append(match.group(0))
+        return f"{_DATE_SENTINEL_L}{len(stash) - 1}{_DATE_SENTINEL_R}"
+
+    return _ISO_DATETIME_RE.sub(_wrap, text), stash
+
+
+def _unmask_iso_datetimes(text: str, stash: list[str]) -> str:
+    for index, stamp in enumerate(stash):
+        text = text.replace(f"{_DATE_SENTINEL_L}{index}{_DATE_SENTINEL_R}", stamp)
+    return text
+
 # Absolute filesystem paths (POSIX with 2+ segments, Windows drive, UNC,
 # home-relative ~/...). Negative lookbehind keeps URLs and single-segment
 # names like "/mcp" intact.
@@ -369,6 +404,7 @@ def _redact_string(text: Any, *, content: bool = False, cap: int) -> str:
     out = _cap_secret_safe(text, cap)
     out = op.redact_output(out)
     if not content:
+        out, date_stash = _mask_iso_datetimes(out)
         stash: list[str] = []
         for index, (pattern, replacement) in enumerate(_PII_PATTERNS):
             if index == _NAME_PAIR_PATTERN_INDEX:
@@ -379,6 +415,8 @@ def _redact_string(text: Any, *, content: bool = False, cap: int) -> str:
             out = pattern.sub(replacement, out)
         if stash:
             out = _restore_model_phrases(out, stash)
+        if date_stash:
+            out = _unmask_iso_datetimes(out, date_stash)
         out = _ABS_PATH_RE.sub("[REDACTED_PATH]", out)
         out = _redact_secret_path_tokens(out)
     # Placeholder substitution can expand the text slightly past the cap.

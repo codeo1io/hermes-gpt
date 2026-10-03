@@ -536,3 +536,159 @@ def test_name_pair_heuristic_preserves_model_strings(ui_root):
     out = ui_security.redact_browser({"note": "mail tony.stark@example.com now"})
     assert "tony.stark@example.com" not in out["note"]
     assert "[redacted-email]" in out["note"]
+
+
+@pytest.mark.parametrize(
+    "stamp",
+    [
+        "2026-10-03",
+        "2026-10-03T04:23:45",
+        "2026-10-03T04:23:45Z",
+        "2026-10-03 04:23:45",
+        "2026-10-03T04:23:45.123456+00:00",
+        "2026-10-03T04:23:45.1+05:30",
+        "next run 2026-10-03T04:23:45.123456+00:00 then 2026-10-04",
+    ],
+    ids=["date-only", "datetime", "utc-z", "space-sep", "micros-offset", "frac-tz", "two-stamps"],
+)
+def test_redact_browser_preserves_iso_timestamps(ui_root, stamp):
+    """rm-174: ISO-8601 dates/timestamps survive the PII passes untouched.
+
+    The phone heuristic matched the digit cluster inside a full-precision
+    timestamp ("...T04:23:45.123456+00:00" -> "...T04:23:[redacted-phone]"),
+    corrupting every timestamp Operator surfaces emit (fetched_at et al).
+    """
+    assert ui_security.redact_browser({"note": stamp})["note"] == stamp
+
+
+def test_redact_browser_phones_still_redacted_next_to_timestamps(ui_root):
+    """rm-174 narrows the phone collision, not the phone rule itself."""
+    note = "cron 2026-10-03T04:23:45.123456+00:00 call +1 (555) 123-4567"
+    out = ui_security.redact_browser({"note": note})["note"]
+    assert out == "cron 2026-10-03T04:23:45.123456+00:00 call [redacted-phone]"
+
+
+def test_redact_browser_iso_guard_does_not_shelter_digit_runs(ui_root):
+    """Longer digit runs are not clean ISO dates: the guard's lookarounds
+    decline to mask them, so the phone heuristic still applies (fail-safe
+    direction — over-redaction, never under-redaction)."""
+    out = ui_security.redact_browser({"note": "id 12026-10-031 end"})["note"]
+    assert out == "id [redacted-phone] end"
+
+
+def test_ok_envelope_timestamp_round_trip(ui_root):
+    stamp = "2026-10-03T04:23:45.123456+00:00"
+    assert ui_security.ok({"fetched_at": stamp}) == {
+        "ok": True,
+        "data": {"fetched_at": stamp},
+    }
+
+
+def test_rm170_cross_site_mutations_fail_closed(ui_root, monkeypatch):
+    """rm-170: the browser trust boundary on mutating /api routes.
+
+    The assess probe's exact shape — text/plain + foreign Origin POST
+    /api/ops/action — returned a 200 dry-run plan before this fix; every leg
+    must now fail closed before the route handler runs.
+    """
+    client = _build_app(monkeypatch)
+
+    # Browser "simple" cross-site form post (no preflight possible).
+    resp = client.post(
+        "/api/ops/action",
+        content=json.dumps({"tool": "hermes_cron_create", "args": {"name": "x"}}),
+        headers={"Content-Type": "text/plain", "Origin": "https://evil.example"},
+    )
+    assert resp.status_code == 415
+    assert resp.json()["error"]["code"] == "UNSUPPORTED_MEDIA_TYPE"
+
+    # application/json body, but a cross-origin browser context.
+    resp = client.post(
+        "/api/ops/action",
+        json={"tool": "hermes_cron_create", "args": {"name": "x"}},
+        headers={"Origin": "https://evil.example"},
+    )
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "CROSS_ORIGIN"
+
+    # Sec-Fetch-Site is honored when present and outranks Origin.
+    resp = client.post(
+        "/api/ops/action",
+        json={"tool": "hermes_cron_create", "args": {"name": "x"}},
+        headers={"Sec-Fetch-Site": "cross-site"},
+    )
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "CROSS_ORIGIN"
+
+
+def test_rm170_forged_host_requests_fail_closed(ui_root, monkeypatch):
+    """rm-170: DNS-rebounding shape — a browser-shaped request whose Host
+    was rebound to an attacker name must fail closed on /api and /oauth,
+    reads included."""
+    client = _build_app(monkeypatch)
+
+    resp = client.get("/api/ops/cron", headers={"Host": "evil.example"})
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "BAD_HOST"
+
+    # /oauth is Host-guarded before routing (this deployment has no OAuth
+    # config, so the unguarded answer would have been a plain 404).
+    resp = client.get("/oauth/token", headers={"Host": "evil.example"})
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "BAD_HOST"
+
+    resp = client.post(
+        "/api/ops/action",
+        json={"tool": "hermes_nonexistent", "args": {}},
+        headers={"Host": "evil.example"},
+    )
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "BAD_HOST"
+
+
+def test_rm170_non_browser_and_same_origin_callers_unaffected(ui_root, monkeypatch):
+    """rm-170 compatibility: curl/MCP-shaped callers (no Origin, no
+    Sec-Fetch-Site, application/json), the same-origin browser UI, and
+    user-initiated browser requests all pass through the trust boundary
+    unchanged; /mcp and non-/api surfaces are not guarded here."""
+    client = _build_app(monkeypatch)
+
+    # Any body passes when the browser markers are absent or same-origin:
+    # an unknown tool reaching the dispatcher proves the trust middleware
+    # let it through (404 UNKNOWN_TOOL is the handler's own envelope).
+    bogus = {"tool": "hermes_nonexistent", "args": {}}
+    resp = client.post("/api/ops/action", json=bogus)
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "UNKNOWN_TOOL"
+
+    resp = client.post(
+        "/api/ops/action",
+        json=bogus,
+        headers={"Origin": "http://127.0.0.1", "Sec-Fetch-Site": "same-origin"},
+    )
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "UNKNOWN_TOOL"
+
+    # user-initiated browser request (e.g. address-bar action) is allowed
+    resp = client.post(
+        "/api/ops/action",
+        json=bogus,
+        headers={"Sec-Fetch-Site": "none"},
+    )
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "UNKNOWN_TOOL"
+
+    # GETs on a valid loopback Host are untouched (reads stay available).
+    assert client.get("/api/ops/cron").status_code == 200
+
+    # /mcp stays governed by the SDK transport guard, not this middleware
+    # (the MCP streamable manager needs the lifespan context).
+    with client:
+        resp = client.post(
+            "/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+        )
+    assert resp.status_code == 200
+    assert "result" in resp.json()
+
+    # Non-guarded surfaces keep their old behavior.
+    assert client.get("/").status_code == 200

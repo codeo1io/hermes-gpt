@@ -12,6 +12,18 @@ Hermes GPT is designed to run on the user's machine, bound to loopback. Remote c
 
 Operator Mode is defense-in-depth, not an OS sandbox. Use OS-level isolation for untrusted input.
 
+### Browser trust boundary (UI and OAuth surfaces)
+
+The loopback bind stops other machines, not other origins in the same browser or a DNS-rebinding page with a forged `Host` header. The UI console (`/api`) and the OAuth endpoints (`/oauth`) therefore sit behind a request-trust middleware (rm-170) that fails closed:
+
+- every `/api` and `/oauth` request must carry a `Host` the server was configured for — loopback names, the bound host:port, `HERMES_GPT_ALLOWED_HOSTS` extras, and the OAuth issuer when configured. A missing or foreign `Host` is refused with `403 BAD_HOST`. This is the same Host allowlist the `/mcp` mount enforces via the MCP SDK `TransportSecuritySettings`; the two guards share one list and stay in lockstep.
+- mutating `/api` requests (POST/PUT/PATCH/DELETE) must declare `Content-Type: application/json` (a charset parameter is fine); anything else — including the browser "simple" `text/plain` form posts a cross-site page can issue without a CORS preflight — is refused with `415 UNSUPPORTED_MEDIA_TYPE`.
+- mutating `/api` requests that carry browser markers (`Sec-Fetch-Site` or `Origin`) must be same-origin or user-initiated (`Sec-Fetch-Site: none`); anything else is refused with `403 CROSS_ORIGIN`.
+
+Non-browser callers (curl, MCP clients, plain HTTP scripts) send none of the browser markers and are unaffected: a `Content-Type: application/json` POST with no `Origin`/`Sec-Fetch-Site` and a valid `Host` behaves exactly as before. The same-origin Flight Deck UI is likewise unaffected. `/mcp` itself is not governed by this middleware — authenticated deployments are governed by the CORS allowlist, and `/mcp` keeps its own [transport host/origin allowlist](mcp-compatibility.md); a stolen bearer token presented cross-origin from a malicious site still cannot ride the browser's ambient credentials because Operator Mode uses explicit bearer tokens, not cookies.
+
+Admins fronting the server with a proxy must add the public hostname to `HERMES_GPT_ALLOWED_HOSTS` (the same variable `/mcp` uses); requests arriving with any other `Host` are refused before routing.
+
 ## Authority model
 
 Operator authority is determined by four things:
