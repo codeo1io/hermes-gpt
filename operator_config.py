@@ -25,13 +25,14 @@ Safety rules:
 from __future__ import annotations
 
 import json
-import os
 import re
 import shutil
+import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
 
+import atomic_write
 import operator_policy as op
 
 # ---------------------------------------------------------------------------
@@ -327,10 +328,11 @@ def hermes_config_set(
 
         policy.require_mutation(dry_run)
         backup = _backup_file(path)
-        tmp = path.with_suffix(".yaml.tmp")
-        with open(tmp, "w", encoding="utf-8") as fh:
-            yaml.safe_dump(new_cfg, fh, sort_keys=False, default_flow_style=False)
-        os.replace(tmp, path)
+        atomic_write.atomic_write_text(
+            path,
+            yaml.safe_dump(new_cfg, sort_keys=False, default_flow_style=False),
+            mode=0o600,
+        )
         result = {
             "success": True,
             "dry_run": False,
@@ -436,10 +438,7 @@ def hermes_config_patch(
 
         policy.require_mutation(dry_run)
         backup = _backup_file(path)
-        tmp = path.with_suffix(".yaml.tmp")
-        with open(tmp, "w", encoding="utf-8") as fh:
-            fh.write(new_content)
-        os.replace(tmp, path)
+        atomic_write.atomic_write_text(path, new_content, mode=0o600)
         result = {
             "success": True,
             "dry_run": False,
@@ -579,6 +578,12 @@ def _validate_env_key_for_write(key: str) -> None:
         )
 
 
+# .env writes are read-modify-write on a shared file, now reachable from
+# multiple worker threads (sync tools are offloaded onto worker threads on
+# both SDK majors). One lock makes each key write atomic end to end.
+_ENV_WRITE_LOCK = threading.Lock()
+
+
 def _write_env_key(env_path: Path, key: str, value: str) -> None:
     """Write ``key=value`` to ``env_path``, preserving comments and existing lines.
 
@@ -586,36 +591,34 @@ def _write_env_key(env_path: Path, key: str, value: str) -> None:
     appends. The value is written verbatim (no shell escaping) — the .env
     format is plain KEY=VALUE.
     """
-    lines: list[str] = []
-    if env_path.exists():
-        with open(env_path, "r", encoding="utf-8") as fh:
-            lines = fh.readlines()
     new_line = f"{key}={value}\n"
-    replaced = False
-    out: list[str] = []
-    for line in lines:
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
+    with _ENV_WRITE_LOCK:
+        lines: list[str] = []
+        if env_path.exists():
+            with open(env_path, "r", encoding="utf-8") as fh:
+                lines = fh.readlines()
+        replaced = False
+        out: list[str] = []
+        for line in lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                out.append(line)
+                continue
+            existing_key = stripped.split("=", 1)[0].strip()
+            if existing_key == key:
+                if not replaced:
+                    out.append(new_line)
+                    replaced = True
+                # Skip duplicate original lines for the same key.
+                continue
             out.append(line)
-            continue
-        existing_key = stripped.split("=", 1)[0].strip()
-        if existing_key == key:
-            if not replaced:
-                out.append(new_line)
-                replaced = True
-            # Skip duplicate original lines for the same key.
-            continue
-        out.append(line)
-    if not replaced:
-        # Ensure there's a blank line between existing content and the new
-        # key when the file isn't empty and doesn't already end with one.
-        if out and out[-1].strip() != "":
-            out.append("\n")
-        out.append(new_line)
-    tmp = env_path.with_suffix(".env.tmp")
-    with open(tmp, "w", encoding="utf-8") as fh:
-        fh.writelines(out)
-    os.replace(tmp, env_path)
+        if not replaced:
+            # Ensure there's a blank line between existing content and the new
+            # key when the file isn't empty and doesn't already end with one.
+            if out and out[-1].strip() != "":
+                out.append("\n")
+            out.append(new_line)
+        atomic_write.atomic_write_text(env_path, "".join(out), mode=0o600)
 
 
 def hermes_env_set_nonsecret(

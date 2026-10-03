@@ -40,6 +40,22 @@ host/origin allowlist: loopback by default plus `HERMES_GPT_ALLOWED_HOSTS`
 extensions and the OAuth issuer when configured. Public unauthenticated
 hosting is unsupported (product invariant).
 
+## Sync tool offload and thread backpressure
+
+Every sync tool body runs on a worker thread on both SDK majors:
+`mcp_compat.HermesMCP.add_tool` wraps sync handlers into offloading
+coroutines (SDK 1 needs this to keep sync bodies off the event loop at all;
+SDK 2 needs it because its native offload would otherwise share `anyio`'s
+implicit process-wide limiter, which the knob below cannot reach). All
+offloaded bodies share one explicit `anyio.CapacityLimiter` sized from
+`HERMES_GPT_TOOL_THREAD_LIMIT` (default `40` — the same capacity `anyio`
+would provide implicitly, so the default is zero behavior delta; read once
+per process). There is no admission-control queue or timeout: a call that
+arrives while all slots are busy waits for a free slot, so sustained
+saturation surfaces as latency. When the limiter stays saturated for a
+while, a rate-limited warning names the knob so operators can retune it.
+See [Environment variables](env-vars.md) for the full knob contract.
+
 ## Trusted-client authentication metadata
 
 Every tool advertises its security scheme via MCP tool metadata

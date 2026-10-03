@@ -1,0 +1,2 @@
+{"step":1,"ts":"2026-09-29T20:02:49Z","summary":"stewardship: re-verifying batch file:line surfaces (token_store, 12 tmp sites, offload, packaging) for the request","touched":[]}
+{"step":2,"ts":"2026-09-29T20:05:18Z","summary":"stewardship_request JSON written+validated: 24 surfaces, 5 separation hints","touched":["/home/agent/.hermes/conductor-delegate-spool-infra-deploy/delegate/a4d0d1d2bee24b03bde304fc64e2f79b.json"]}

@@ -359,3 +359,104 @@ def test_gated_write_tools_refuse_without_owner_direct_confirm(built_tools, tmp_
         assert "PERMISSION_DENIED" in json.dumps(swarm)
     finally:
         op.set_audit_log_override(None)
+
+
+def test_tool_thread_limit_defaults_and_knob(monkeypatch):
+    """rm-078: the offload limiter defaults to anyio's 40 and honors the knob."""
+    import mcp_compat
+
+    monkeypatch.setattr(mcp_compat, "_tool_limiter", None)
+    monkeypatch.delenv("HERMES_GPT_TOOL_THREAD_LIMIT", raising=False)
+    limiter = mcp_compat._tool_thread_limiter()
+    assert limiter.total_tokens == 40
+
+    monkeypatch.setattr(mcp_compat, "_tool_limiter", None)
+    monkeypatch.setenv("HERMES_GPT_TOOL_THREAD_LIMIT", "7")
+    limiter = mcp_compat._tool_thread_limiter()
+    assert limiter.total_tokens == 7
+
+    # Malformed values fall back to the default instead of breaking startup.
+    assert mcp_compat._resolve_tool_thread_limit.__name__ == "_resolve_tool_thread_limit"
+    monkeypatch.setenv("HERMES_GPT_TOOL_THREAD_LIMIT", "not-a-number")
+    assert mcp_compat._resolve_tool_thread_limit() == 40
+    monkeypatch.setenv("HERMES_GPT_TOOL_THREAD_LIMIT", "0")
+    assert mcp_compat._resolve_tool_thread_limit() == 1
+
+
+def test_offloaded_sync_tool_runs_via_explicit_limiter(monkeypatch):
+    """rm-078: the SDK-1 offload wrapper passes our limiter to to_thread."""
+    import anyio
+    import mcp_compat
+
+    captured = {}
+
+    async def fake_run_sync(func, *, limiter=None):
+        captured["limiter"] = limiter
+        return func()
+
+    monkeypatch.setattr(anyio.to_thread, "run_sync", fake_run_sync)
+
+    def sync_tool(x: int) -> int:
+        return x * 2
+
+    wrapped = mcp_compat._offload_sync_tool(sync_tool)
+    out = anyio.run(lambda: wrapped(x=21))
+    assert out == 42
+    assert captured["limiter"] is mcp_compat._tool_thread_limiter()
+
+
+def test_saturation_warning_is_rate_limited(monkeypatch, caplog):
+    """rm-078: saturation emits one warning, then stays quiet inside the window."""
+    import logging
+
+    import mcp_compat
+
+    monkeypatch.setattr(mcp_compat, "_last_saturation_warning", 0.0)
+
+    class _Saturated:
+        total_tokens = 4
+
+        def statistics(self):
+            return type("S", (), {"borrowed_tokens": 4, "tasks_waiting": 0})()
+
+    limiter = _Saturated()
+
+    with caplog.at_level(logging.WARNING, logger="mcp_compat"):
+        mcp_compat._warn_if_saturated(limiter)
+        mcp_compat._warn_if_saturated(limiter)
+        mcp_compat._warn_if_saturated(limiter)
+
+    warnings = [r for r in caplog.records if "saturated" in r.message]
+    assert len(warnings) == 1
+    assert "HERMES_GPT_TOOL_THREAD_LIMIT" in warnings[0].message
+
+
+def test_concurrent_first_calls_construct_exactly_one_limiter(monkeypatch):
+    """rm-078 review fix (2026-10-03, run 041a92f6667d): lazy limiter
+    construction is lock-guarded, so a burst of concurrent first calls
+    cannot each build a ``CapacityLimiter`` (one orphaned) and transiently
+    double the effective thread budget."""
+    import threading
+
+    import mcp_compat
+
+    monkeypatch.setattr(mcp_compat, "_tool_limiter", None)
+    monkeypatch.setattr(mcp_compat, "_tool_thread_limit", None)
+
+    limiters = []
+    barrier = threading.Barrier(8)
+
+    def racer() -> None:
+        barrier.wait()
+        limiters.append(mcp_compat._tool_thread_limiter())
+
+    threads = [threading.Thread(target=racer) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(limiters) == 8
+    assert len({id(limiter) for limiter in limiters}) == 1, (
+        "concurrent first calls produced more than one limiter"
+    )

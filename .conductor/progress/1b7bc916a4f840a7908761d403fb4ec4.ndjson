@@ -1,0 +1,7 @@
+{"step":1,"ts":"2026-09-29T20:30:47Z","summary":"targeted_tests opened: running engine targeted_command over 17 changed surfaces","touched":[]}
+{"step":2,"ts":"2026-09-29T20:54:11Z","summary":"fixed 2 gate failures: atomic_write into py-modules; runtime-checkout.md out of MANIFEST+guard","touched":["pyproject.toml","MANIFEST.in","test_package_docs.py","CHANGELOG.md"]}
+{"step":1,"ts":"2026-09-29T21:26:01Z","summary":"gate r1: 2 failures (wheel import atomic_write; sdist runtime-checkout hygiene)","touched":[test_package_hygiene.py,pyproject.toml,MANIFEST.in]}
+{"step":2,"ts":"2026-09-29T21:26:01Z","summary":"fixed: atomic_write added to py-modules; runtime-checkout delisted+guard-pinned; CHANGELOG 14","touched":[pyproject.toml,MANIFEST.in,test_package_docs.py,CHANGELOG.md]}
+{"step":3,"ts":"2026-09-29T21:26:01Z","summary":"root-caused: stale egg-info SOURCES.txt poisoned all in-place builds; removed residue","touched":[hermes_gpt.egg-info]}
+{"step":4,"ts":"2026-09-29T21:26:01Z","summary":"gate r3 PASS exit 0, 17 surfaces 62s; digest surface-list unchanged","touched":[]}
+{"step":7,"ts":"2026-09-29T21:29:36Z","summary":"docs/README.md env-vars row re-applied after stash-dance loss; 17 files final","touched":["docs/README.md"]}

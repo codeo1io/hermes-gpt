@@ -31,14 +31,15 @@ from __future__ import annotations
 import json
 import os
 import re
-import secrets
 import shlex
 import shutil
+import threading
 import time
 from pathlib import Path
 from typing import Any
 
 import operator_policy as op
+import atomic_write
 
 
 # ---------------------------------------------------------------------------
@@ -47,24 +48,13 @@ import operator_policy as op
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
-    """Durably replace ``path`` with ``content``.
+    """Durably replace ``path`` with ``content`` via the shared helper.
 
-    The staging file is uniquely named (pid + random token) so concurrent
-    writers to the same target never clobber each other's staging file, and
-    it is fsynced before the rename so a crash cannot leave a truncated
-    target behind. A failed write removes its own staging file.
+    Thin shim kept for call sites and tests; the canonical implementation
+    (unique staging, fsync before rename, atomic replace, self-cleaning)
+    lives in :mod:`atomic_write` and adds an explicit 0600 mode.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
-    try:
-        with open(tmp, "w", encoding="utf-8") as fh:
-            fh.write(content)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
+    atomic_write.atomic_write_text(path, content, mode=0o600)
 
 
 def _backup_file(path: Path) -> Path | None:
@@ -992,6 +982,9 @@ def _janitor_operator_tmpdir(tmpdir: Path, *, now: float | None = None) -> int:
     return removed
 
 
+_TMPDIR_LOCK = threading.Lock()
+
+
 def _ensure_operator_tmpdir() -> Path:
     """Route owner-command scratch away from shared /tmp.
 
@@ -1011,12 +1004,13 @@ def _ensure_operator_tmpdir() -> Path:
         pass
     resolved = str(tmpdir.resolve())
     global _janitor_last_run
-    if time.time() - _janitor_last_run >= _TMPDIR_JANITOR_INTERVAL:
-        _janitor_last_run = time.time()
-        _janitor_operator_tmpdir(Path(resolved))
-    os.environ["TMPDIR"] = resolved
-    os.environ["TEMP"] = resolved
-    os.environ["TMP"] = resolved
+    with _TMPDIR_LOCK:
+        if time.time() - _janitor_last_run >= _TMPDIR_JANITOR_INTERVAL:
+            _janitor_last_run = time.time()
+            _janitor_operator_tmpdir(Path(resolved))
+        os.environ["TMPDIR"] = resolved
+        os.environ["TEMP"] = resolved
+        os.environ["TMP"] = resolved
     return Path(resolved)
 
 

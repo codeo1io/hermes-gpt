@@ -1,0 +1,5 @@
+{"step":1,"ts":"","summary":"prioritize: survey open items + prior prioritization artifact formats","touched":[]}
+{"step":1,"ts":"2026-09-29T19:59:55Z","summary":"prioritize: read prior-cycle format + re-derived open-item universe (45+ legacy candidates), env knobs=96, upstream unchanged","touched":[]}
+{"step":2,"ts":"2026-09-29T19:59:55Z","summary":"prioritize: sibling interlocks found — 2 skill-resolution branches + Q3 pack (token_store) unlanded; rm-077 scoped narrow","touched":[]}
+{"step":3,"ts":"2026-09-29T19:59:55Z","summary":"prioritize: dedup — rm-055 absorbs rm-082 gitleaks; rm-054/036 fold into rm-076 next cycle","touched":[]}
+{"step":4,"ts":"2026-09-29T19:59:55Z","summary":"prioritize: batch SELECTED rm-077+rm-067r+rm-078+rm-046+rm-080 (stretch rm-079/rm-082n); artifact written","touched":[".conductor/prioritize/34aa4fb0a73840399482c1ba4b11171c.md"]}

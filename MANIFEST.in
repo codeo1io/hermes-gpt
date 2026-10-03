@@ -21,8 +21,22 @@ include docs/retention-policy.md
 include docs/updating.md
 include docs/windows-chatgpt-codex.md
 include docs/ui-security-boundary.md
+include docs/cloudflare-tunnel.md
+include docs/codex-permissions.md
+include docs/delegations.md
+include docs/env-vars.md
+include docs/finance.md
+include docs/live-events.md
+include docs/missions.md
+include docs/openai-secure-mcp-tunnel.md
+include docs/security.md
+include docs/file-export.md
+include docs/flight-deck-missions.md
+include docs/session-control.md
+include docs/session-history.md
 include docs/flight-deck-coverage.md
 include docs/gemini-spark.md
+include docs/vnext-capability-manifest-and-mission-ledger.md
 recursive-include examples *.ps1
 prune docs/design
 prune docs/releases

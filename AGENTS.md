@@ -109,6 +109,10 @@ python -m twine check dist/*
 python tools/check_package_hygiene.py dist/*
 ```
 
+Before asserting sdist contents, remove any stale `hermes_gpt.egg-info/` directory
+(or build from a clean checkout): a stale `SOURCES.txt` silently poisons subsequent
+in-place `python -m build` runs (observed 2026-09-30, run 041a92f6667d).
+
 Do not weaken or skip a failing safety test just to make a change pass.
 
 ## Release discipline

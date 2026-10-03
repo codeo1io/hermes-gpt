@@ -53,6 +53,7 @@ hermes-gpt-fabric-peer = "operator_fabric_g4c:peer_main"
 [tool.setuptools]
 include-package-data = true
 py-modules = [
+  "atomic_write",
   "server",
   "oauth_auth",
   "operator_policy",
@@ -121,11 +122,13 @@ py-modules = [
 ]
 "share/hermes-gpt/docs" = [
   "docs/README.md",
+  "docs/env-vars.md",
   "docs/oauth.md",
   "docs/operator-mode.md",
   "docs/finance.md",
   "docs/missions.md",
   "docs/live-events.md",
+  "docs/vnext-capability-manifest-and-mission-ledger.md",
   "docs/delegations.md",
   "docs/mcp-compatibility.md",
   "docs/file-export.md",

@@ -12,8 +12,10 @@ assessment:
 
 The fixes: the two tools became async bodies that ``await`` their helpers,
 and ``mcp_compat.HermesMCP.add_tool`` wraps sync handlers in an offloading
-coroutine — but only when SDK < 2 is installed, so SDK 2 lanes are
-unchanged.
+coroutine on BOTH SDK majors (2026-10-03 review fix, run 041a92f6667d):
+SDK 1 needs it to run sync bodies off the loop at all, and SDK 2 needs it
+so sync bodies run through the explicit ``HERMES_GPT_TOOL_THREAD_LIMIT``
+limiter instead of anyio's implicit one.
 """
 
 from __future__ import annotations
@@ -84,15 +86,31 @@ def test_offload_wrapper_keeps_event_loop_responsive():
     del _threading
 
 
-def test_hermesmcp_add_tool_wrapper_gated_by_sdk_major():
-    """The wrapper must exist exactly on the SDK it is needed for."""
-    if mcp_compat.SDK_V2:
-        # SDK 2 offloads sync tools itself; HermesMCP must NOT override
-        # add_tool (byte-identical execution on the 2.x lanes).
-        assert "add_tool" not in vars(mcp_compat.HermesMCP)
-    else:
-        # SDK 1 runs sync tools on the loop; the override must exist.
-        assert "add_tool" in vars(mcp_compat.HermesMCP)
+def test_hermesmcp_add_tool_wrapper_exists_on_both_sdk_majors():
+    """The wrapper must exist on BOTH SDK majors (2026-10-03 review fix,
+    run 041a92f6667d): SDK 1 runs sync tools on the event loop, and SDK 2's
+    native offload uses anyio's implicit limiter that
+    ``HERMES_GPT_TOOL_THREAD_LIMIT`` cannot reach — the explicit limiter
+    must govern the default lane too, not just the SDK-1 lane."""
+    # Registered on the running major regardless of version...
+    assert "add_tool" in vars(mcp_compat.HermesMCP)
+    # ...and it actually wraps sync handlers into offloading coroutines.
+    server_instance = mcp_compat.HermesMCP("wrapper-probe", version="0-test")
+
+    def sync_probe(x: int) -> int:
+        return x * 2
+
+    server_instance.add_tool(sync_probe, name="sync_probe")
+    registered = server_instance._tool_manager._tools["sync_probe"].fn
+    assert inspect.iscoroutinefunction(registered)
+    assert registered is not sync_probe
+
+    async def async_probe(y: int) -> int:
+        return y + 1
+
+    server_instance.add_tool(async_probe, name="async_probe")
+    passthrough = server_instance._tool_manager._tools["async_probe"].fn
+    assert passthrough is async_probe
 
 
 @pytest.mark.parametrize("tool_name", ["hermes_web_extract", "hermes_vision_analyze"])
