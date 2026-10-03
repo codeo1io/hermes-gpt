@@ -471,3 +471,25 @@ def test_env_copy_nonsecret_refuses_missing_key_in_source(hermes_root, clean_env
     parsed = json.loads(out)
     assert parsed["success"] is False
     assert "not set" in parsed["error"].lower()
+
+
+def test_config_backup_helper_honors_file_backups_gate(tmp_path, monkeypatch):
+    """rm-192: config-tool backups go through the single gated helper.
+
+    operator_config once carried a duplicate _backup_file; it now delegates
+    to operator_workspace's, so the env gate must hold here too. This test
+    pins the delegation so the duplicate cannot silently return.
+    """
+    import operator_workspace as ows
+
+    target = tmp_path / "config.yaml"
+    target.write_text("x: 1\n", encoding="utf-8")
+
+    monkeypatch.setenv(ows.OPERATOR_FILE_BACKUPS_ENV, "0")
+    assert ocfg._backup_file(target) is None
+    assert list(tmp_path.glob("config.yaml.bak.*")) == []
+
+    monkeypatch.setenv(ows.OPERATOR_FILE_BACKUPS_ENV, "fals")
+    backup = ocfg._backup_file(target)
+    assert backup is not None
+    assert "fail-closed" in (ocfg._ows_file_backup_warning() or "")

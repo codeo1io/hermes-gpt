@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Operator write tools can now opt out of `.bak.*` file backups with `HERMES_GPT_OPERATOR_FILE_BACKUPS=0` (recognized false values: `0/false/no/off/disabled`, case-insensitive; empty also disables; default unchanged — backups stay on). One shared gate now covers all eight backup sites: the four workspace/owner write tools plus the profile-config writers (`hermes_config_set`, `hermes_config_patch`, `hermes_env_set_nonsecret`, `hermes_env_copy_nonsecret`), which previously carried a duplicate ungated backup helper. The parse is fail-closed: an unrecognized value (e.g. a typo) keeps backups ON and every direct-write tool result gains a `backup_warning` field naming the unrecognized value. The toggle changes only backup creation — level, dry-run, path, and Owner gates are untouched. Adopts the shape of upstream PR [#85](https://github.com/asimons81/hermes-gpt/pull/85) with the fail-closed hardening; see [docs/operator-mode.md](docs/operator-mode.md#optional-file-backups). The test suite also pins two determinism invariants: the environment-dependent `skipif` inventory is registered in a guard test (new skips fail until registered), and the audit-log override is snapshot-restored around every test so a dying fixture can no longer leak it across tests.
+
 ## 0.13.0 - 2026-09-29
 
 Autopilot: one durable, default-off runtime that drives a Mission through its MissionPlan without a human re-triggering every node, and never crosses an approval boundary. It is a caller of the existing Mission, plan, placement, Work Contract, delegation, budget, and live-event surfaces, not a new authority. See [docs/autopilot.md](docs/autopilot.md).
