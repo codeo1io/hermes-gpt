@@ -400,7 +400,11 @@ async def _websocket_endpoint(
                 last_heartbeat = now
             try:
                 text = await asyncio.wait_for(websocket.receive_text(), timeout=0.5)
-            except TimeoutError:
+            except asyncio.TimeoutError:
+                # 3.10: asyncio.exceptions.TimeoutError is a distinct class from
+                # builtin TimeoutError (they converge in 3.11). wait_for raises
+                # the asyncio class, so a bare `except TimeoutError` let the
+                # poll loop's normal 0.5s idle tick kill the endpoint on 3.10.
                 continue
             if len(text) > 4096:
                 await websocket.close(code=1009)
