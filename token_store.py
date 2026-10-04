@@ -120,18 +120,45 @@ def _key_from_file(hermes_root: Path) -> bytes | None:
         return None
 
 
-def _write_key_file(hermes_root: Path, key: bytes) -> None:
+def _ensure_secrets_dir(hermes_root: Path) -> Path:
+    """Create the secrets directory owner-only (0o700), idempotently.
+
+    The explicit mode is umask-proof: a umask can only clear permission
+    bits, and 0o700 sets none that group/other could hold.
+    """
     d = _secrets_dir(hermes_root)
-    d.mkdir(parents=True, exist_ok=True)
+    d.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return d
+
+
+def _write_secret_file(path: Path, data: bytes) -> None:
+    """Write secret bytes owner-only, with the mode fixed BEFORE any write.
+
+    Uses the same fd-based creation primitive as the store lock
+    (``os.open(..., 0o600)``) so the file is never observable on disk in a
+    group/world-readable state: there is no write-then-chmod window for key
+    or envelope material under a permissive umask.
+    """
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        # Also normalizes a stale temp file a previous run may have left
+        # with a wider mode; the mode is set before a single byte lands.
+        os.fchmod(fd, 0o600)
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view) :]
+    finally:
+        os.close(fd)
+
+
+def _write_key_file(hermes_root: Path, key: bytes) -> None:
+    _ensure_secrets_dir(hermes_root)
     path = key_file_path(hermes_root)
     tmp = path.with_suffix(".tmp")
-    tmp.write_bytes(key)
-    os.chmod(tmp, 0o600)
+    _write_secret_file(tmp, key)
+    # POSIX rename preserves the tmp inode's 0o600 mode, so the destination
+    # is owner-only from the instant it exists.
     tmp.replace(path)
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
 
 
 def _rotate_active_key(hermes_root: Path) -> dict[str, Any]:
@@ -161,10 +188,9 @@ def _rotate_active_key(hermes_root: Path) -> dict[str, Any]:
     try:
         fresh = secrets.token_bytes(32)
         path = key_file_path(hermes_root)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        _ensure_secrets_dir(hermes_root)
         tmp = path.with_suffix(".new")
-        tmp.write_bytes(fresh)
-        os.chmod(tmp, 0o600)
+        _write_secret_file(tmp, fresh)
         os.replace(tmp, path)
     except Exception:
         return {"outcome": "failed", "source": "keyfile"}
@@ -237,17 +263,14 @@ def _write_envelope(hermes_root: Path, kid: str, plaintext: dict[str, Any], key:
         "ciphertext": _b64(ciphertext),
         "nonce": _b64(nonce),
     }
-    d = _secrets_dir(hermes_root)
-    d.mkdir(parents=True, exist_ok=True)
+    _ensure_secrets_dir(hermes_root)
     path = envelope_path(hermes_root)
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(envelope, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.chmod(tmp, 0o600)
+    _write_secret_file(
+        tmp, json.dumps(envelope, ensure_ascii=False, indent=2).encode("utf-8")
+    )
+    # Rename preserves the tmp inode's 0o600 mode (see _write_key_file).
     tmp.replace(path)
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
 
 
 def save_tokens(hermes_root: Path, tokens: dict[str, Any]) -> dict[str, Any]:
@@ -322,7 +345,7 @@ class _StoreLock:
         _msvcrt.locking(self.fd, _msvcrt.LK_UNLCK, 1)
 
     def __enter__(self) -> "_StoreLock":
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
         try:
             self._acquire()
@@ -368,7 +391,17 @@ def _connect(hermes_root: Path) -> sqlite3.Connection:
     """
     path = _db_path(hermes_root)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # Create the database owner-only BEFORE sqlite opens it: sqlite
+        # honors an existing file's mode (and propagates it to the -wal/-shm
+        # sidecars), so no page of token material is ever group/world-
+        # readable under a permissive umask. Legacy databases created by
+        # older builds are normalized by the chmod below.
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+        finally:
+            os.close(fd)
         db = sqlite3.connect(path, timeout=15.0, isolation_level=None)
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA journal_mode=WAL")

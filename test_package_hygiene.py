@@ -11,9 +11,12 @@ regression in the guard itself is caught without a full build.
 from __future__ import annotations
 
 import io
+import os
+import signal
 import subprocess
 import sys
 import tarfile
+import time
 import zipfile
 from pathlib import Path
 
@@ -21,6 +24,52 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent
 GUARD = REPO_ROOT / "tools" / "check_package_hygiene.py"
+
+
+def _kill_process_tree(proc: subprocess.Popen) -> None:
+    """Kill the child's whole process group (the session Popen created)."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        return
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
+def _run_in_own_session(argv, *, cwd=None, timeout=60.0, check=False):
+    """Run argv in its own session so a timeout can kill the whole tree.
+
+    ``python -m build`` and the hygiene guard spawn grandchildren that
+    inherit the stdout/stderr pipes; killing only the direct child (what
+    ``subprocess.run`` does on timeout) leaves those pipes held open and
+    the drain-wait deadlocks the suite (fleet-observed 43+ minute freeze
+    in this module). A new session plus a process-group kill bounds every
+    descendant.
+    """
+    proc = subprocess.Popen(
+        argv,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_process_tree(proc)
+        out, err = proc.communicate()  # reaps; pipes are closed by killpg
+        raise subprocess.TimeoutExpired(
+            cmd=argv, timeout=timeout, output=out, stderr=err
+        ) from None
+    if check and proc.returncode != 0:
+        raise subprocess.CalledProcessError(
+            proc.returncode, argv, output=out, stderr=err
+        )
+    return subprocess.CompletedProcess(argv, proc.returncode, out, err)
 
 sys.path.insert(0, str(REPO_ROOT / "tools"))
 import check_package_hygiene as guard  # noqa: E402  (requires the sys.path bootstrap above)
@@ -175,13 +224,11 @@ def built_artifacts(tmp_path_factory):
     """Build wheel + sdist once per module and return the artifact paths."""
     outdir = tmp_path_factory.mktemp("dist")
     try:
-        subprocess.run(
+        _run_in_own_session(
             [sys.executable, "-m", "build", "--outdir", str(outdir)],
             cwd=str(REPO_ROOT),
-            check=True,
-            capture_output=True,
-            text=True,
             timeout=300,
+            check=True,
         )
     except (subprocess.CalledProcessError, FileNotFoundError) as exc:
         pytest.skip(f"python -m build unavailable or failed: {exc}")
@@ -192,17 +239,41 @@ def built_artifacts(tmp_path_factory):
 
 def test_wheel_and_sdist_are_hygiene_clean(built_artifacts):
     """The release-blocking guard must pass on both built artifacts."""
-    result = subprocess.run(
+    result = _run_in_own_session(
         [sys.executable, str(GUARD), *[str(a) for a in built_artifacts]],
-        check=False,
-        capture_output=True,
-        text=True,
         timeout=120,
     )
     assert result.returncode == 0, (
         f"package hygiene guard failed:\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )
     assert "CLEAN" in result.stdout
+
+
+def test_timeout_path_kills_pipe_holding_grandchildren(tmp_path):
+    """rm-188 regression: the timeout path must kill the whole process
+    group, not just the direct child.
+
+    The child spawns a grandchild that inherits the stdout/stderr pipes
+    and outlives it; with plain ``subprocess.run`` semantics the post-kill
+    drain blocks until the grandchild exits (the 43+ minute suite freeze).
+    The session-scoped runner must raise TimeoutExpired within a small
+    bound instead.
+    """
+    child = tmp_path / "spawner.py"
+    child.write_text(
+        "import subprocess, sys, time\n"
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        "print('child-ready', flush=True)\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+    started = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        _run_in_own_session([sys.executable, str(child)], timeout=2)
+    elapsed = time.monotonic() - started
+    assert elapsed < 30, (
+        f"timeout path took {elapsed:.1f}s — the process group was not killed"
+    )
 
 
 def test_sdist_does_not_ship_internal_docs(built_artifacts):

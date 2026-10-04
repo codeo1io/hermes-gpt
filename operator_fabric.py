@@ -35,6 +35,7 @@ from typing import Any
 import operator_fleet as op_fleet
 import operator_policy as op
 import operator_runners as op_runners
+from versioning import VERSION
 
 FABRIC_VERSION = 1
 REQUEST_SCHEMA = "hermes.fabric-request/v1"
@@ -2812,7 +2813,7 @@ class _PeerHandler(BaseHTTPRequestHandler):
                     "protocolVersion": "1.0",
                     "name": policy.identity,
                     "description": "Hermes GPT managed Fabric peer",
-                    "version": "0.8",
+                    "version": VERSION,
                     "url": self.advertised_url,
                     "capabilities": {},
                     "defaultInputModes": ["application/json"],

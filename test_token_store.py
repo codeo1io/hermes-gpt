@@ -259,3 +259,63 @@ def test_restore_populates_after_restart(hermes_root):
     summary = fresh.restore_tokens(hermes_root)
     assert summary["restored"] == 2
     assert fresh.validate_access_token("tok-restart") is True
+
+
+# --- rm-187: secret files must be owner-only from creation (0o600 / 0o700) ---
+
+
+@pytest.fixture
+def permissive_umask():
+    """umask 0o000 — the dangerous case for secret-file creation (a naive
+    write lands group/world-readable, and a write-then-chmod fix leaves a
+    window where secret bytes are readable on disk)."""
+    prev = os.umask(0o000)
+    try:
+        yield
+    finally:
+        os.umask(prev)
+
+
+def _force_keyfile_source(monkeypatch):
+    monkeypatch.setattr(ts, "_key_from_keyring", lambda *a, **k: None)
+    monkeypatch.setattr(ts, "_store_key_in_keyring", lambda *a, **k: False)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+def test_secret_files_created_owner_only_under_permissive_umask(
+    tmp_path, monkeypatch, permissive_umask
+):
+    """rm-187: key file + envelope are created 0o600 and the secrets dir
+    0o700, even under umask 0o000 (mode fixed at open, never after write)."""
+    _force_keyfile_source(monkeypatch)
+    root = tmp_path / "fresh-root"  # secrets dir is created by the writes
+
+    ts._write_key_file(root, b"k" * 32)
+    assert os.stat(root / "secrets").st_mode & 0o777 == 0o700
+    assert os.stat(ts.key_file_path(root)).st_mode & 0o777 == 0o600
+
+    ts.save_tokens(root, {"access_tokens": {}})
+    assert os.stat(ts.envelope_path(root)).st_mode & 0o777 == 0o600
+    # Rewrite path (envelope already exists) stays owner-only.
+    ts.save_tokens(root, {"access_tokens": {}, "refresh_tokens": {}})
+    assert os.stat(ts.envelope_path(root)).st_mode & 0o777 == 0o600
+
+    rotation = ts._rotate_active_key(root)
+    assert rotation["outcome"] == "rotated"
+    assert os.stat(ts.key_file_path(root)).st_mode & 0o777 == 0o600
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+def test_token_db_and_lock_created_owner_only_under_permissive_umask(
+    tmp_path, monkeypatch, permissive_umask
+):
+    """rm-187: the SQLite token db is created 0o600 at open time (not
+    chmod'd after sqlite has already written pages), as is its lock file."""
+    _force_keyfile_source(monkeypatch)
+    root = tmp_path / "fresh-root"
+
+    ts.commit_tokens(root, source_epoch=0, issue={})
+
+    assert os.stat(root / "secrets").st_mode & 0o777 == 0o700
+    assert os.stat(root / "secrets" / ts.DB_FILENAME).st_mode & 0o777 == 0o600
+    assert os.stat(ts._store_lock_path(root)).st_mode & 0o777 == 0o600

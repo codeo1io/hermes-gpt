@@ -16,6 +16,7 @@ claim against the current module and its tests before acting.
 
 ## Active implementation notes
 
+- `a2a-adopt-vs-build.md` — decision record for `rm-204`: the four hand-rolled A2A peer surfaces (fabric client, fabric agent card, fleet peer discovery client, server fleet card) vs `a2a-sdk` 1.2.x; decision stay-hand-rolled / pin-and-conform-later, `protocolVersion` kept at `1.0`, card `version` now derived from `versioning.VERSION`; standing conformance guards in `test_operator_fabric.py`.
 - `v0.12-budget-enforcement.md` — budget D3 hard-block ENFORCEMENT (v0.12 slice-2, Phase 4/5): gate matrix (global flag + direct + confirm + per-mission policy), pause via mission transition with `budget_breaker` reason, breaker signal via the existing attention spool, `budget_events` `break` row, anti-TOCTOU re-snapshot, failure-mode matrix (card B1/feat-v012-slice2).
 - `v0.12-controller-l2.md` — controller L2 rung + placement-informed dispatch (v0.12 slice-2): execute-at-most-one smallest action under full gates, retained §7.7 prohibitions, idempotent replay, `would_assign` truth table, fail-closed recovery (card B1/feat-v012-slice2). **Implemented** behind the default-off gate set; L0/L1 output is byte-identical with the gate unset.
 - `v0.9-budget-hardblock.md` — mission-scoped spend envelope (`budget_accounts` + `budget_check`, Phase 2 dry-run) and the D3 hard-block path (pause Mission + `budget_breaker` signal); enforcement implemented in v0.12 slice-2 behind the default-off gate set, dry-run otherwise (kanban t_78e597c6).

@@ -734,3 +734,97 @@ def test_http_peer_rejects_generic_text_before_any_agent_path(tmp_path, monkeypa
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+# --- rm-204: A2A adopt-vs-build standing conformance guards ---
+
+
+def test_agent_card_advertises_real_package_version(tmp_path, monkeypatch):
+    """rm-204 guard: the Fabric agent card pins to the real package version
+    (versioning.VERSION) instead of a stale literal, and keeps the documented
+    plain-JSON card shape incl. the supportedInterfaces dialect."""
+    from versioning import VERSION
+
+    svc = service(tmp_path, monkeypatch)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), fabric._PeerHandler)
+    host, port = server.server_address
+    advertised = f"http://{host}:{port}"
+    server.fabric_service = svc
+    server.fabric_advertised_url = advertised
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        for path in ("/.well-known/agent-card.json", "/.well-known/agent.json"):
+            with urllib.request.urlopen(
+                f"http://{host}:{port}{path}", timeout=5
+            ) as resp:
+                assert resp.status == 200
+                assert resp.headers["Content-Type"].startswith("application/json")
+                card = json.loads(resp.read().decode("utf-8"))
+            assert card["protocolVersion"] == "1.0"
+            assert card["version"] == VERSION, (
+                "agent card version must track versioning.VERSION, not a "
+                "stale literal"
+            )
+            assert card["url"] == advertised
+            assert card["capabilities"] == {}
+            assert card["defaultInputModes"] == ["application/json"]
+            assert card["defaultOutputModes"] == ["application/json"]
+            assert card["skills"][0]["id"] == "hermes-fabric-v1"
+            assert card["supportedInterfaces"] == [
+                {
+                    "url": advertised,
+                    "protocolBinding": "JSONRPC",
+                    "protocolVersion": "1.0",
+                }
+            ]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_peer_client_declares_plain_json_a2a_headers(monkeypatch):
+    """rm-204 standing guard: the hand-rolled Fabric client speaks the
+    documented plain-JSON A2A dialect — Accept: application/json on every
+    call; Content-Type: application/json + A2A-Version: 1.0 on JSON-RPC
+    POSTs (see docs/design/a2a-adopt-vs-build.md)."""
+    captured = []
+
+    class _FakeResponse:
+        def read(self, _n=-1):
+            return b"{}"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        captured.append(req)
+        return _FakeResponse()
+
+    monkeypatch.setattr(fabric.urllib.request, "urlopen", fake_urlopen)
+    fabric._http_json("http://127.0.0.1:9/card", headers={}, timeout=5)
+    fabric._http_json(
+        "http://127.0.0.1:9/rpc",
+        headers={"Authorization": "Bearer t"},
+        timeout=5,
+        body={"jsonrpc": "2.0", "method": "SendMessage"},
+    )
+
+    get_req, post_req = captured
+    assert get_req.get_method() == "GET"
+    assert {k.lower(): v for k, v in get_req.headers.items()} == {
+        "accept": "application/json"
+    }
+    assert post_req.get_method() == "POST"
+    post_headers = {k.lower(): v for k, v in post_req.headers.items()}
+    assert post_headers["accept"] == "application/json"
+    assert post_headers["content-type"] == "application/json"
+    assert post_headers["a2a-version"] == "1.0"
+    assert post_headers["authorization"] == "Bearer t"
+
+
+# --- end rm-204 ---
