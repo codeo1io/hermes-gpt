@@ -232,3 +232,17 @@ jobs:
         with:
           name: distributions
           path: dist/*
+
+  roadmap-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Roadmap ledger id guard (rm-195)
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          python tools/check_roadmap_ids.py --baseline origin/master

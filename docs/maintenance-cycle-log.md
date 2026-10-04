@@ -487,3 +487,184 @@ and `uvx ruff@0.15.22`.
   61db9bce rm-133, c5fba76a rm-148); upstream remains frozen at tip
   `f4151d9728` (9 commits ahead, no v0.13 tag; PR #85 touches
   `operator_workspace.py` — check it before any backup-related work).
+
+## Cycle 11 — 2026-10-03 — "Canonical ledger truth repair: recover the render-collapse, guard id monotonicity"
+
+Run `dfaf334f988c494e8d0df40d18aa57c3` (repository-maintenance
+`d7b00779f41d4218a24c577e8ecc8034`, campaign
+`hermes-gpt-fix-pr63-pkce-test-fixtures-80cce15da948f8b2`, cycle 3) against
+worktree run-dfaf334f988c — assessed at `6be3a5e95b` (a commit whose entire
+diff IS the ROADMAP managed-render collapse, 1061→329 lines), rebased onto
+`e490130737` at implement (clean; ROADMAP.md was byte-identical across
+6be3a5e95b..origin/master, exactly as the campaign predicted). Phases:
+assess → research → roadmap → prioritize → stewardship → implement →
+targeted tests → full tests → compound. All outcomes below are pre-review:
+the batch is implemented and locally verified but uncommitted (landing gate
+owns commits). Heading numbering note (verified on disk 2026-10-03 by
+attempt 959d4af2): the committed log ends at Cycle 6 and Cycle 7 exists
+nowhere; uncommitted sibling entries hold Cycle 8 (run efe7657638c7),
+Cycle 9 (run d92e1ad3b11f) and Cycle 10 (run e1e8d7ecd932) at this same
+append anchor. This entry mints Cycle 11 past the observed frontier (same
+rule as id minting); renumber/fold at the landing gate, keeping 8+9+10+11.
+
+### What the cycle did
+
+- **Batch lead — rm-195 ledger truth repair.** The campaign's unique anchor:
+  commit `6be3a5e95b` landed canonically (an ancestor of origin/master) and
+  silently dropped ledger truth — 38 rm- ids with no trace, PLUS 22 more
+  whose defining blocks the render flattened to title-only one-liners. The
+  second class was invisible to the assess-time MENTION-set comparison and
+  surfaced only when the guard needed a DEFINITION-based one; sizing was
+  corrected 38 → 60 at implement. Restore: 60 blocks recovered verbatim —
+  44 from the pre-collapse snapshot `git show 6be3a5e95b^:ROADMAP.md`, 16
+  from git history at the last commit that still defined each block — every
+  block carrying a `*restore source:*` annotation; statuses left AS-OF their
+  source snapshot (flips are landing-gate-owned). Result: the ledger's
+  defined-id set is a superset of every ancestor version — 116 defined ids
+  at implement (vs 55 at origin/master, 99 at `6be3a5e95b^`), 120 after the
+  sibling-landing sync below.
+- **Batch rider (folded same unit) — rm-139 roadmap guard tooling.** NEW
+  `tools/check_roadmap_ids.py`: id-format validation (3 legacy variants),
+  duplicate detection, 12-word status grammar, monotonicity vs a baseline
+  (`origin/master` | any ref | path | none) with an explicit
+  `roadmap-id-removed: rm-NNN` marker escape, `--json` output. NEW
+  `test_tools_check_roadmap_ids.py`: 11 tests including the failing-mode
+  proof against a synthetic 6be3a5e95b-shaped collapse. `.github/workflows/ci.yml`
+  +14: a `roadmap-guard` job (fetch-depth 0) appended after the build job —
+  deliberately disjoint from the sibling-contested mcp-matrix region. No
+  pre-existing suite test consumes ROADMAP.md (grep-verified), so the guard
+  is purely additive.
+- **Yielded: rm-048 (mcp 2.3.x conformance lane).** Selected at prioritize,
+  yielded at stewardship: sibling 9b1770fc3065 was live-mid-implement on
+  exactly its file set (ci.yml + docs/mcp-compatibility.md +
+  test_mcp_compat.py diffs verified in its worktree); one-owner rule.
+- **Sibling-landing sync (targeted-tests phase).** Between implement
+  (baseline e490130737) and validation, origin/master advanced to
+  `97321194a8` (run 61db9bce terminal-salvage landing `f685b516d1` +
+  integration merge), minting rm-151..rm-154. Their definition lines were
+  imported verbatim into a dedicated ROADMAP block so the new invariant
+  holds mid-run: guard pre-fix RC=1 (`rm-151..154 missing`) → post-fix `ok
+  (120 defined ids vs 59 baseline; 0 marked removals)`. The landing-gate
+  rebase folds that block with master's originals — keep exactly one copy of
+  each id line.
+- **Campaign roadmap trail** (canonical, outside the repo):
+  `campaigns/hermes-gpt-fix-pr63-pkce-test-fixtures-80cce15da948f8b2/ROADMAP.md`
+  grew the Cycle 3 additions (+30 lines, exactly one mint rm-195), the
+  batch-selected section, the stewardship two-unit split, the implement
+  section, and compound's Cycle 3 outcome. Ledger patch for the gate:
+  `/tmp/3f4f12b8-scratch/ROADMAP.ledger.patch` (insert-only +8,
+  `git apply --check` PASS, two-way verified, footer stays last).
+- **Assess/research substrate (consumed, not re-derived):** assess ran the
+  full suite GREEN at `6be3a5e95b` plus six runtime probes (CSRF/DNS-rebinding
+  text/plain dispatch 200-OK, sys.path pollution SHADOW:agent, skill-profile
+  bleed, plan-declared-artifact drop proven) — every finding folded into
+  EXISTING ids (S1→rm-170, S5→cedce-cedce0cffda9 M1, S6→rm-136) instead of
+  re-minted; research proved the collapse landed canonically (HEAD ancestor
+  of origin/master, 7 behind / 0 ahead) and re-verified every dependency and
+  upstream claim live on 2026-10-03.
+
+### Prevention rules
+
+1. **Damage-size claims about structured ledgers need a definition-based
+   extractor, not substring presence.** "38 ids dropped" came from an
+   id-MENTION set-comm; 22 additional flattened blocks still MENTION their
+   ids in title-only one-liners. The 60-block truth surfaced only when the
+   guard had to parse block shape. Corollary: build the parser before
+   quoting recovery counts.
+2. **When a managed render replaces a hand-maintained ledger and its engine
+   is retired, git is the only authority.** The ROADMAP footer still says
+   "do not edit by hand" while nothing re-renders content back. Recover each
+   block verbatim from the last commit that defined it (44 from the
+   pre-collapse snapshot, 16 from deeper history), annotate the source per
+   block, and leave status flips to the gate. Never retype recovered text
+   from memory — renumber notes inside restored blocks prove how much
+   history the ids carry.
+3. **Baseline-relative invariants need a mid-run repair path.** The guard
+   asserts HEAD ⊇ origin/master, and master moved mid-run. Importing the
+   drifted ids verbatim (a sibling-landing sync block) restored the
+   invariant without redoing roadmap phases — and the guard itself proved
+   the repair (RC=1 before, ok after). A guard a live run cannot satisfy
+   gets disabled; design the escape first.
+4. **Every removal guard needs an explicit, greppable escape hatch.** The
+   `roadmap-id-removed: rm-NNN` marker keeps legitimate landing-gate
+   renumbers from bricking CI while still failing the silent-collapse class
+   (proven by the synthetic-collapse failing mode in the test file).
+5. **Yield contested file sets after verifying sibling state on disk, not
+   from memory.** rm-048 was yielded only after `git status`/`git diff` in
+   9b1770fc3065's worktree showed its batch live on the exact three files.
+   The fleet-census claim alone would not have been enough evidence.
+6. **Read the prior attempt's event log before any durable write.** This
+   action's prior attempt `4ed0789efb` was reaped at session bootstrap
+   (event log: turn_started → session_reap_failed → completed(failed);
+   zero tool calls, no delegate envelope). One `cat` proved nothing to adopt
+   and authorized a clean redo — same family as Cycle 8 rule 5, now proven
+   twice.
+7. **A missing pytest summary line is not a missing result.** The impacted
+   runner stacks its own `-q` on pyproject's `-q`; under the effective `-qq`
+   pytest 9.1.1 suppresses the final `N passed` line in runner logs. Verify
+   by an explicit-count control invocation (here `263 passed in 36.77s`)
+   plus the gate returncode — never treat an absent line as absence of
+   outcome, and never block a phase on it.
+
+### Validation record (current at compound)
+
+- Targeted (work-order command verbatim ×3, 7 changed surfaces as args →
+  15 impacted test files): RC=0 every run with identical selection, 263
+  tests, zero fixes (`/tmp/7023656c-scratch/targeted.log`, `targeted2.log`,
+  `targeted-final.log`, `impacted-final.log`); ruff 0.15.22 clean over all
+  changed surfaces (project venv — global 0.16.9 is version skew, never
+  used); `yaml.safe_load` on the edited ci.yml green.
+- Full gate (verbatim `local_validation_gate.py --shell-command 'python -m
+  pytest -q'`): GATE_RC=0, envelope
+  `/home/agent/.hermes/local-validation-gate/results/result-2885337-354271789.json`,
+  digest
+  `validation:v1:48b1260b1aade41100a2b9e8b8f34e76f00591d49be6cf46939263b89bb92c68`,
+  single admitted run (workers=2), 16:54:23→17:12:21 UTC 2026-10-03 (~18
+  min), log `[100%]`, ZERO `FAILED`/`ERROR` markers, 1656 test markers
+  (final summary suppressed per rule 7 — counted via python across 23
+  progress lines); `rm_rf` Errno-39 session-start garbage warnings present
+  (known fleet noise, not failures). Tree unchanged across the phase and
+  identical at compound start: `M .github/workflows/ci.yml`, `M ROADMAP.md`
+  (+551), `?? tools/check_roadmap_ids.py`,
+  `?? test_tools_check_roadmap_ids.py`.
+- Caveat (known fleet nuance): the envelope's `digest_base` is `unknown`
+  (standalone local-validation-gate write); the authoritative equality check
+  is recomputing `validation_digest` from an installed conductor release at
+  the review/final gates.
+- Currency duty: compound's own delta is docs/ledger-only (this log entry +
+  the campaign-roadmap 'Cycle 3 outcome' append) — no executable surface
+  changed after the full gate, so the envelope above remains current at HEAD
+  + delta. Any later phase that touches executable surfaces (e.g. a
+  review-fix pass) MUST refresh and explicitly supersede this record, never
+  leave this envelope as a stale final state.
+- The compound phase ran under the work order's explicit no-test constraint:
+  every validation fact above is consumed from the recorded phase evidence,
+  not re-executed.
+
+### Context left for the next cycle
+
+- **First rider (stewardship's pick): rm-119/F8** — start_flow foreign-turn
+  exfil; rm-119 itself was resurrected by this cycle's restore.
+- **Re-derive, don't redo, rm-048** (mcp 2.3.x conformance lane) against
+  whatever 9b1770fc3065 landed; the research facts live in the campaign
+  roadmap's S3 fold-map line (7 behavior changes in v2.3.0,
+  `max_sse_event_size` needs httpx2 ≥2.10, protocol revisions 2025-11-25 /
+  2026-07-28, transitive floors starlette ≥0.48@py3.14 / anyio ≥4.9 /
+  pydantic ≥2.12).
+- **The restored open-class ids are the next assess's input:** ≥30 open
+  blocks are visible again (rm-058..075, rm-085..094, rm-115..119, rm-121,
+  123, 124, 130 …). Their invisibility was the root cause of sibling re-mint
+  churn (three-way rm-196 collisions). Re-score them against fleet ownership
+  BEFORE minting anything ≥ rm-202; the freed census also retires the
+  "contested rm-193/194" trap that forced this run to mint rm-195.
+- **Landing-gate duties:** fold
+  `/tmp/3f4f12b8-scratch/ROADMAP.ledger.patch` (title-merge collisions per
+  the campaign census — rm-180/181, rm-191, rm-193, rm-196×3, rm-197;
+  lowest-mint wins, losers renumber ≥ rm-202); fold the Sibling-landing sync
+  block into master's rm-151..154 originals (exactly one copy of each id
+  line); keep cycle-log Cycles 8→9→10→11 in order on merge; status flips for
+  rm-195/rm-139 stay gate-owned; recompute the validation digest from an
+  installed conductor release (the envelope's `digest_base` is `unknown`).
+- **Compound sink substitution** (standing fleet pattern, restated for the
+  record): `docs/solutions/` is a live-system ops-runbook contract; this
+  cycle's learning is compounded here + in the campaign roadmap instead.
