@@ -487,3 +487,223 @@ and `uvx ruff@0.15.22`.
   61db9bce rm-133, c5fba76a rm-148); upstream remains frozen at tip
   `f4151d9728` (9 commits ahead, no v0.13 tag; PR #85 touches
   `operator_workspace.py` — check it before any backup-related work).
+
+## Cycle 12 — 2026-10-04 — "Repo & release truth closure"
+
+Run `73696bb0d3b1432593e0fe57ed66d1a2` (repository-maintenance
+`926e9e9ae120496083974792b98fae60` cycle 3, campaign
+`hermes-gpt-ci-self-hosted-only-e5cade321d1e7909`) against worktree
+`run-73696bb0d3b1-73696bb0` at HEAD `e490130737` — fast-forward rebased from
+the assessed base `40a26a5378` at implement via stash→ff-only→pop (ff range
+touched only `operator_live_events.py` + `test_operator_autopilot_status.py`;
+zero batch-file overlap; the unstaged ROADMAP.md mint survived
+byte-for-byte). Phases: assess `97df30ad` (18 findings at 40a26a5378; prior
+fleet assess was 30de0067f9, +1 Stage4/INV-9 commit) → research `67aac56d`
+(outputs N1–N5, all facts re-verified live) → roadmap `679fdabf` (prior
+attempt `ac5fcec2` died of transport failure ~8 messages in with zero durable
+work — forensically verified via event log + tree census, redone from
+scratch) → prioritize `43d44386` → stewardship `2bfd6225` → implement
+`9da73752` → targeted_tests `1ce146e3` → full_tests `c67298d4` → compound
+(this entry). Everything below is PRE-REVIEW: implemented and locally
+verified, uncommitted; review, landing, and CI carry this record forward.
+Numbering: this entry takes Cycle 12 — this tree's committed log ends at
+Cycle 6; sibling uncommitted entries hold 8 (run-efe7657638c7), 9
+(run-d92e1ad3b11f), 10 (run-e1e8d7ecd932), 11 (run-dfaf334f988c); Cycle 7
+exists nowhere on disk (recorded once by a swept prior pass, per efe's
+Cycle 8 note). This campaign's cycles 1–2 (runs `fd2bc85f`, `abf8079b`)
+failed before compound — this is work-order `926e9e9a`'s first compounding
+record. A landing merge keeps entries 8→12 in numeric order. The ce-compound
+`docs/solutions/` sink was deliberately not used (fleet precedent 9b1770fc /
+d92e1ad3 / efe76576: `docs/solutions/` is a live-system ops-runbook
+contract); learnings live here and in the campaign roadmap.
+
+### What the cycle did
+
+Batch **"Repo & release truth closure"** — 3 units, selected under full
+fleet saturation (every open item ≥70 was claimed by an in-flight sibling
+implement or blocked on a fleet-banned file; claims verified 2026-10-03
+~14:5Z), all backed by this run's own assess evidence, all zero
+runtime-behavior risk, zero banned-file contact except one named
+`.gitignore` hazard:
+
+- **U1 LEAD `rm-045` — vercel.json reconciliation: DELETED with rationale**
+  (`git rm vercel.json`). The 14-line root config routed `site/**` through
+  `@vercel/static` — a pre-`web/`-era static-site deployment target. The
+  current UI is the `web/` vite app, and public unauthenticated Operator
+  hosting is unsupported (product invariant), so the repo must not imply a
+  Vercel deployment target: deletion is the truth-closure, not a rewrite to
+  track `web/`. Upstream PR #85 (open since 2026-09-30, 1 comment, no
+  maintainer signal) was recorded as context only — untouched, never closed
+  or commented. Remaining `vercel` mentions are historical records
+  (`x-post-v0.4.0.md` marketing history, ledger lines) — verified by grep.
+  Residual recorded for next cycle: `site/vercel.json` (90 bytes) remains as
+  an untracked on-disk artifact (assess finding #16's second half).
+- **U2 `rm-161` — dead scaffolding deleted** (`git rm test_verify.py`).
+  134 lines of Windows `C:\Users\asimo\...` MCP verification scaffolding
+  with **zero test functions** (re-verified at HEAD before this entry:
+  `git show HEAD:test_verify.py | grep -c 'def test_'` → 0) and zero
+  references in code/CI/config. Collectors count collected tests, not test
+  *files*, so this survived every CI gate since it landed.
+- **U3 `rm-168` — .conductor work-order artifacts untracked** (`git rm -r
+  --cached .conductor`, 210 files, ALL kept on disk for operator
+  continuity) + one trailing `.gitignore` append (comment + `.conductor/`,
+  now line 45; kept as a separate hunk from run-b6659410's planned
+  `.gitignore` edit). Pre-grep for `.conductor` references in
+  ci.yml/tools/docs: none in executable surfaces.
+- **No README/CHANGELOG/docs legs** — not user-visible, and those files are
+  fleet-banned today.
+- **Roadmap-phase deliverable (companion, NOT a batch unit):** repo
+  ROADMAP.md +12 insert-only mint — dated `signals:` insertions on
+  rm-048/rm-134/rm-139/rm-014 + the cycle-3 additions block carrying the
+  full 18-finding fold map, standing gates, and the research dated-refresh.
+  NO new id minted (every candidate already fleet-owned; census
+  2026-10-03T13:19:30Z, frontier rm-206, next free rm-207). The ledger
+  patch `/tmp/679fdabf-scratch/ROADMAP.ledger.patch` is a landing-gate duty;
+  the worktree mint stays unstaged per fleet convention.
+- **Campaign roadmap:** outcome appended to
+  `/work/projects/hermes-autonomy/runtime/fork-maintenance/campaigns/hermes-gpt-ci-self-hosted-only-e5cade321d1e7909/ROADMAP.md`
+  (this campaign's first cycle-outcome section — its cycles 1–2 failed).
+
+### Validation record (recorded outcomes only — compound ran no tests)
+
+- **Targeted** (dispatch-named surfaces: `operator_live_events.py`,
+  `test_operator_autopilot_status.py`, `test_verify.py` — first two folded
+  in by the rebase, third deleted by the batch): seeded runner verified
+  non-fallback via `--print-only` (7 impacted test files, NOT the full
+  suite), then `--jobs 1` (delegate pid pool saturated 863→900/900 with one
+  EAGAIN spawn — single-worker launch per fleet rule) → RC:0, dots [100%],
+  zero FAILED/ERROR (`/tmp/1ce146e3-scratch/targeted.log`); explicit-count
+  rerun `.venv/bin/python -m pytest --basetemp <fresh> -p no:cacheprovider
+  <7 files>` → **141 passed in 37.62s**, RC:0. `python3 -m ruff check .` →
+  All checks passed (0.15.10 in-pin). Implement-phase focused gates:
+  `test_package_hygiene.py` 51 passed; `--collect-only -q` RC:0 (collection
+  intact after deletions).
+- **Full:** the work order's full_command executed VERBATIM through the
+  local validation gate — `local_validation_gate.py --shell-command
+  'python -m pytest -q'` (release `98a6bf4aa6ea302fa79578ffe1f98dd51c15b2c1`)
+  → **GATE-RC:0**, outcome `completed`, returncode 0, workers 2, 1378.9s
+  (started 2026-10-03T19:32:58.63Z → finished 19:55:57.58Z). Envelope
+  `/home/agent/.hermes/local-validation-gate/results/result-808166-355223419.json`.
+  Dot-matrix: [100%], zero FAILED/ERROR greps; full_tests recorded 1795
+  passed + 5 skipped, strict line-anchored recount at compound = 1796 + 5 =
+  1801 outcomes (±1 dot-parse variance, same conclusion). Single admitted
+  run, tree unchanged across the phase (`1 M ROADMAP / 212 D staged / 1 M
+  .gitignore staged`, 0 untracked).
+- **Digest:** `validation_digest('40a26a5378561050f93393a30666d3c65d51916e',
+  '.')` == dispatch digest `validation:v1:13b436b31c266aa2888a1f5bacc983d
+  57c47adc53ab53553c85afe5ee00b3b98` before AND after both test phases
+  (recomputed from the release source, not the envelope — the envelope
+  carries `validation_digest: null` + `digest_base: 'unknown'`, the known
+  standalone-gate quirk; authoritative equality is the recompute, and the
+  base is the work-order lineage base 40a26a5378…, not HEAD).
+- **Digest currency:** this entry and the campaign-roadmap append are
+  docs-only (no executable surface changed after full_tests), so the
+  envelope above remains the newest validation record per fleet rule —
+  supersede only if a post-compound phase edits executable surfaces.
+
+### Prevention rules
+
+1. **A stale deploy config is implied support, not neutral documentation.**
+   When a config file's target surface no longer exists (`site/**` era vs
+   the `web/` app) AND the product invariant disclaims that hosting
+   (local-loopback, no public Operator hosting), delete-with-rationale;
+   never rewrite the config to track a build the product says it won't
+   deploy. Record the upstream-PR context but never act on the upstream
+   thread from a fork-truth change.
+2. **Zero-test test files are invisible to collectors.** A `test_*.py` with
+   no test functions passes collection, CI, and hygiene checks forever —
+   collectors count tests, not files. Candidate guard for `tools/`: every
+   tracked `test_*.py` must yield ≥1 collected test or an explicit
+   historical marker. Deletion is safe only after a repo-wide reference
+   grep (here: zero refs to `test_verify|vercel` outside historical
+   records — re-verified at HEAD before deletion and again at compound).
+3. **Run-local tool state must be ignored at introduction, not untracked
+   retroactively.** `.conductor/` accumulated 210 tracked files before any
+   ignore rule existed. The retroactive pattern that works: `git rm -r
+   --cached` (disk preserved for operator continuity) + one-line ignore +
+   pre-grep ci.yml/tools/docs for references. Landing corollary: every
+   later conductor landing that re-adds `.conductor` files (61db9bce's
+   97321194a8 added two) must re-apply the same untrack fold.
+4. **Stash→ff-only→pop preserves unstaged ledger mints byte-for-byte** —
+   but verify the ff range's file set BEFORE popping; if the range touched
+   the minted file or batch files, stop and reconcile instead.
+5. **Dead-attempt forensics before durable writes** (re-proved by this
+   cycle's roadmap phase): a transport-failed prior attempt leaves event-log
+   dispatch/progress lines but NO result artifact and (here) zero scratch/
+   ledger/tree traces; census everything before adopting; nothing durable →
+   redo the phase from scratch, never adopt by assumption.
+6. **Gate-envelope digest fields are advisory, not authoritative** (third
+   fleet occurrence): the standalone-gate envelope carries
+   `validation_digest: null` / `digest_base: 'unknown'`; the equality check
+   is recomputing `validation_digest(base, repo)` from the installed
+   release, where base = the work-order lineage base, not HEAD.
+7. **Delegate pid-pool pre-flight stands** (re-proved): pids.current hit
+   863→900/900 with an EAGAIN bash spawn during targeted — single-worker
+   launch + polling; `pids.max` has since been raised 900→3000 (full suite
+   ran at 912, ~30%, zero starvation symptoms). The admission gate tracks
+   CPU/mem leases, not pids — the cgroup read is still manual pre-flight.
+
+### Context left for the next cycle
+
+- **Headline (from this run's assess, folded in the mint's fold map):**
+  `rm-185` shared-mission-workspace + basename-only evidence matching
+  (`operator_autopilot.py:960`, `operator_mission_plan.py:621-622`,
+  `operator_contract.py:799-830`) — runtime-PROVEN at 40a26a5378 by
+  `/tmp/97df30ad-assess/probe_shared_workspace.py` (cross-mission AND
+  within-mission contamination), ACTIVATED at the #26 rebase
+  (`artifacts_present` default-on), priority 92.0, fleet-triple-claimed —
+  coordinate before batching; the probes are reusable as regression tests.
+  `rm-170`/rebinding exfil chain (`probe_rebinding_exfil.py`: sessions_leak
+  + transcript_secret + csrf dispatch all true) is fixed-at-master (outer
+  `TransportSecurityMiddleware`, server.py:3348-3352) — closed, never
+  reselect; `rm-134`'s residual Content-Type/Sec-Fetch check survives as
+  the research-N1 gap.
+- **Unclaimed-this-cycle queue (value order, from prioritize):**
+  rm-172 (turn lease ttl-300 never renewed; `hermes_state.py:309`
+  `refresh_session_turn_lease` has zero callers), rm-164+rm-201 (oauth
+  redirect_uri suffix wildcard, `oauth_auth.py:1430-1437` — when
+  oauth_auth.py clears the fleet ban), rm-174 (phone-redaction regex
+  matches ISO dates + ui_security.py:216 TitleCase false-positive),
+  rm-177 (audit_record `changed: False` hardcoded), rm-184 (fleet-card
+  stale '0.20.5' literals server.py:3075/:3117 + operator_fabric.py:2815
+  `"version": "0.8"`), rm-183 (operator_fleet POST read unbounded + GET
+  reads full body before `_MAX_REMOTE_BYTES` — cap bounds nothing),
+  rm-205/rm-206 (when the b6659410 ui_chat/server lane clears),
+  rm-196+rm-193 skill-bleed family (when skill-res clears),
+  rm-035 (`[tool.ruff]` section; pin `>=0.15,<0.17` when adopting 0.16.x —
+  0.16.10 current), rm-012 basetemp `rm_rf` de-flake lane (protocol
+  re-observed in BOTH this cycle's logs: dots+[100%]+zero F/E = green;
+  never file a repo defect off a lost summary line).
+- **Claimed by siblings — verify at landing, don't reselect:**
+  rm-077+rm-083 (sdist zero web assets — fe7370db), rm-048 lane signals
+  recorded here (mcp 2.3.0 suite-green scratch venv, mcp 2.3.0 live on
+  PyPI while repo pins 2.2.0), rm-162+rm-173 (hermes-agent cloned at HEAD
+  in CI + self-hosted publish id-token; upstream moved to eb7e862032),
+  rm-203 (A2A v1.0.1 prefers `application/a2a+json` — extend acceptance to
+  cite a2aproject/A2A CHANGELOG.md@v1.0.1), rm-139 cross-run census guard
+  extension (this cycle's mint records the collision inventory).
+- **Batch residual:** `site/vercel.json` (untracked, 90 bytes, on-disk) —
+  finding #16's second half; disposition next cycle.
+- **Verified-FIXED negatives (scope away, don't re-derive):** gitleaks path
+  args, oauth dynamic-registration scope leakage, operator_cron deadline
+  retry loop, operator_fabric client guard (all at 40a26a5378); WS-loop
+  bare-`TimeoutError` = fixed at 58a70ddd5e (#27, rebase-only).
+
+### Landing-gate duties (this cycle's additions)
+
+- Status flips rm-045 / rm-161 / rm-168 → implemented (keep
+  `tools/check_roadmap_ids.py` green; no ids removed); THREE separate
+  commits per `must_remain_separate`; the `.gitignore` hunk stays separate
+  from run-b6659410's planned hunk.
+- Apply `/tmp/679fdabf-scratch/ROADMAP.ledger.patch` (or merge by title);
+  fold cycle-log entries 8→9→10→11→12 in order; re-census fleet LIVE
+  before any mint (frontier rm-206 at 2026-10-03T13:19:30Z; next free
+  rm-207).
+- Reconcile ref drift: local origin/master has advanced to `97321194a8`
+  (2 beyond the implement gate `e490130737`; 61db9bce's landing brings
+  ROADMAP.md +64, CHANGELOG, ui_security.py, operator_mission.py AND two
+  NEW tracked `.conductor` files — re-apply the U3 untrack fold on top).
+- Supersede envelope `result-808166-355223419.json` only if a post-compound
+  phase edits executable surfaces (fleet rule; compound edited docs only).
+- Campaign roadmap carries this cycle's outcome section (append at
+  campaign dir, first for this work order).
