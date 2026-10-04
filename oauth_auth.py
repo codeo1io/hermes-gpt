@@ -1301,6 +1301,12 @@ def _error_response(exc: OAuthError) -> JSONResponse:
 
 
 def validate_bearer_token(token_value: str, state: OAuthState | None, *, static_token: str | None = None) -> bool:
+    # Mirrors the B4 guards (authorize / _authenticate_client): a non-ASCII
+    # bearer token used to raise TypeError inside hmac.compare_digest and
+    # surface as an unauthenticated 500 from every protected path. Malformed
+    # tokens are a client error, not a crash.
+    if token_value and not token_value.isascii():
+        return False
     expected = (static_bearer_from_env() or "") if static_token is None else static_token
     if expected and token_value and hmac.compare_digest(token_value, expected):
         return True

@@ -48,16 +48,20 @@ jobs:
         sdk: ["mcp>=1.28.1,<2", "mcp>=2,<3"]
         # Exact pins run on the full matrix only (push(master)/nightly/
         # dispatch). Current upstream releases under test (research
-        # 2026-09-20): mcp 1.30.0 and 2.2.0 shipped 2026-09-07; exact pins
-        # keep them covered deliberately rather than incidentally via the
-        # range lanes.
+        # 2026-10-03, rm-180 refresh per rm-048 cadence): mcp 2.3.0 shipped
+        # 2026-10-02 (2.x pin moved 2.2.0 -> 2.3.0; requires-python >=3.10,
+        # same SDK 2 execution semantics the range lane already exercises);
+        # mcp 1.30.0 stays the deliberate 1.x exact lane adjacent to the
+        # floor. Spec-delta review note: SDK 2.3.x adds no new hermes-gpt
+        # surface — our integration consumes server/session primitives only
+        # (verified: suite subset green on a 2.3.0 venv this cycle).
         include: >-
           ${{ github.event_name == 'pull_request' && fromJSON('[]')
-          || fromJSON('[{"python": "3.10", "sdk": "mcp==1.28.1"}, {"python": "3.10", "sdk": "mcp==2.0.0"}, {"python": "3.10", "sdk": "mcp==1.30.0"}, {"python": "3.10", "sdk": "mcp==2.2.0"}]') }}
+          || fromJSON('[{"python": "3.10", "sdk": "mcp==1.28.1"}, {"python": "3.10", "sdk": "mcp==2.0.0"}, {"python": "3.10", "sdk": "mcp==1.30.0"}, {"python": "3.10", "sdk": "mcp==2.3.0"}]') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
         with:
           python-version: ${{ matrix.python }}
       - run: python -m pip install -e ".[dev]" "${{ matrix.sdk }}"
@@ -149,8 +153,8 @@ jobs:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
         with:
           python-version: '3.12'
       - run: python -m pip install -e ".[dev]"
@@ -164,8 +168,8 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
         with:
           python-version: '3.12'
       - run: python -m pip install -e ".[dev]"
@@ -193,7 +197,7 @@ jobs:
   windows-docs:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - name: Parse Secure MCP Tunnel PowerShell examples
         shell: powershell
         run: |
@@ -219,8 +223,8 @@ jobs:
     needs: [test, agent-loader, compatibility, lint, web, windows-docs]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
         with:
           python-version: '3.12'
       - run: python -m pip install build twine

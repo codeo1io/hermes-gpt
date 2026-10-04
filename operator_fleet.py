@@ -245,7 +245,12 @@ def _http_post_json(url: str, body: dict[str, Any], headers: dict[str, str], tim
     hdrs = {"Content-Type": "application/json", "A2A-Version": "1.0", **headers}
     req = urllib.request.Request(url, data=data, headers=hdrs, method="POST")
     with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
-        return json.loads(resp.read().decode("utf-8"))
+        # Same bound as _http_get_json: a hostile or oversized peer response
+        # must not be buffered into memory unbounded.
+        body = resp.read(_MAX_REMOTE_BYTES + 1)
+        if len(body) > _MAX_REMOTE_BYTES:
+            raise ValueError("A2A peer response exceeded the bounded response limit")
+        return json.loads(body.decode("utf-8"))
 
 
 def _card_url(base_url: str) -> str:

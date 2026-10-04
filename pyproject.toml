@@ -16,7 +16,10 @@ dependencies = [
   "mcp[cli]>=1.28.1,<3",
   "packaging>=23",
   "uvicorn>=0.30,<1",
-  "cryptography>=42",
+  "cryptography>=50",
+  # rm-180: floor closes GHSA-g6cj-pr64-35w5 / CVE-2026-69247 (HIGH,
+  # Bleichenbacher oracle via distinguishable PKCS#7 decrypt failures;
+  # affects 44.0.0-49.0.0, fixed ONLY in 50.0.0 - so >=49 is still exposed).
   "pyyaml>=6.0.3,<7",
   "croniter>=2.0,<7",
   "tomli; python_version < '3.11'",
@@ -25,7 +28,9 @@ dependencies = [
   # ui_ops.py, operator_live_events.py. anyio: mcp_compat.py, ui_missions.py
   # (dedicated long-poll limiter). Declared so the operator UI has an
   # explicit install contract independent of the MCP SDK's dependency pivot.
-  "starlette>=0.40,<2",
+  "starlette>=0.47.2,<2",
+  # rm-180: 0.47.2 floor closes CVE-2025-54121 (multipart DoS) for
+  # range-resolved installs below the resolved 1.x line.
   "anyio>=4,<5",
 ]
 
