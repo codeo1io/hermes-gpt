@@ -70,6 +70,7 @@ py-modules = [
   "operator_cron",
   "operator_skills",
   "operator_skill_resolution",
+  "operator_profile_scope",
   "operator_config",
   "operator_workspace",
   "operator_export",

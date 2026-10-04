@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Any
 
 import operator_policy as op
+from operator_profile_scope import profile_override_scope
 
 
 @dataclass(frozen=True)
@@ -193,16 +194,16 @@ def _agent_modules() -> tuple[Any, Any] | None:
 
 @contextmanager
 def _profile_scope(profile_home: Path, constants: Any):
-    setter = getattr(constants, "set_hermes_home_override", None)
-    resetter = getattr(constants, "reset_hermes_home_override", None)
-    if not callable(setter) or not callable(resetter):
+    """Scope one call to a profile home under the shared rm-207 profile gate.
+
+    The Agent override is process-global, so concurrent Operator tool calls
+    for different profiles must not hold windows at the same time; the gate
+    in ``operator_profile_scope`` serializes conflicting homes while allowing
+    same-home overlap. Degrades to a plain no-op scope exactly as before when
+    the constants module lacks the override pair.
+    """
+    with profile_override_scope(profile_home, constants):
         yield
-        return
-    token = setter(profile_home)
-    try:
-        yield
-    finally:
-        resetter(token)
 
 
 def _plugin_entries(skills_tool: Any) -> list[dict[str, Any]]:
