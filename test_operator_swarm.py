@@ -1342,3 +1342,57 @@ def test_server_registers_swarm_tools(monkeypatch):
         "hermes_swarm_approve",
     ):
         assert tool in names
+
+
+# --- rm-197: fail-closed stages contract guard (replaces a stripped-under--O assert) ---
+
+def test_canonical_workflow_stages_guard_fails_closed(monkeypatch):
+    """The stages contract guard must raise explicitly; asserts vanish under -O."""
+    monkeypatch.setattr(swarm, "_validate_stage_defs", lambda stages, raw: None)
+    raw = {
+        "schema": swarm.WORKFLOW_SCHEMA,
+        "workspaces": ["/tmp"],
+        "stages": "not-a-list",
+    }
+    with pytest.raises(ValueError, match="stages must resolve to a list"):
+        swarm._canonical_workflow(raw)
+
+
+def test_canonical_workflow_stages_guard_under_python_O():
+    """rm-197: with asserts stripped (``python -O``) the guard still fails closed."""
+    import os
+    import subprocess as sp
+    import sys
+    import textwrap
+
+    repo = str(Path(__file__).resolve().parent)
+    script = textwrap.dedent(
+        f"""
+        import sys
+        sys.path.insert(0, {repo!r})
+        import operator_swarm
+
+        operator_swarm._validate_stage_defs = lambda stages, raw: None
+        raw = {{
+            "schema": operator_swarm.WORKFLOW_SCHEMA,
+            "workspaces": ["/tmp"],
+            "stages": "not-a-list",
+        }}
+        try:
+            operator_swarm._canonical_workflow(raw)
+        except ValueError as exc:
+            if "stages must resolve to a list" in str(exc):
+                print("GUARD_OK")
+                sys.exit(0)
+        sys.exit(3)
+        """
+    )
+    proc = sp.run(
+        [sys.executable, "-O", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "GUARD_OK" in proc.stdout

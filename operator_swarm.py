@@ -463,7 +463,11 @@ def _canonical_workflow(raw: Any) -> tuple[str, dict[str, Any]]:
 
     stages = raw.get("stages")
     _validate_stage_defs(stages, raw)
-    assert isinstance(stages, list)
+    if not isinstance(stages, list):
+        # Defensive contract guard (rm-197): survives ``python -O``. Normally
+        # unreachable because _validate_stage_defs rejects non-list shapes
+        # with its own ValueError.
+        raise ValueError(f"workflow {id}: stages must resolve to a list")
 
     # Per-stage M1-contract shape validation happens lazily at dispatch
     # (the engine builds contracts then); workflow_validate can call

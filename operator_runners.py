@@ -1300,7 +1300,15 @@ def _worker_pi(
         bufsize=1,
         env=child_env,
     )
-    assert proc.stdin is not None and proc.stdout is not None
+    if proc.stdin is None or proc.stdout is None:
+        # Fail-closed stdio guard (rm-197): an explicit check survives
+        # ``python -O`` where the previous ``assert`` was stripped.
+        proc.kill()
+        proc.wait()
+        raise RuntimeError(
+            "pi runner subprocess did not allocate stdio pipes: "
+            f"pid={getattr(proc, 'pid', '?')} argv={argv!r}; refusing RPC dispatch"
+        )
     proc.stdin.write(json.dumps({"id": "dispatch", "type": "prompt", "message": contract["objective"]}, ensure_ascii=False) + "\n")
     proc.stdin.flush()
     final_text = ""

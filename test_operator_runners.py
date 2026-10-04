@@ -1043,3 +1043,85 @@ def test_stale_request_envelope_cleanup_removes_old_prompt(tmp_path: Path):
     _os.utime(request_path, (old, old))
     assert runners._cleanup_stale_request_envelopes(hermes_root=tmp_path, ttl_seconds=3600) == 1
     assert not request_path.exists()
+
+
+# --- rm-197: fail-closed stdio guard (replaces a stripped-under--O assert) ---
+
+def test_worker_pi_stdio_guard_fails_closed(monkeypatch, tmp_path):
+    """The stdio guard must raise explicitly; asserts vanish under ``python -O``."""
+    import sys  # noqa: F401  (kept for parity with the -O variant)
+
+    killed = {}
+
+    class FakeProc:
+        pid = 4242
+        stdin = None
+        stdout = None
+
+        def kill(self):
+            killed["pid"] = self.pid
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr(runners, "_pi_tools", lambda contract: "read")
+    monkeypatch.setattr(runners, "_pi_selection", lambda contract: (None, None))
+    monkeypatch.setattr(runners, "_pi_child_env", lambda contract: {})
+    monkeypatch.setattr(
+        runners.confinement, "wrap_argv", lambda argv, workspace, writable: argv
+    )
+    monkeypatch.setattr(
+        runners, "_popen_process_group", lambda *a, **k: FakeProc()
+    )
+    with pytest.raises(RuntimeError, match="stdio pipes"):
+        runners._worker_pi("pi-sentinel", {"objective": "x"}, 30, tmp_path / "log")
+    assert killed["pid"] == 4242
+
+
+def test_worker_pi_stdio_guard_under_python_O():
+    """rm-197: with asserts stripped (``python -O``) the guard still fails closed."""
+    import os
+    import subprocess as sp
+    import textwrap
+
+    repo = str(Path(__file__).resolve().parent)
+    script = textwrap.dedent(
+        f"""
+        import sys
+        sys.path.insert(0, {repo!r})
+        import operator_runners as runners
+
+        class FakeProc:
+            pid = 4242
+            stdin = None
+            stdout = None
+            def kill(self):
+                pass
+            def wait(self):
+                return 0
+
+        runners._pi_tools = lambda contract: "read"
+        runners._pi_selection = lambda contract: (None, None)
+        runners._pi_child_env = lambda contract: {{}}
+        runners.confinement.wrap_argv = lambda argv, workspace, writable: argv
+        runners._popen_process_group = lambda *a, **k: FakeProc()
+        try:
+            runners._worker_pi(
+                "pi-sentinel", {{"objective": "x"}}, 30, "/tmp/pi-guard-O.log"
+            )
+        except RuntimeError as exc:
+            if "stdio pipes" in str(exc):
+                print("GUARD_OK")
+                sys.exit(0)
+        sys.exit(3)
+        """
+    )
+    proc = sp.run(
+        [sys.executable, "-O", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "GUARD_OK" in proc.stdout
