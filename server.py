@@ -3790,9 +3790,8 @@ def build_codex_mcp_server(
         gateway_snapshot=lambda: hermes_gateway_status(),
         gateway_diagnostics_callback=_codex_gateway_diagnostics,
         # vision/web tools are native async tools; their Codex registry bodies are
-        # plain defs executed in worker threads (SDK 2 offloads them; SDK 1 goes
-        # through HermesMCP.add_tool's _offload_sync_tool), so bridging with
-        # asyncio.run is loop-safe here.
+        # plain defs executed in worker threads (MCP SDK 2 offloads sync tools
+        # natively), so bridging with asyncio.run is loop-safe here.
         vision_analyze=lambda image_path, prompt: asyncio.run(
             hermes_vision_analyze(image_url=image_path, question=prompt)
         ),
