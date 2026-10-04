@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+import operator_policy as _operator_policy
 import operator_skill_resolution as _skill_resolution
 
 _ISOLATED_ENV_VARS = (
@@ -44,6 +45,9 @@ _ISOLATED_ENV_VARS = (
     "HERMES_GPT_OAUTH_GEMINI_REDIRECT_URI",
     "HERMES_GPT_BEARER_TOKEN",
     "HERMES_GPT_TOKEN_MASTER_KEY",
+    # Operator file backups default ON for every test; backup-gating tests
+    # set HERMES_GPT_OPERATOR_FILE_BACKUPS explicitly (rm-192).
+    "HERMES_GPT_OPERATOR_FILE_BACKUPS",
     # Hermes-side identity env: never inherit the invoking shell's profile or
     # data root during tests. Cleared at import time so collection-time module
     # imports resolve against the sandbox, not the real machine.
@@ -168,3 +172,19 @@ def isolate_operator_environment(monkeypatch):
     monkeypatch.setattr(
         _skill_resolution, "_skill_loader_override", _test_skill_loader
     )
+
+
+@pytest.fixture(autouse=True)
+def _reset_audit_log_override():
+    """Keep operator_policy's audit-log override from leaking across tests.
+
+    Module-local ``audit_override`` fixtures set a process-global override
+    (``operator_policy.set_audit_log_override``). A test that dies between
+    set and teardown — or one that sets the global directly — would leak it
+    into every later test's audit records. Snapshot and restore around each
+    test so suite results stay environment-order deterministic. (rm-101)
+    """
+    saved = _operator_policy._audit_log_override
+    yield
+    if _operator_policy._audit_log_override != saved:
+        _operator_policy.set_audit_log_override(saved)

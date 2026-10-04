@@ -28,6 +28,7 @@ def clean_env(monkeypatch):
         op.OPERATOR_ENABLED_ENV, op.OPERATOR_LEVEL_ENV, op.OPERATOR_APPLY_MODE_ENV,
         op.OPERATOR_ALLOWED_PROFILES_ENV, op.OPERATOR_ALLOWED_PATHS_ENV,
         op.OPERATOR_DENIED_PATHS_ENV, op.OWNER_ACK_ENV, op.OWNER_ACTIVE_ENV,
+        ows.OPERATOR_FILE_BACKUPS_ENV,
     ]:
         monkeypatch.delenv(name, raising=False)
 
@@ -827,3 +828,125 @@ def test_janitor_operator_tmpdir_never_raises_on_undeletable(tmp_path: Path, mon
     assert ows._janitor_operator_tmpdir(tmp_path) == 1
     assert stale_file.exists() is False
     assert stale_dir.exists()
+
+
+# ---------------------------------------------------------------------------
+# Operator file backups: HERMES_GPT_OPERATOR_FILE_BACKUPS (rm-192)
+#
+# Fail-closed superset of upstream PR #85: recognized false values
+# (0/false/no/off/disabled, case-insensitive, and the empty string) disable
+# backups; anything else unrecognized keeps backups ON and the tool result
+# carries backup_warning so a typo can never silently drop the safety net.
+# ---------------------------------------------------------------------------
+
+
+def test_workspace_patch_file_backups_disabled(workspace_tree, clean_env, audit_override, monkeypatch):
+    monkeypatch.setenv(op.OPERATOR_ENABLED_ENV, "1")
+    monkeypatch.setenv(op.OPERATOR_LEVEL_ENV, "workspace")
+    monkeypatch.setenv(op.OPERATOR_APPLY_MODE_ENV, "direct")
+    monkeypatch.setenv(op.OPERATOR_ALLOWED_PATHS_ENV, str(workspace_tree))
+    monkeypatch.setenv(ows.OPERATOR_FILE_BACKUPS_ENV, "0")
+    target = workspace_tree / "README.md"
+    out = ows.hermes_workspace_patch(
+        path=str(target), old_string="# Project", new_string="# New Project",
+        dry_run=False,
+    )
+    parsed = json.loads(out)
+    assert parsed["success"] is True
+    assert parsed["backup"] is None
+    assert parsed["backup_warning"] is None
+    assert list(workspace_tree.glob("README.md.bak.*")) == []
+
+
+def test_owner_write_file_file_backups_disabled(workspace_tree, clean_env, audit_override, monkeypatch):
+    _enable_owner(monkeypatch)
+    monkeypatch.setenv(ows.OPERATOR_FILE_BACKUPS_ENV, "off")
+    target = workspace_tree / "owned.txt"
+    out = ows.hermes_owner_write_file(path=str(target), content="data", dry_run=False)
+    parsed = json.loads(out)
+    assert parsed["success"] is True
+    assert parsed["backup"] is None
+    assert parsed["backup_warning"] is None
+    assert list(workspace_tree.glob("owned.txt.bak.*")) == []
+
+
+def test_file_backups_unrecognized_value_fails_closed(workspace_tree, clean_env, audit_override, monkeypatch):
+    monkeypatch.setenv(op.OPERATOR_ENABLED_ENV, "1")
+    monkeypatch.setenv(op.OPERATOR_LEVEL_ENV, "workspace")
+    monkeypatch.setenv(op.OPERATOR_APPLY_MODE_ENV, "direct")
+    monkeypatch.setenv(op.OPERATOR_ALLOWED_PATHS_ENV, str(workspace_tree))
+    # Upstream PR #85's gate (is_truthy) would treat this typo as "off";
+    # the fork variant keeps backups on and warns.
+    monkeypatch.setenv(ows.OPERATOR_FILE_BACKUPS_ENV, "fals")
+    target = workspace_tree / "README.md"
+    out = ows.hermes_workspace_patch(
+        path=str(target), old_string="# Project", new_string="# New Project",
+        dry_run=False,
+    )
+    parsed = json.loads(out)
+    assert parsed["success"] is True
+    assert parsed["backup"] is not None
+    assert "fail-closed" in parsed["backup_warning"]
+    assert ows.OPERATOR_FILE_BACKUPS_ENV in parsed["backup_warning"]
+    assert len(list(workspace_tree.glob("README.md.bak.*"))) == 1
+
+
+def test_file_backups_forced_on_emits_no_warning(workspace_tree, clean_env, audit_override, monkeypatch):
+    monkeypatch.setenv(op.OPERATOR_ENABLED_ENV, "1")
+    monkeypatch.setenv(op.OPERATOR_LEVEL_ENV, "workspace")
+    monkeypatch.setenv(op.OPERATOR_APPLY_MODE_ENV, "direct")
+    monkeypatch.setenv(op.OPERATOR_ALLOWED_PATHS_ENV, str(workspace_tree))
+    monkeypatch.setenv(ows.OPERATOR_FILE_BACKUPS_ENV, "1")
+    target = workspace_tree / "README.md"
+    out = ows.hermes_workspace_patch(
+        path=str(target), old_string="# Project", new_string="# New Project",
+        dry_run=False,
+    )
+    parsed = json.loads(out)
+    assert parsed["success"] is True
+    assert parsed["backup"] is not None
+    assert parsed["backup_warning"] is None
+
+
+def test_file_backups_empty_string_disables(workspace_tree, clean_env, audit_override, monkeypatch):
+    monkeypatch.setenv(op.OPERATOR_ENABLED_ENV, "1")
+    monkeypatch.setenv(op.OPERATOR_LEVEL_ENV, "workspace")
+    monkeypatch.setenv(op.OPERATOR_APPLY_MODE_ENV, "direct")
+    monkeypatch.setenv(op.OPERATOR_ALLOWED_PATHS_ENV, str(workspace_tree))
+    monkeypatch.setenv(ows.OPERATOR_FILE_BACKUPS_ENV, "")
+    target = workspace_tree / "README.md"
+    out = ows.hermes_workspace_patch(
+        path=str(target), old_string="# Project", new_string="# New Project",
+        dry_run=False,
+    )
+    parsed = json.loads(out)
+    assert parsed["success"] is True
+    assert parsed["backup"] is None
+
+
+def test_owner_patch_file_backups_disable_is_case_insensitive(workspace_tree, clean_env, audit_override, monkeypatch):
+    _enable_owner(monkeypatch)
+    monkeypatch.setenv(ows.OPERATOR_FILE_BACKUPS_ENV, "DISABLED")
+    target = workspace_tree / "owned.txt"
+    target.write_text("old", encoding="utf-8")
+    out = ows.hermes_owner_patch(
+        path=str(target), old_string="old", new_string="new", dry_run=False,
+    )
+    parsed = json.loads(out)
+    assert parsed["success"] is True
+    assert parsed["backup"] is None
+    assert list(workspace_tree.glob("owned.txt.bak.*")) == []
+
+
+def test_owner_patch_unrecognized_value_fails_closed(workspace_tree, clean_env, audit_override, monkeypatch):
+    _enable_owner(monkeypatch)
+    monkeypatch.setenv(ows.OPERATOR_FILE_BACKUPS_ENV, "ye")
+    target = workspace_tree / "owned.txt"
+    target.write_text("old", encoding="utf-8")
+    out = ows.hermes_owner_patch(
+        path=str(target), old_string="old", new_string="new", dry_run=False,
+    )
+    parsed = json.loads(out)
+    assert parsed["success"] is True
+    assert parsed["backup"] is not None
+    assert "fail-closed" in parsed["backup_warning"]
