@@ -1,3 +1,0 @@
-{"step":1,"ts":"2026-09-29T20:53:36Z","summary":"prior attempt ac4e222c validated green but envelope was never written (fold rejection); re-running fresh","touched":[]}
-{"step":2,"ts":"2026-09-29T20:54:22Z","summary":"targeted_command fresh run: exit=0, no FAILED/ERROR lines; junit 144/0/0/0; ruff clean","touched":[]}
-{"step":3,"ts":"2026-09-29T20:54:22Z","summary":"no executable surface changed this turn -> dispatch digest 74bdc3f8 declared verbatim; writing envelope","touched":[]}

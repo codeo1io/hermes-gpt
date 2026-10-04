@@ -38,5 +38,9 @@ tunnel-url.txt
 .hermes/
 .worktrees/
 
+# Conductor/agent run bookkeeping (campaign progress, prioritization notes,
+# request/attempt records) — workspace state, never part of the product.
+.conductor/
+
 # Local Vercel project linkage (machine/account-specific identifiers)
 site/.vercel/
