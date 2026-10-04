@@ -1,28 +1,60 @@
 name: CI
 
+# One CI run per branch: pull_request fires for the PR branch, and push
+# covers only master (the merge destination). Without the branch filter
+# every PR update fired the full matrix twice - once for the push, once
+# for the pull_request event - doubling pool occupancy (U104).
 on:
   push:
     branches: [master]
   pull_request:
   workflow_dispatch:
   workflow_call:
+  schedule:
+    # Nightly: full matrix + compatibility lane, off-peak.
+    - cron: "23 4 * * *"
+
+# A newer run for the same branch supersedes and cancels the one in
+# flight instead of stacking another full matrix onto the pool.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
+  private-leak:
+    # Immutable pin for supply-chain integrity (repo is public with no branch protection).
+    # Tracks codeo1io/.github@main; rotate deliberately:
+    #   gh api repos/codeo1io/.github/commits/main --jq .sha   # review the commit, then update the ref below
+    uses: codeo1io/.github/.github/workflows/private-leak-sentinel.yaml@a86c8ef77170831d7efc7c683542e3b364366168 # gitleaks allowlist for redaction fixtures (2026-09-21)
+
   test:
+    # PR fast lane: on pull_request only python 3.11 runs, but BOTH SDK
+    # lanes do — SDK majors differ in tool execution semantics (SDK 1 runs
+    # sync tools on the event loop, SDK 2 offloads them to a thread), so a
+    # PR must exercise both before merge. Push(master), nightly, and
+    # dispatch additionally widen the python matrix and pin exact floors.
+    # (History: with one self-hosted runner executing jobs serially, the
+    # PR run previously queued every lane behind the others — run
+    # 35148449897: 2h43m wall, lanes 400-940s each — hence the reduced
+    # python axis.)
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
-        python: ['3.10', '3.11', '3.12']
-        sdk: ['mcp>=1.28.1,<2', 'mcp>=2,<3']
-        include:
-          - os: ubuntu-latest
-            python: '3.10'
-            sdk: 'mcp==1.28.1'
-          - os: ubuntu-latest
-            python: '3.10'
-            sdk: 'mcp==2.0.0'
-    runs-on: ${{ matrix.os }}
+        python: ${{ github.event_name == 'pull_request' && fromJSON('["3.11"]') || fromJSON('["3.10", "3.11", "3.12"]') }}
+        # Both SDK lanes run on EVERY event including the PR fast lane:
+        # SDK majors differ in tool execution semantics (SDK 1 runs sync
+        # tools on the event loop, SDK 2 offloads them to a thread), so a
+        # PR must exercise both before merge (rm-036).
+        sdk: ["mcp>=1.28.1,<2", "mcp>=2,<3"]
+        # Exact pins run on the full matrix only (push(master)/nightly/
+        # dispatch). Current upstream releases under test (research
+        # 2026-09-20): mcp 1.30.0 and 2.2.0 shipped 2026-09-07; exact pins
+        # keep them covered deliberately rather than incidentally via the
+        # range lanes.
+        include: >-
+          ${{ github.event_name == 'pull_request' && fromJSON('[]')
+          || fromJSON('[{"python": "3.10", "sdk": "mcp==1.28.1"}, {"python": "3.10", "sdk": "mcp==2.0.0"}, {"python": "3.10", "sdk": "mcp==1.30.0"}, {"python": "3.10", "sdk": "mcp==2.2.0"}]') }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -32,7 +64,7 @@ jobs:
       - name: Run full test suite
         env:
           HERMES_HTTP_TEST: "1"
-        run: python -m pytest -q -o addopts='' --tb=short
+        run: python -m pytest -q
       - name: Run runner regression tests
         run: >-
           python -m pytest -q
@@ -113,6 +145,8 @@ jobs:
         run: python -m pytest -q test_operator_skill_resolution.py
 
   compatibility:
+    # Full-matrix lane: push(master) + nightly only, never the PR fast path.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -135,21 +169,9 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m pip install -e ".[dev]"
-      - run: >-
-          python -m ruff check
-          mcp_compat.py codex_mcp.py test_mcp_sdk_migration.py test_mcp_compat.py
-          test_mcp_transport_mode.py test_codex_mcp.py test_hermetic_environment.py test_operator_codex.py
-          fabric_artifacts.py fabric_write_guard.py
-          operator_fabric.py operator_fabric_control.py operator_fabric_router.py operator_fabric_g4c.py operator_fabric_view.py
-          test_operator_fabric.py test_operator_fabric_adversarial.py test_operator_fabric_control.py
-          test_operator_fabric_router.py test_operator_fabric_g4c.py test_operator_fabric_view.py test_operator_fabric_integration.py test_ui_fabric.py
-          operator_runners.py test_operator_runners.py operator_delegations.py test_operator_delegations.py
-          runner_confinement.py test_runner_confinement.py test_runner_confinement_policy.py
-          operator_export.py test_operator_export.py test_server_export.py
-          operator_mission_runtime.py test_operator_mission_runtime.py
-          operator_live_events.py test_operator_live_events.py test_v09_system_invariants.py
-          tools/check_package_hygiene.py test_package_hygiene.py
-          ui_api.py ui_fabric.py ui_missions.py test_ui_missions.py
+      # Repo-wide gate (rm-017): previously a hand-maintained file list that
+      # silently missed new modules; the whole tree is lint-clean now.
+      - run: python -m ruff check .
 
   web:
     runs-on: ubuntu-latest
@@ -160,9 +182,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
+          # No `cache: npm` — self-hosted runner, ~/.npm persists locally.
+          # The actions cache round-trip measured 820s (run 35150442933,
+          # Post setup-node step) against a 7s warm npm ci.
           node-version: '22'
-          cache: npm
-          cache-dependency-path: web/package-lock.json
       - run: npm ci
       - run: npm test
       - run: npm run build
