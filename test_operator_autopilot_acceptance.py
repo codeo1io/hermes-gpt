@@ -36,13 +36,13 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = pytest.mark.skipif(not Path("/proc/self/environ").exists(), reason="Linux /proc authority proof; portable Autopilot unit tests run on every OS")
-
 import operator_autopilot as autopilot
 import operator_job_supervisor as jobs
 import operator_mission_runtime as mission
 import operator_policy as op
 from test_operator_autopilot_advance import _observe
+
+pytestmark = pytest.mark.skipif(not Path("/proc/self/environ").exists(), reason="Linux /proc authority proof; portable Autopilot unit tests run on every OS")
 
 REPO = str(Path(__file__).resolve().parent)
 MID = "msn-acceptance"

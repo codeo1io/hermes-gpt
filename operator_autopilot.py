@@ -966,11 +966,11 @@ def _build_contract(
         "allowed_scope": {"workspaces": [str(_data_root(hermes_root) / "missions" / "artifacts" / _task_id(mission_id, node_id, key))], "profiles": [profile]},
         "forbidden_actions": [],
         "expected_artifacts": [{"path": name, "must_exist": True, "min_bytes": 1, **requirements.get(name, {})}
-                               for name in artifacts],        "tests": [],
+                               for name in artifacts],
+        "tests": [],
         "review_requirements": {},
         "completion_criteria": {
             "run_state": {"terminal": True, "outcome_ok": ["completed", "done"]},
-            "artifacts_present": bool(artifacts),
             "artifacts_present": bool(node.get("expected_artifacts")),
             "tests_pass": False,
             "review_satisfied": False,
