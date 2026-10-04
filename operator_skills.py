@@ -25,6 +25,7 @@ Safety rules:
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import importlib
@@ -34,6 +35,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import operator_policy as op
+from operator_profile_scope import profile_override_gate
 
 _skill_manager_module: Any | None = None
 
@@ -212,36 +214,46 @@ def _call_skill_manager(
     kwargs = {k: v for k, v in payload.items() if v is not None}
     kwargs.update({"action": action, "name": name})
 
-    token = None
-    reset_home = None
-    if profile_home is not None:
-        try:
-            from hermes_constants import (
-                reset_hermes_home_override,
-                set_hermes_home_override,
-            )
+    # rm-207: the Agent override is process-global, so the whole
+    # set -> mutate -> reset window runs under the shared profile gate.
+    # Same-profile callers still overlap; different-profile callers wait.
+    # The import/degradation logic below is unchanged and stays inside the
+    # window so a failed scoping attempt never holds the gate open long.
+    with (
+        profile_override_gate(profile_home)
+        if profile_home is not None
+        else contextlib.nullcontext()
+    ):
+        token = None
+        reset_home = None
+        if profile_home is not None:
+            try:
+                from hermes_constants import (
+                    reset_hermes_home_override,
+                    set_hermes_home_override,
+                )
 
-            token = set_hermes_home_override(profile_home)
-            reset_home = reset_hermes_home_override
-        except Exception as exc:
-            # Optional-import degradation (CI and other hosts without the
-            # Hermes Agent source tree on sys.path). Scoping is a no-op for
-            # the default profile (default home == hermes_root), so we may
-            # safely proceed without it there. For a non-default profile we
-            # cannot guarantee the write targets the requested profile home,
-            # so we fail closed instead of writing to the wrong profile.
-            if hermes_root is not None and profile_home == Path(hermes_root).resolve():
-                pass  # default profile: scoping unnecessary
-            else:
-                return {
-                    "success": False,
-                    "error": f"Could not scope skill mutation to {profile_home}: {exc}",
-                }
-    try:
-        result = manager.skill_manage(**kwargs)  # type: ignore[union-attr]
-    finally:
-        if token is not None and reset_home is not None:
-            reset_home(token)
+                token = set_hermes_home_override(profile_home)
+                reset_home = reset_hermes_home_override
+            except Exception as exc:
+                # Optional-import degradation (CI and other hosts without the
+                # Hermes Agent source tree on sys.path). Scoping is a no-op for
+                # the default profile (default home == hermes_root), so we may
+                # safely proceed without it there. For a non-default profile we
+                # cannot guarantee the write targets the requested profile home,
+                # so we fail closed instead of writing to the wrong profile.
+                if hermes_root is not None and profile_home == Path(hermes_root).resolve():
+                    pass  # default profile: scoping unnecessary
+                else:
+                    return {
+                        "success": False,
+                        "error": f"Could not scope skill mutation to {profile_home}: {exc}",
+                    }
+        try:
+            result = manager.skill_manage(**kwargs)  # type: ignore[union-attr]
+        finally:
+            if token is not None and reset_home is not None:
+                reset_home(token)
 
     if isinstance(result, dict):
         return result

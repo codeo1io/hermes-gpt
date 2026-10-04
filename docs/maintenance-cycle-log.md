@@ -661,3 +661,233 @@ the landing gate.
   test_suite_determinism.py; docs/solutions/ untouched). CHANGELOG
   "Unreleased" + `docs/operator-mode.md` + README ride the batch; supersede
   the validation envelope only if a later phase edits executable surfaces.
+
+## Cycle 13 — 2026-10-05 — "Concurrency isolation for Operator profile scoping"
+
+Run `9037c3156272472abdb533396c66a368` (repository-maintenance
+`ebb00eda4cbb43c9b2877a78f678d852`, cycle 3, campaign
+`hermes-gpt-fix-ci-fast-lane-59762166ca1fd70a`) against worktree
+run-9037c3156272-9037c315 (branch `conductor/run-9037c3156272`): assessed at
+`30de0067f9` (clean tree; then-`origin/master` `e490130737` carried #26/#27/#28
+unlanded), implemented at `c43d085121` (fast-forwarded past the mandated
+`e490130737` to `origin/master`; the run's ROADMAP mint survived the ff via
+stash/ff-only/pop, content-identical, insert-only +14/0- against the new HEAD).
+Phases: assess → research → roadmap → prioritize → stewardship → implement →
+targeted tests → full tests → compound. All outcomes below are pre-review: the
+batch is implemented and locally verified but uncommitted, awaiting review and
+the fold/commit gates. Two earlier same-phase attempts died transport-dead
+(roadmap `40e74fd4`; stewardship `bc0f426e` at +1.7 s) leaving nothing durable
+— both phases were redone from scratch after envelope forensics. Numbering
+note: this tree's committed log frontier was Cycle 8; unintegrated sibling run
+branches hold Cycle 9 (d92e1ad3 "Swarm state co-ownership"), 10 (e1e8d7ec
+"Supply-chain & perimeter truth"), 11 (dfaf334f "Canonical ledger truth
+repair"), 12 (73696bb0 "Repo & release truth closure"). This entry mints Cycle
+13 past the observed max (cycle-6 rule 7 discipline); renumber/fold at the
+landing gate.
+
+### What the cycle did
+
+- **Batch lead — rm-207 "Operator profile isolation" (fleet id minted this
+  cycle, priority 65; assess ff09ba0a finding F03 P2, probe
+  `PROFILE_BLEED: True` at base).** New shared-gate module
+  `operator_profile_scope.py` (134 lines): a profile-keyed Condition gate where
+  same-home holders overlap, different-home holders are mutually exclusive, and
+  same-thread conflicting nesting raises `ProfileScopeConflict` instead of
+  deadlocking; no logging, no registry, no audit-material capture (raw-prompt
+  and audit invariants preserved). `operator_skill_resolution._profile_scope`
+  (:193-204) now delegates through `profile_override_scope` (degradation
+  contract unchanged), and `operator_skills._call_skill_manager` (:218-240)
+  wraps its whole set→mutate→reset window in `profile_override_gate` (the
+  fail-closed non-default degradation is preserved and covered by a test).
+  `pyproject.toml` ships the new module via py-modules (wheel-built and
+  verified SHIPPED). Regression suite `test_operator_profile_isolation.py`
+  (11 tests, 475 lines): sampling interleave through both repo paths,
+  structural-barrier exclusion, same-profile overlap preserved, nested-conflict
+  raise, subprocess env captured at spawn is profile-pure, parent `os.environ`
+  never mutated, no profile material in logs. RED PROOF: with the gate
+  neutralized (`/tmp/69034104-implement/redproof_plugin.py`) the four bleed
+  detectors FAIL with cross-profile homes observed and PASS with the gate.
+  SITE CORRECTION recorded in the ledger entry: rm-207's acceptance cited
+  `operator_fabric.py` sites that have ZERO mechanism hits at both bases — the
+  real in-parent sites were exactly the two gated above (see prevention rule 1).
+- **Batch partner rm-086 tier-2 (secret-path writes 0600-from-first-byte, F21)
+  — DROPPED, not implemented.** The mandated dispatch-time dirty-file scan
+  caught sibling run-a0f8eb89b525 holding an uncommitted
+  `token_store.py` (+75/−30) implementing exactly that acceptance; escalated
+  to the coordinator per the prioritization batch terms and ratified as a
+  land-once duplicate. The sibling batch is now committed at `65fb97510f` on
+  branch `conductor/run-a0f8eb89b525` (pushed to origin/fork/codeo1io, NOT yet
+  in `origin/master`).
+- **Deferred by batch terms:** the `hermes_state.py:79` module-singleton prong
+  (invalidate/rebuild handles on override enter-exit) belongs to the
+  rm-105/106 lane (sibling 2f81870e's files); the new module deliberately does
+  not touch it.
+- **Substrate consumed, not re-derived:** assess ff09ba0a's 28 findings (1 P1
+  F01 real-stack CSRF/Host/Origin proof via `server.build_server()` +
+  `build_asgi_app()`; 12 P2; 15 P3; 6 new this attempt; suite re-proven green
+  at base, sdist rc=0 with 0 web/assets entries) and research e63859b8's 5
+  candidates + 2 confirmations + 5 negative results were ALL folded to
+  existing fleet ids by the roadmap phase — this cycle minted exactly one id
+  (rm-207). Full fold map: run-worktree `ROADMAP.md` cycle-3 additions block.
+
+### Validation record (current at compound)
+
+- Targeted (work-order command verbatim from repo root):
+  `run_repo_impacted_tests.py` classified `pyproject.toml` (a FULL_IMPACT_FILES
+  entry) among the 19 changed surfaces and self-escalated to the authoritative
+  full gate — envelope `result-1988489-359778946.json` (returncode 0, workers
+  1, 355.3 s); progress-char recount over all 26 percent lines: 1821 passed +
+  5 skipped = 1826 outcomes, 0 failed / 0 errored. Focused 21-file lane: 313
+  passed + 1 skipped (`test_operator_workspace.py:221`, Windows-only) in
+  98.56 s; the implement-phase environmental failure
+  `test_operator_skill_resolution.py::test_disabled_skill_rejected` PASSED
+  under the gate interpreter (see rule 5).
+- Full (authoritative command verbatim, gate wrapper,
+  GATE_EXIT=0 via PIPESTATUS): envelope
+  `result-2896695-361289245.json` — outcome completed, returncode 0, workers
+  1, 395.6 s, starvation_escape false; identical dot-grid 1821 passed + 5
+  skipped = 1826, 0 failed / 0 errored, tree unchanged across the phase. The
+  targeted-fallback and full runs produced the IDENTICAL outcome set ~6.5 h
+  apart on the same tree — consumed here as a zero-cost determinism proof
+  (rule 4).
+- Static: ruff (pinned 0.15.22) clean over all 19 changed surfaces, rc=0.
+- Digests (recomputation-verified via `hermes_conductor.validation_policy`
+  from release `be15abcc2e…`): envelope digest
+  `validation:v1:4fda5348…bbe5` == recompute(base=None); dispatch digest
+  `validation:v1:ab9136…4bf1` == recompute(base=run-original
+  `30de0067f9…`) — NOT base=current HEAD `c43d085121` (rule 3). Recomputed
+  again BEFORE and AFTER this compound phase's edits (ROADMAP.md status flip +
+  this log entry): both equalities still hold — the validation digest excludes
+  the ledger/docs surfaces this phase touched, so the two envelopes above
+  remain current at compound time. Nothing executable has changed since the
+  full gate; supersede the envelopes only if a later phase edits executable
+  surfaces.
+- Zero fixes were needed in targeted/full: the implemented tree is exactly
+  what was validated.
+
+### Prevention rules established
+
+1. **Grep the mechanism, not the finding's file list, before implementing.**
+   rm-207's acceptance cited seven `operator_fabric.py` sites with ZERO
+   `set_hermes_home_override`/`HERMES_PROFILE` occurrences at either base —
+   the assess finding's site inventory was stale against the tree, and the
+   real mutation sites were `operator_skill_resolution._profile_scope` and
+   `operator_skills._call_skill_manager`. Before implementing any
+   site-enumerating acceptance, re-derive the site list with a repo-wide grep
+   of the mechanism name and record the correction in the ledger entry (as
+   done here), so the next reader does not re-chase ghost sites.
+2. **The collision scan belongs at dispatch time, not only at prioritization
+   time.** The prioritize-phase sweep (~15:05Z 10-03) verified `token_store.py`
+   dirty-NOWHERE; by implement dispatch (~02:49Z 10-04) the sibling's
+   uncommitted batch sat on exactly that file. A clean prioritization scan
+   proves nothing hours later under a concurrently-minting fleet: re-run the
+   dirty-file sweep at dispatch, and when a collision appears, escalate and
+   drop the duplicate (land-once) rather than merge two implementations of one
+   acceptance.
+3. **The validation digest's base is the run's original dispatch base, and it
+   survives in-run rebases.** After this run ff'd `30de0067f9` → `c43d085121`,
+   recomputing `validation_digest(HEAD)` did NOT reproduce the dispatch digest
+   — only `validation_digest(<run-original base>)` did, while the gate
+   envelope's own digest equals `recompute(base=None)` (its `digest_base:
+   "unknown"` is the standalone-gate write, not tree drift; cycle-5 note,
+   sharpened). Pass the base explicitly and take it from the work order, not
+   from the current HEAD.
+4. **A batch that touches `pyproject.toml` buys a free determinism proof.**
+   The targeted runner's FULL_IMPACT_FILES escalation makes the targeted phase
+   run the full suite, so targeted and full validate the same tree twice. When
+   the two outcome sets are identical (here 1821P+5S twice, hours apart),
+   record the equality as the determinism evidence instead of re-running for
+   speed or doubt — a slow-but-green gate twice is a feature (extends cycle-4's
+   toolchain note into a rule).
+5. **Environmental failure triage: stash-reproduce first, then probe the
+   interpreter.** `test_disabled_skill_rejected` failed in the repo `.venv`
+   during implement; reproducing it identically at HEAD with the batch stashed
+   proved it pre-existing, and it passed under the gate interpreter
+   (`/home/agent/.local/bin/python`, which has httpx+httpx2 — the repo `.venv`
+   has only httpx2, and the real-agent loader path needs httpx). Attribute an
+   environmental failure only after both steps; record which interpreter
+   makes it pass.
+6. **Insert-only ledger mints survive a mandated ff via stash → ff-only →
+   pop.** The run's uncommitted ROADMAP mint rode through the
+   `30de0067f9` → `c43d085121` ff content-identical; the proof obligation is
+   numstat against the NEW head (insert-only preserved, +14/0-; later compound
+   edits kept it +16/0-). Do not hand-rebase a ledger patch when stash/ff/pop
+   can carry it.
+
+### Local toolchain notes (small, reusable)
+
+- Gate envelopes live under `~/.hermes/local-validation-gate/results/`; the
+  digest recomputation pattern is `sys.path.insert(release/src)` →
+  `hermes_conductor.validation_policy.validation_digest(base, repo)` with the
+  base passed EXPLICITLY (full 40-hex sha string; `None` reproduces the
+  envelope's own digest, a short sha does neither).
+- The two-interpreter split (gate `python` at `/home/agent/.local/bin/python`
+  vs repo `.venv/bin/python`) changes httpx/httpx2 availability and therefore
+  which tests skip vs run — name the interpreter whenever a skip count is
+  cited (extends cycle-6 rule 4 with the httpx/httpx2 instance).
+- Under fleet load the gate admitted workers=1 both times (load1≈18.8 at
+  targeted); 355–396 s full suites are normal in that lane.
+- Compound ran under an explicit no-test constraint: every validation fact
+  above was consumed from the recorded phase envelopes, never re-executed.
+
+### Context left for the next cycle
+
+- **rm-207 awaits review + fold/commit** (this phase's prohibited set):
+  uncommitted delta at compound = 4 M + 2 ?? — `ROADMAP.md` +16/0-,
+  `operator_skill_resolution.py` +10/−9, `operator_skills.py` +41/−29,
+  `pyproject.toml` +1/0, new `operator_profile_scope.py` (134 lines) and
+  `test_operator_profile_isolation.py` (475 lines), plus compound's own
+  `docs/maintenance-cycle-log.md` (this entry).
+- **rm-086 tier-2 / rm-187 verification duty:** the land-once duplicate is
+  committed at `65fb97510f` (`conductor/run-a0f8eb89b525`, pushed, not yet in
+  `origin/master`). At integration, verify the 0600-from-first-byte acceptance
+  against that batch and flip rm-086's tier-2 remainder satisfied — do not
+  re-implement.
+- **Fleet frontier (re-census before minting, live):** ids moved rm-207 → rm-216 at
+  this compound's first sweep and → rm-227 MINUTES LATER at the final sweep —
+  the frontier moved intra-phase while this entry was being written (observed
+  holders: run-40adb5bd1fe8 uncommitted rm-214 ISO-vs-REAL windowing, rm-215
+  upstream v0.13/v0.14 adoption gap, rm-216 ui_chat `last_active` key; plus
+  rm-217..rm-227 appearing in sibling worktrees between sweeps). NEXT FREE =
+  rm-228 as of the final sweep; the run ledger's 2026-10-03 "next free rm-208"
+  note is superseded (a COMPOUND REFRESH annotation now says so in place).
+  Live incident for cycle-6 rule 7: a census older than minutes is already
+  stale — sweep, write, and re-verify the max immediately before the mint.
+- **Cycle-log numbering:** unintegrated siblings hold Cycles 9–12; the next
+  compound phase continues past 13 or folds at the landing gate.
+- **Open pool from this cycle's prioritization (20-item table,
+  `/tmp/c68637fc-scratch/prioritized-batch.md`, none selected besides the
+  batch):** headline **rm-170** (P1, assess F01 — the landed rm-134
+  allowed_hosts/allowed_origins guard is PROVEN-INSUFFICIENT: it wraps the
+  inner mount only, the outer `/ui` mount stays unguarded; the extension needs
+  a real-stack ASGI-layer regression, not a standalone mount), then rm-193
+  (sys.path pollution + agent `hermes_state` shadowing), rm-174 (redaction
+  fail-closed + TitleCase over-redaction), rm-171 (cron jobs.json locking +
+  next_run_at), rm-172 (+rm-200 turn-lease atomicity), rm-183 (fleet POST
+  unbounded read), rm-136 (+F28 schema/single-writer), rm-144 (finance
+  request_id confinement), rm-175 (ROADMAP evidence-stub debt), rm-077
+  (packaging asymmetry).
+- **Watch items carried from research folds:** upstream PR #85 backup
+  configurability adopt-vs-defer now has a reviewable patch (rm-147; cycle 8
+  hardened the same shape as rm-192 — reconcile the two at review), MCP SDK
+  2.3.0 lane (rm-048), OSV floor refresh starlette/cryptography/anyio
+  (rm-173), py3.10 EOL floor decision (rm-169), `hermes_state.py:79` prong
+  (rm-105/106).
+- **Research negatives (scope discipline, re-verify before relying):** fork
+  has 0 commits beyond `origin/master` except PR #85; codeo1io/hermes-gpt open
+  issues = 0; uvicorn/pyyaml/croniter/packaging/mcp advisory-clean; no
+  x-mcp-header/WithJsonSchema usage in-tree (SDK 2.3.0 registration
+  strictness cannot break tool registration).
+
+### Landing-gate duties
+
+- Fold this run's +16/0- ROADMAP insert with the sibling ledger patches in
+  mint order; flip rm-207 to landed once review passes; cite rm-196/rm-197 by
+  TITLE (double-minted ids).
+- Reconcile the cycle-log numbering (this Cycle 13 vs unintegrated sibling
+  Cycles 9–12) and the frontier correction (rm-228 next free as of compound's
+  final sweep; rm-217–rm-227 minted by siblings intra-phase).
+- Supersede `result-1988489-359778946.json` / `result-2896695-361289245.json`
+  only if a later phase edits executable surfaces (cycle-8 rule 6); the
+  compound delta is ledger/docs-only and digest-excluded (verified by
+  recomputation before and after).
