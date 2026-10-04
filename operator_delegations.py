@@ -33,6 +33,12 @@ STATES = frozenset({"reserved", "queued", "running", "reconciling", "succeeded",
 DISPATCH_PHASES = frozenset({"reserved", "invoking", "dispatched", "cancelled"})
 TERMINAL_STATES = frozenset({"succeeded", "failed", "cancelled"})
 MAX_LIST = 200
+VALIDATION_GRACE_SECONDS = 30
+_CHECK_KINDS = frozenset({"run_state", "artifacts", "tests", "review", "forbidden", "authorization"})
+_CHECK_STATUSES = frozenset({"PASS", "FAIL", "UNVERIFIED"})
+_ARTIFACT_FAILURE_CODES = frozenset({"artifact_missing", "artifact_too_small", "artifact_too_large",
+                                   "artifact_hash_mismatch", "artifact_remote_mismatch", "artifact_not_file",
+                                   "artifact_unreadable"})
 
 
 def _now() -> str:
@@ -138,6 +144,10 @@ def _init(db: sqlite3.Connection) -> None:
         db.execute("ALTER TABLE delegations ADD COLUMN cancellation_observation_sha256 TEXT NOT NULL DEFAULT ''")
     if "cancellation_watermark_ready" not in columns:
         db.execute("ALTER TABLE delegations ADD COLUMN cancellation_watermark_ready INTEGER NOT NULL DEFAULT 0")
+    if "validation_summary_json" not in columns:
+        db.execute("ALTER TABLE delegations ADD COLUMN validation_summary_json TEXT NOT NULL DEFAULT '{}'")
+    if "validation_failure_since" not in columns:
+        db.execute("ALTER TABLE delegations ADD COLUMN validation_failure_since TEXT NOT NULL DEFAULT ''")
     db.commit()
 
 
@@ -186,6 +196,35 @@ def _backend_ref(payload: dict[str, Any]) -> dict[str, str]:
     return out
 
 
+def validation_summary(value: Any) -> dict[str, Any]:
+    """Persist/project enums only; never validation details, file bodies or paths."""
+    if not isinstance(value, dict):
+        return {}
+    verdict = value.get("verdict")
+    if not isinstance(verdict, str) or verdict not in {"SATISFIED", "NOT_SATISFIED", "INCONCLUSIVE", "INVALID_CONTRACT"}:
+        return {}
+    raw_checks = value.get("checks")
+    if not isinstance(raw_checks, list):
+        return {"verdict": verdict, "checks": []}
+    checks = []
+    for check in raw_checks[:6]:
+        if not isinstance(check, dict):
+            continue
+        kind, status = check.get("kind"), check.get("status")
+        if not isinstance(kind, str) or kind not in _CHECK_KINDS or not isinstance(status, str) or status not in _CHECK_STATUSES:
+            continue
+        item = {"kind": kind, "status": status}
+        codes = check.get("failure_codes")
+        if kind == "artifacts":
+            item["failure_codes"] = sorted({code for code in codes[:16]
+                if isinstance(code, str) and code in _ARTIFACT_FAILURE_CODES}) if isinstance(codes, list) else []
+        checks.append(item)
+    return {
+        "verdict": verdict,
+        "checks": checks,
+    }
+
+
 def _surface(row: sqlite3.Row | dict[str, Any], *, events: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     value = dict(row)
     try:
@@ -193,6 +232,10 @@ def _surface(row: sqlite3.Row | dict[str, Any], *, events: list[dict[str, Any]] 
     except ValueError:
         backend_ref = {}
     value["backend_ref"] = backend_ref if isinstance(backend_ref, dict) else {}
+    try:
+        value["validation"] = validation_summary(json.loads(value.pop("validation_summary_json", "{}") or "{}"))
+    except (ValueError, TypeError):
+        value["validation"] = {}
     value["cancel_requested"] = bool(value.get("cancel_requested"))
     value["cancellation_in_progress"] = bool(value.get("cancellation_in_progress"))
     value["cancellation_watermark_ready"] = bool(value.get("cancellation_watermark_ready"))
@@ -1051,6 +1094,8 @@ def hermes_delegation_reconcile(
         path = _db_path(hermes_root)
         with _connect(path, write=False) as db:
             stored = dict(_get_row(db, delegation_id))
+        stored.setdefault("validation_summary_json", "{}")
+        stored.setdefault("validation_failure_since", "")
 
         if contract_json:
             _canonical, contract, sha = contract_mod._parse_contract(contract_json)
@@ -1084,10 +1129,12 @@ def hermes_delegation_reconcile(
             if observed.get("error"):
                 observed_desired = "failed"
 
-        if legacy_lineage:
-            verdict = ""
-        else:
-            verdict = _validation_verdict_cached(manifest, observed, root)
+        validation = contract_mod._validate_manifest_impl(manifest, None, root)
+        # Fork hardening (PR #56 lineage): cacheable manifests reuse the verdict cache.
+        verdict = _validation_verdict_cached(manifest, observed, root)
+        validation["verdict"] = verdict
+        safe_validation = validation_summary(validation)
+        summary_json = json.dumps(safe_validation, sort_keys=True, separators=(",", ":"))
 
         # Product invariant: a confirmed cancellation is monotonic against all
         # later backend observations — including later verified success. A
@@ -1129,6 +1176,33 @@ def hermes_delegation_reconcile(
             outcome = ""
         elif observed is None or (observed_desired == "succeeded" and verdict != "SATISFIED"):
             desired = "reconciling"
+        # A successful backend with positively observed bad artifacts is a work
+        # defect, not an ambiguous submission. Allow a durable 30s delivery grace,
+        # then let the existing bounded semantic recovery handle the failure.
+        # Missing/unreadable run, denied authority, and pending reviews never
+        # enter this path, even when their overall verdict is NOT_SATISFIED.
+        checks = {c["kind"]: c["status"] for c in safe_validation.get("checks", [])}
+        required = {"run_state", "authorization"}
+        if manifest_contract["completion_criteria"]["tests_pass"]:
+            required.add("tests")
+        if manifest_contract["completion_criteria"]["no_forbidden_actions"]:
+            required.add("forbidden")
+        if manifest_contract["review_requirements"]["required"]:
+            required.add("review")
+        defect = (observed_desired == "succeeded" and verdict == "NOT_SATISFIED"
+                  and manifest_contract["completion_criteria"]["artifacts_present"]
+                  and checks.get("artifacts") == "FAIL"
+                  and all(checks.get(kind) == "PASS" for kind in required)
+                  and not cancellation_pending and not authoritative_cancel)
+        failure_since = ""
+        if defect:
+            failure_since = str(stored.get("validation_failure_since") or _now())
+            try:
+                age = (datetime.now(timezone.utc) - datetime.fromisoformat(failure_since)).total_seconds()
+            except (ValueError, TypeError):
+                failure_since, age = _now(), 0
+            if age >= VALIDATION_GRACE_SECONDS:
+                desired, outcome = "failed", "validation_failed"
         verified_success = desired == "succeeded" and verdict == "SATISFIED"
 
         changed = (
@@ -1139,6 +1213,8 @@ def hermes_delegation_reconcile(
             or resolved_cancel_requested != bool(stored.get("cancel_requested"))
             or resolved_cancellation_in_progress != bool(stored.get("cancellation_in_progress"))
             or dispatch_phase != stored.get("dispatch_phase")
+            or summary_json != stored.get("validation_summary_json", "{}")
+            or failure_since != stored.get("validation_failure_since", "")
         )
         changed = changed or stale_invocation
         preview = dict(stored)
@@ -1150,6 +1226,8 @@ def hermes_delegation_reconcile(
             "cancel_requested": resolved_cancel_requested,
             "cancellation_in_progress": resolved_cancellation_in_progress,
             "dispatch_phase": dispatch_phase,
+            "validation_summary_json": summary_json,
+            "validation_failure_since": failure_since,
         })
         if stale_invocation:
             preview["dispatch_phase"] = "reserved"
@@ -1178,6 +1256,7 @@ def hermes_delegation_reconcile(
                 "schema", "mission_id", "task_id", "contract_sha256", "backend",
                 "state", "cancel_requested", "cancellation_in_progress", "authority_version",
                 "dispatch_phase", "terminal_at", "updated_at",
+                "validation_summary_json", "validation_failure_since",
             )
             stale = any(current.get(key) != stored.get(key) for key in authority_fields)
             if stale:
@@ -1199,19 +1278,25 @@ def hermes_delegation_reconcile(
                     (delegation_id, manifest["schema"], manifest["context_sha256"], json.dumps(manifest, sort_keys=True, separators=(",", ":")), now, now),
                 )
             if stale_invocation and current.get("dispatch_phase") == "invoking" and current.get("state") == "reserved":
+                # Fork hardening: stale-invocation recovery persists the v0.14
+                # validation columns so the surface stays coherent.
                 db.execute(
-                    "UPDATE delegations SET state=?,backend_state=?,outcome=?,validation_verdict=?,dispatch_phase='reserved',updated_at=?,terminal_at=? WHERE delegation_id=?",
-                    (desired, _bounded(backend_state, 128), _bounded(outcome, 128), _bounded(verdict, 64), now, terminal_at, delegation_id),
+                    "UPDATE delegations SET state=?,backend_state=?,outcome=?,validation_verdict=?,"
+                    "validation_summary_json=?,validation_failure_since=?,"
+                    "authority_version=authority_version+?,dispatch_phase='reserved',updated_at=?,terminal_at=? WHERE delegation_id=?",
+                    (desired, _bounded(backend_state, 128), _bounded(outcome, 128), _bounded(verdict, 64),
+                     summary_json, failure_since, 1 if changed else 0, now, terminal_at, delegation_id),
                 )
                 _event(db, delegation_id, "delegation.invocation_recovered", from_state="reserved", to_state="reserved")
             else:
                 db.execute(
                     "UPDATE delegations SET state=?,backend_state=?,outcome=?,validation_verdict=?,"
                     "cancel_requested=?,cancellation_in_progress=?,cancellation_observation_sha256='',cancellation_watermark_ready=0,"
-                    "dispatch_phase=?,updated_at=?,terminal_at=? WHERE delegation_id=?",
+                    "dispatch_phase=?,validation_summary_json=?,validation_failure_since=?,"
+                    "authority_version=authority_version+?,updated_at=?,terminal_at=? WHERE delegation_id=?",
                     (desired, _bounded(backend_state, 128), _bounded(outcome, 128), _bounded(verdict, 64),
                      1 if resolved_cancel_requested else 0, 1 if resolved_cancellation_in_progress else 0,
-                     dispatch_phase, now, terminal_at, delegation_id),
+                     dispatch_phase, summary_json, failure_since, 1 if changed else 0, now, terminal_at, delegation_id),
                 )
             if changed:
                 _event(db, delegation_id, "delegation.reconciled", from_state=stored["state"], to_state=desired, backend_state=backend_state, observed=observed)
