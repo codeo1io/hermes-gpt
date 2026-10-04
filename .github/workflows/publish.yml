@@ -11,7 +11,7 @@ jobs:
 
   publish:
     needs: test
-    runs-on: self-hosted
+    runs-on: ubuntu-latest  # public repo: GitHub-hosted only (was self-hosted)
     permissions:
       id-token: write
     environment: pypi
