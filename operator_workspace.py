@@ -67,7 +67,54 @@ def _atomic_write_text(path: Path, content: str) -> None:
         raise
 
 
+OPERATOR_FILE_BACKUPS_ENV = "HERMES_GPT_OPERATOR_FILE_BACKUPS"
+
+_FILE_BACKUP_FORCE_ON = frozenset({"1", "true", "yes", "on", "enabled"})
+_FILE_BACKUP_DISABLE = frozenset({"0", "false", "no", "off", "disabled", ""})
+
+
+def _file_backups_enabled(raw: str | None = None) -> bool:
+    """Fail-closed parse of ``OPERATOR_FILE_BACKUPS_ENV``.
+
+    Unset keeps backups on (the historic default). The documented false
+    values — and an explicitly empty value — disable them, matching
+    upstream PR #85. Any OTHER value is unrecognized: it does NOT disable
+    backups (a typo must never silently turn a safety net off) and the
+    tool result carries ``_file_backup_warning()`` so the operator sees it.
+    """
+    if raw is None:
+        raw = os.environ.get(OPERATOR_FILE_BACKUPS_ENV)
+    if raw is None:
+        return True
+    value = raw.strip().lower()
+    if value in _FILE_BACKUP_FORCE_ON:
+        return True
+    if value in _FILE_BACKUP_DISABLE:
+        return False
+    # Unrecognized: a typo must never silently disable a safety net.
+    return True
+
+
+def _file_backup_warning(raw: str | None = None) -> str | None:
+    """Operator-visible warning for an unrecognized backup toggle value."""
+    if raw is None:
+        raw = os.environ.get(OPERATOR_FILE_BACKUPS_ENV)
+    if raw is None:
+        return None
+    value = raw.strip().lower()
+    if value in _FILE_BACKUP_FORCE_ON or value in _FILE_BACKUP_DISABLE:
+        return None
+    return (
+        f"{OPERATOR_FILE_BACKUPS_ENV}={raw!r} is not a recognized value; "
+        "file backups remain enabled (fail-closed). Use "
+        "0/false/no/off/disabled to disable, or 1/true/yes/on/enabled to "
+        "force on."
+    )
+
+
 def _backup_file(path: Path) -> Path | None:
+    if not _file_backups_enabled():
+        return None
     if not path.exists():
         return None
     ts = time.strftime("%Y%m%d-%H%M%S")
@@ -577,6 +624,7 @@ def hermes_workspace_patch(
             "path": str(p),
             "match_count": match_count,
             "backup": str(backup) if backup else None,
+            "backup_warning": _file_backup_warning(),
         }
         op.audit_record(
             tool="hermes_workspace_patch",
@@ -650,6 +698,7 @@ def hermes_workspace_write_file(
             "dry_run": False,
             "path": str(p),
             "backup": str(backup) if backup else None,
+            "backup_warning": _file_backup_warning(),
         }
         op.audit_record(
             tool="hermes_workspace_write_file",
@@ -1233,6 +1282,7 @@ def hermes_owner_patch(
             "path": str(p),
             "match_count": match_count,
             "backup": str(backup) if backup else None,
+            "backup_warning": _file_backup_warning(),
         }
         op.audit_record(
             tool="hermes_owner_patch",
@@ -1313,6 +1363,7 @@ def hermes_owner_write_file(
             "owner_mode": True,
             "path": str(p),
             "backup": str(backup) if backup else None,
+            "backup_warning": _file_backup_warning(),
         }
         op.audit_record(
             tool="hermes_owner_write_file",

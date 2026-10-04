@@ -126,6 +126,12 @@ Tools that create or dispatch external work also require `confirm=true` when the
 
 A refusal caused by a missing gate is expected behavior, not a failure to execute the request.
 
+### Optional file backups
+
+Direct-mode write tools — `hermes_workspace_patch`, `hermes_workspace_write_file`, `hermes_owner_patch`, `hermes_owner_write_file`, and the profile-config writers `hermes_config_set`, `hermes_config_patch`, `hermes_env_set_nonsecret`, `hermes_env_copy_nonsecret` — keep a timestamped `.bak.*` copy next to the target before writing. This is a safety net and the default is ON; one shared gate covers all sites.
+
+Set `HERMES_GPT_OPERATOR_FILE_BACKUPS=0` to disable it (recognized false values: `0`, `false`, `no`, `off`, `disabled`, case-insensitive; an explicitly empty value also disables). Recognized true values (`1`, `true`, `yes`, `on`, `enabled`) force backups on. This switch is fail-closed: any other value (for example a typo like `fals`) keeps backups ON and the tool result carries a `backup_warning` naming the unrecognized value, so a typo can never silently drop the safety net. The toggle changes only backup creation; it never bypasses level, dry-run, path, or Owner gates.
+
 ## Mission Control
 
 Mission Control is the read-only `hermes_mission_*` operational view of the Hermes deployment.

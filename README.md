@@ -268,6 +268,8 @@ HERMES_GPT_OWNER_ACK=I_UNDERSTAND_THIS_CAN_MUTATE_MY_MACHINE
 
 See [docs/operator-mode.md](docs/operator-mode.md) for the complete policy model and exact gates.
 
+Direct-mode write tools keep a timestamped `.bak.*` backup of each target before writing (default on). Operators who manage backups their own way can set `HERMES_GPT_OPERATOR_FILE_BACKUPS=0` to opt out; the toggle is fail-closed — an unrecognized value keeps backups on and the tool result warns. See [Optional file backups](docs/operator-mode.md#optional-file-backups).
+
 ## Mission Control
 
 Mission Control is structurally read-only. It exposes bounded operational summaries for:

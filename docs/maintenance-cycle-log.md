@@ -487,3 +487,177 @@ and `uvx ruff@0.15.22`.
   61db9bce rm-133, c5fba76a rm-148); upstream remains frozen at tip
   `f4151d9728` (9 commits ahead, no v0.13 tag; PR #85 touches
   `operator_workspace.py` — check it before any backup-related work).
+
+## Cycle 8 — 2026-10-04 — "Operator write-path defaults you can trust"
+
+Run `efe7657638c74fa4a5e929f0ecd6cea1` (repository-maintenance
+`5260fbbbcd3a4f408340d2759420dec7`, campaign
+`hermes-gpt-conductor-run-dbf82ae4683a-a501872d8ba07e19`, cycle 3) against
+worktree run-efe7657638c7 at `e490130737` (rebased fast-forward from the
+assessed base `30de0067f9` at implement, zero conflicts — batch files
+untouched by #26/#27/#28). Phases: assess → research → roadmap → prioritize →
+stewardship → implement → targeted tests → full tests → compound. All outcomes
+below are pre-review: the batch is implemented and locally verified but
+uncommitted. Heading numbering note (re-verified 2026-10-04 by attempt
+f9f233f9): the committed log ends at Cycle 6 and Cycle 7 exists nowhere on
+disk — an earlier pass recorded an uncommitted `## Cycle 7 — 2026-10-03` in
+sibling 9b1770fc3065, whose worktree now ends at Cycle 6; sibling
+2f81870e7a06 still holds a date-headed `## Cycle 2026-10-03` entry and
+sibling d92e1ad3 an uncommitted `## Cycle 9 — 2026-10-04` (same line-491
+append anchor as this entry). This entry stays Cycle 8; renumber/fold at
+the landing gate.
+
+### What the cycle did
+
+- **Batch lead — operator file-backup configurability (fleet id `rm-192`,
+  this run's mint, ships as the insert-only ledger patch
+  `/tmp/92395980-scratch/ROADMAP.ledger.patch`, unlanded).** Upstream PR #85
+  (asimons81/hermes-gpt, brunocasado, still open/patch-less per research
+  2026-10-03) was adopted by SHAPE and hardened: env const
+  `HERMES_GPT_OPERATOR_FILE_BACKUPS` (`operator_workspace.py:70`) gates the
+  shared `_backup_file` helper (`:115-116`) covering the four workspace/owner
+  write tools; `operator_config.py:234-241` DELEGATES to the same helper
+  (replacing a private duplicate that left the four profile-config writers
+  ungated) — one gate, eight direct-write sites. Parse is fail-closed
+  (`_file_backups_enabled`, `:76`): unset = backups ON (default unchanged);
+  recognized false set `{0,false,no,off,disabled, ""}` case-insensitive;
+  any unrecognized value keeps backups ON and stamps a `backup_warning`
+  naming the value on direct-write tool results. Docs:
+  `docs/operator-mode.md` "Optional file backups" (8 tools listed), README
+  pointer, CHANGELOG "Unreleased" entry. Tests: 7 new in
+  `test_operator_workspace.py` (incl. `test_file_backups_unrecognized_value_fails_closed`
+  `:873`, owner-parity `:861`, empty-string `:911`, case-insensitive `:927`)
+  plus the delegation drift-guard in `test_operator_config.py`. Live
+  delegation probe: `=0` → `_backup_file()` returns None; `'fals'` → backup
+  created + warning contains "fail-closed".
+- **Batch rider — own the environment-dependent skips + autouse audit-override
+  reset (`rm-101`).** `conftest.py:177` autouse `_reset_audit_log_override`
+  snapshots/restores `operator_policy._audit_log_override` around every test
+  (a fixture dying between set and teardown could previously leak the
+  process-global override into every later test's audit records — same
+  ordering-hazard family as the fleet's test_server-before-test_gemini_compat
+  pollution). New `test_suite_determinism.py` pins both halves: the
+  skipif-inventory guard (`:42` — every environment-dependent `skipif`
+  registered; new skips fail until registered) and the audit-leak regression
+  pair (`:64`/`:70`). rm-101's tracked ROADMAP block carries the dated update;
+  status flip deferred to the landing gate.
+- **Assess/research substrate (consumed, not re-derived):** assess found
+  A1-A19 at `30de0067f9` on a green full-suite baseline; research root-caused
+  10 consecutive master CI failures (2026-10-01→10-03) to the py3.10
+  `asyncio.TimeoutError`-vs-`TimeoutError` class (fixed by #27
+  `58a70ddd5e`) plus a 3.12/mcp>=2 lane flake (green at `e490130737`, run
+  37107958208); upstream drift 0; PR #85 open; dependency lanes verified
+  0-vuln at starlette 1.7.0 / cryptography 50.0.2 / anyio 4.15.1 /
+  uvicorn 0.54.0 / mcp 2.3.0; Python 3.10 EOL passed 2026-10-01.
+
+### Prevention rules
+
+1. **Adopting an upstream patch's shape does not adopt its safety posture.**
+   PR #85's gate `raw is not None and not op.is_truthy(raw)` is fail-OPEN for
+   a loss-prevention default: `is_truthy` (`operator_policy.py:81`) treats
+   anything unrecognized as falsey, so a typo'd env value silently DISABLES
+   backups. Any gate guarding a destructive-adjacent default must parse
+   recognized-true/recognized-false explicitly and fail toward the safe side
+   on unrecognized input, surfacing the offending value — pinned by
+   `test_file_backups_unrecognized_value_fails_closed`.
+2. **Census for duplicate helpers before gating "the shared one".** The
+   upstream PR gated only `operator_workspace._backup_file`;
+   `operator_config.py` carried a private duplicate covering four more write
+   tools, which would have stayed ungated. `git grep` the helper name
+   repo-wide before claiming one-gate coverage; keep the delegation +
+   drift-guard test so the duplicate cannot regrow.
+3. **Write conftest/global-state hooks from source, not memory.** The first
+   autouse attempt guessed `_AUDIT_LOG_OVERRIDE`; the real process-global is
+   `operator_policy._audit_log_override` (`:70`). Read the owning module
+   before snapshotting a global in a fixture.
+4. **Environment-dependent skips are a determinism surface.** A new `skipif`
+   silently changes what "green" means per host. Register it in the
+   skipif-inventory guard (owner note or hard condition, per rm-101
+   acceptance) or the suite fails it.
+5. **Read the prior attempt's event log before any durable write.** This run
+   reaped two prior attempts (research `8a91ba4b` at ~100 s; compound
+   `7735f749` at 3.4 s — zero work). One `cat` of the `.jsonl` distinguishes
+   "nothing happened" from "durable writes exist to verify", and prevents
+   double-applied append-only edits.
+6. **Validation records claim currency — later phases must supersede.** The
+   envelope below is current at compound time. Any phase that touches
+   executable surfaces after this point (e.g. a review-fix pass) must refresh
+   the shipped validation records and explicitly supersede this envelope —
+   never leave a stale envelope as the final state.
+
+### Validation record (current at compound)
+
+- Targeted (work-order command, 10 changed surfaces): RC=0 first run, zero
+  fixes (`/tmp/5dcc0dec-targeted/run1.log`); ruff over the 10 surfaces clean.
+- Full gate (verbatim `local_validation_gate.py --shell-command 'python -m
+  pytest -q'`): GATE_RC=0, envelope
+  `/home/agent/.hermes/local-validation-gate/results/result-2088694-354043546.json`,
+  digest `validation:v1:162865e8e0aedadbb4b9c06760278e38af343ef5814c42970939b776d2f21629`,
+  single admitted run, dot-grid 1807 passed + 5 skipped = 1812 outcomes,
+  0 failed / 0 errored, tree unchanged (8 M + 1 ??) across the phase.
+- Caveat (known fleet nuance): the envelope's `digest_base` is `unknown`
+  (standalone local-validation-gate write); the authoritative equality check
+  is recomputing `validation_digest` from an installed conductor release at
+  the review/final gates.
+
+### Local toolchain notes
+
+- The compound phase ran under an explicit no-test constraint: all validation
+  facts above are consumed from the recorded targeted/full phase evidence,
+  not re-executed.
+- Compound's own delta is docs/ledger-only (repo ROADMAP.md rm-101 dated
+  update, this log entry, campaign-roadmap 'Cycle 3 outcome' append) — no
+  executable surface changed after the full gate, so the envelope above
+  stays current. The ce-compound `docs/solutions/` sink was deliberately
+  NOT used: fleet precedent (9b1770fc3065; d92e1ad3 cycle 2) treats
+  docs/solutions/ as a live-system ops-runbook contract — the reusable
+  lessons live in this entry instead. (Correction by attempt f9f233f9,
+  2026-10-04: reaped attempt 8bbf0930 had described a solutions runbook +
+  index row it never wrote before dying; this entry now matches the tree.)
+
+### Context left for the next cycle
+
+- **Fleet frontier:** this run minted `rm-192` (campaign board + ledger
+  patch, unlanded); siblings hold rm-181/190/191-max patches and uncommitted
+  renders. Next mint re-censuses live (worktree greps + delegate spool), not
+  from this log.
+- **Landing-gate flips already proven stale-open:** `rm-081` + `rm-098`
+  (content satisfied at master via #25 `125255c0bc`; upstream drift 0 incl.
+  #82/#83/#84) — flip, do not re-implement.
+- **Unselected pool for the next assess/prioritize:** A1 boundary findings
+  (WS foreign-Origin accepted at `operator_live_events.py:402-403`;
+  text/plain + foreign-Origin dispatch; foreign-Host GET 200), A2 residue
+  beyond #27's live-events fix (`ui_ops.py:700`, `ui_chat.py:748/761/490`,
+  `operator_autopilot.py:523/530-559/1824-1827`,
+  `operator_job_supervisor.py:457-469/511-540`,
+  `operator_cron.py:425-447/1271-1283`, `ui_security.py:207`,
+  `oauth_auth.py:1430-1439` — bare `except TimeoutError` missing py3.10's
+  distinct `asyncio.TimeoutError`; a 3.11-floor bump may fold the class since
+  3.10 EOL'd 2026-10-01), A12 (sdist ships zero docs assets), research S1-S5
+  folds (`rm-077`/`rm-083`, `rm-177`, `rm-048` + `rm-173`), the
+  0-vuln dependency lanes above, `rm-038` branch protection (human/admin
+  lane), `rm-139` id-guard (owned by dfaf334f's `rm-195`).
+- **Upstream back-contribution candidate:** propose the fail-closed parse
+  (rule 1) as an amendment/comment on PR #85 before upstream lands the
+  fail-open gate verbatim.
+- **Docs-truth note (corrected by attempt f9f233f9):** an earlier compound
+  pass claimed `docs/solutions/README.md` indexes a missing runbook — false
+  on verification: `runner-cancel-workspace-authority.md` IS tracked at HEAD
+  `e490130737` (`git ls-files docs/solutions/` + `git show HEAD:…` both
+  confirm). The surviving gap is real but smaller: `docs/solutions/` has no
+  pointer from `docs/README.md`'s authority map or AGENTS.md
+  (discoverability gap for a live-system ops-runbook directory).
+
+### Landing-gate duties
+
+- Fold the stacked ledger patches in mint order (79b3e882, 03ec00ae,
+  ca49ab4b, this run's `/tmp/92395980-scratch/ROADMAP.ledger.patch`),
+  resolving rm-180..191 collisions by title; status flips: this batch
+  (`rm-101`, `rm-192`) and the stale-open `rm-081`/`rm-098`.
+- Delta at compound: 10 M + 1 ?? (implement's 8 M — CHANGELOG.md, README.md,
+  conftest.py, docs/operator-mode.md, operator_config.py,
+  operator_workspace.py, test_operator_config.py, test_operator_workspace.py
+  — plus compound's repo ROADMAP.md and this log; untracked:
+  test_suite_determinism.py; docs/solutions/ untouched). CHANGELOG
+  "Unreleased" + `docs/operator-mode.md` + README ride the batch; supersede
+  the validation envelope only if a later phase edits executable surfaces.

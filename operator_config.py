@@ -27,8 +27,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
-import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -234,15 +232,20 @@ def hermes_config_get(
 
 
 def _backup_file(path: Path) -> Path | None:
-    if not path.exists():
-        return None
-    ts = time.strftime("%Y%m%d-%H%M%S")
-    bak = path.with_name(f"{path.name}.bak.{ts}")
-    try:
-        shutil.copy2(path, bak)
-        return bak
-    except OSError:
-        return None
+    # Delegates to the single gated helper in operator_workspace so
+    # HERMES_GPT_OPERATOR_FILE_BACKUPS applies to config-tool writes too
+    # (rm-192: no per-site drift; the upstream PR #85 shape gated only the
+    # workspace helper, which would have left config backups ungated).
+    import operator_workspace as _ows
+
+    return _ows._backup_file(path)
+
+
+def _ows_file_backup_warning() -> str | None:
+    """See operator_workspace._file_backup_warning (fail-closed note)."""
+    import operator_workspace as _ows
+
+    return _ows._file_backup_warning()
 
 
 def _set_dotted(cfg: dict[str, Any], key_path: str, value: Any) -> None:
@@ -339,6 +342,7 @@ def hermes_config_set(
             "before": before,
             "after": after,
             "backup": str(backup) if backup else None,
+            "backup_warning": _ows_file_backup_warning(),
         }
         op.audit_record(
             tool="hermes_config_set",
@@ -445,6 +449,7 @@ def hermes_config_patch(
             "dry_run": False,
             "profile": profile,
             "backup": str(backup) if backup else None,
+            "backup_warning": _ows_file_backup_warning(),
         }
         op.audit_record(
             tool="hermes_config_patch",
@@ -669,6 +674,7 @@ def hermes_env_set_nonsecret(
             "key": key,
             "already_set": already_set,
             "backup": str(backup) if backup else None,
+            "backup_warning": _ows_file_backup_warning(),
         }
         op.audit_record(
             tool="hermes_env_set_nonsecret",
@@ -790,6 +796,7 @@ def hermes_env_copy_nonsecret(
             "key": key,
             "already_set_in_target": already_set,
             "backup": str(backup) if backup else None,
+            "backup_warning": _ows_file_backup_warning(),
         }
         op.audit_record(
             tool="hermes_env_copy_nonsecret",
