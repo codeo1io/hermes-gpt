@@ -34,6 +34,10 @@ _EXPECTED_SKIPIF_COUNTS = {
     "test_runner_confinement_env_shebang.py": 1,
     "test_operator_workspace.py": 1,
     "test_codex_mcp.py": 1,
+    # v0.14.0 adoption: Linux-only /proc authority proof at module level
+    # (pytestmark skipif not Path("/proc/self/environ").exists()); portable
+    # Autopilot acceptance tests must stay runnable on every OS.
+    "test_operator_autopilot_acceptance.py": 1,
 }
 
 _SKIP_PATTERN = re.compile(r"\bskipif\b")

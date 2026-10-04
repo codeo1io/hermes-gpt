@@ -3,24 +3,36 @@
 [![PyPI version](https://img.shields.io/pypi/v/hermes-gpt.svg)](https://pypi.org/project/hermes-gpt/)
 [![PyPI downloads](https://img.shields.io/pypi/dm/hermes-gpt.svg)](https://pypi.org/project/hermes-gpt/)
 
-![Hermes GPT v0.13.0 candidate - Autopilot: a durable, default-off runtime that drives a Mission through its MissionPlan without a human re-triggering every node, with the connector surface unchanged at 137 tools when its machine gate is unset and three more when it is set](assets/hermes-gpt-v0.13.0-readme-hero.jpg)
+![Hermes GPT v0.14.0 — Acceptance and bounded recovery](assets/hermes-gpt-v0.14.0-readme-hero.jpg)
 
 `hermes-gpt` is a local-first MCP sidecar for Hermes Agent. It exposes selected Hermes capabilities to trusted MCP clients without modifying Hermes Agent source files.
 
+[Website](https://hermes-gpt.tonysimons.dev/) · [Docs hub](https://hermes-gpt.tonysimons.dev/docs.html) · [Canonical documentation](docs/README.md)
+
 ## Current status
 
-- **Repository version:** 0.13.0
-- **GitHub release target:** v0.13.0
-- **Latest PyPI release:** check the badge above; PyPI is published independently from GitHub
+- **Repository version:** 0.14.0
+- **Published GitHub release:** [v0.14.0](https://github.com/asimons81/hermes-gpt/releases/tag/v0.14.0)
+- **Verified PyPI release:** [0.14.0](https://pypi.org/project/hermes-gpt/0.14.0/); check the badge for later updates
 - **Python requirement:** 3.10+
 - **MCP SDK (current source):** 1.28.1+ or 2.x; see [compatibility](docs/mcp-compatibility.md).
 - **Deployment posture:** local-dev / trusted-machine only
 - **Remote public hosting:** unsupported without a real authenticated private boundary
 
 > [!IMPORTANT]
-> GitHub releases and PyPI can temporarily be on different versions. The PyPI badge above is the source of truth for what `pip install hermes-gpt` installs. Do not assume a PyPI install contains v0.13 (Autopilot) features unless the badge reports 0.13.0 or newer, or v0.12 features unless it reports 0.12.0 or newer.
+> GitHub releases and PyPI can temporarily be on different versions. The PyPI badge above is the source of truth for what `pip install hermes-gpt` installs. Declared artifact acceptance and recovery require 0.14.0 or newer. Autopilot requires 0.13.0 or newer and `HERMES_GPT_AUTOPILOT=1`.
 
 For the current documentation map and source-of-truth rules, start with [docs/README.md](docs/README.md). Agents working in this repository should also read [AGENTS.md](AGENTS.md).
+
+## What v0.14.0 adds
+
+**Acceptance and recovery** strengthens Autopilot's completion checks and handles confirmed deliverable failures after successful execution.
+
+1. **Declare checks before dispatch.** Optional node `artifact_requirements` set minimum/maximum file sizes and expected SHA-256 values. Each attempt's immutable Work Contract carries these checks, and rework preserves them.
+2. **Recover confirmed failures.** Successfully executed work with bad required artifacts gets a durable 30-second delivery grace. If the artifacts still fail and every other required check passes, the delegation fails with `validation_failed`; Autopilot can use its existing bounded semantic replan. Unreadable evidence, pending review, and ambiguous execution never trigger automatic redispatch.
+3. **Explain completion.** Flight Deck shows check results, fixed artifact failure reasons, delivery grace, and unverified evidence through its read-only supervision panel. No new tools or browser mutation controls are introduced.
+
+Size and digest checks prove the declared requirements; semantic quality still requires review. Autopilot remains default off and final Mission approval remains Owner-only. See [v0.14 release notes](docs/release-notes-v0.14.0.md) and [Autopilot](docs/autopilot.md). Verify PyPI separately before relying on v0.14 features in an installed package.
 
 ## What v0.13.0 adds
 
@@ -30,7 +42,8 @@ v0.13.0 adds **Autopilot**: a durable, default-off runtime that drives one Missi
 2. **It never crosses an approval boundary** - approval nodes and `high_impact` nodes are never dispatched or advanced; Autopilot reports `waiting_for_owner` and dispatches nothing past them. It cannot approve or complete a Mission: it stops at `awaiting_approval`, and only `hermes_mission_approve` in Owner mode completes it.
 3. **Evidence, not claims** - a node completes only when its Work Contract validates against observed state; a worker's own success report is never accepted, and missing evidence fails closed.
 4. **Bounded everything** - concurrency, attempts per node, replans, and runtime are capped at start; new dispatch is held whenever the Mission's budget envelope is not verifiably within its limit; recovery is decided by the existing failure classifier and only transient failures are retried.
-5. **Additive elsewhere** - `hermes_autopilot_status` carries a derived summary without changing any earlier key, Flight Deck gets a read-only Autopilot view, and a failed delegation attempt can now be marked superseded by its successor (see [docs/missions.md](docs/missions.md)) without changing any approval rule.
+5. **Deliverables and supervision** - node artifact requirements are enforced in isolated attempt workspaces; unfinished work blocks plan replacement, and independent reconciliation preserves bounded recovery. Flight Deck includes an Autopilot panel and its built assets ship in release wheels.
+6. **Additive elsewhere** - `hermes_autopilot_status` carries a derived summary without changing any earlier key, Flight Deck gets a read-only Autopilot view, and a failed delegation attempt can now be marked superseded by its successor (see [docs/missions.md](docs/missions.md)) without changing any approval rule.
 
 See [CHANGELOG.md](CHANGELOG.md) for the complete v0.13.0 change list.
 
@@ -156,7 +169,7 @@ python -m pip install .
 hermes-gpt
 ```
 
-The final v0.12.0 wheel and sdist are also attached to the [GitHub v0.12.0 release](https://github.com/asimons81/hermes-gpt/releases/tag/v0.12.0). The v0.11.0 release notes cover the opt-in Gemini Spark client profile, MCP Python SDK 2.x support, and profile-aware Bot Chat; the v0.10.0 release notes cover the vNext slice-1 surfaces (MissionPlan DAG, derived capability-manifest and mission-ledger views, budget envelope, placement scoring, failure semantics, and the shadow controller); the v0.8.0 release notes cover the Fabric surfaces (`hermes-gpt-fabric-peer`, capability-aware routing, remote evidence admission, reconciliation); the v0.9 surfaces (Missions `hermes_mission_*`, delegations `hermes_delegation_*`, live events `hermes_live_events_*`, `hermes_job_status/wait`) are documented in [docs/missions.md](docs/missions.md), [docs/delegations.md](docs/delegations.md), and [docs/live-events.md](docs/live-events.md). Operator diagnostics and recovery tools (`hermes_operator_doctor`, `hermes_operator_snapshot`, `hermes_release_doctor`, `hermes_operator_recover`) are documented in [docs/operator-mode.md](docs/operator-mode.md).
+The v0.14.0 wheel and sdist are also attached to the [GitHub v0.14.0 release](https://github.com/asimons81/hermes-gpt/releases/tag/v0.14.0). See [v0.14 release notes](docs/release-notes-v0.14.0.md) for acceptance and recovery, and [Autopilot](docs/autopilot.md) for setup and limits. The v0.11.0 release notes cover the opt-in Gemini Spark client profile, MCP Python SDK 2.x support, and profile-aware Bot Chat; the v0.10.0 release notes cover the vNext slice-1 surfaces (MissionPlan DAG, derived capability-manifest and mission-ledger views, budget envelope, placement scoring, failure semantics, and the shadow controller); the v0.8.0 release notes cover the Fabric surfaces (`hermes-gpt-fabric-peer`, capability-aware routing, remote evidence admission, reconciliation); the v0.9 surfaces (Missions `hermes_mission_*`, delegations `hermes_delegation_*`, live events `hermes_live_events_*`, `hermes_job_status/wait`) are documented in [docs/missions.md](docs/missions.md), [docs/delegations.md](docs/delegations.md), and [docs/live-events.md](docs/live-events.md). Operator diagnostics and recovery tools (`hermes_operator_doctor`, `hermes_operator_snapshot`, `hermes_release_doctor`, `hermes_operator_recover`) are documented in [docs/operator-mode.md](docs/operator-mode.md).
 
 ## Default local MCP surface
 
