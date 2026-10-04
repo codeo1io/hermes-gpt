@@ -84,6 +84,7 @@ _ALLOWED_SPEC_KEYS = {
     "context_refs",
     "skills",
     "final_approval_required",
+    "approval_policy",
 }
 _ALLOWED_PATCH_KEYS = {
     "title",
@@ -274,6 +275,34 @@ def _normalize_skills(raw: Any) -> list[dict[str, str]]:
     return out
 
 
+def _normalize_approval_policy(raw: Any) -> dict[str, Any]:
+    """Typed, mint-time approval policy. Default is owner-gated (today's behavior).
+
+    ``owner`` (or missing): the Mission parks at ``awaiting_approval`` until the
+    Owner approves — unchanged semantics. ``auto_when_evidence_verified``: an
+    owner-side resolver MAY resolve the gate once the Mission's evidence is
+    independently re-verified (terminal children, verified successes, digest-
+    checked artifacts). The policy is immutable after mint (not patchable) and
+    grants no new authority inside Autopilot: the frontier and Autopilot itself
+    still never approve anything.
+    """
+    default = {"policy": "owner"}
+    if raw is None:
+        return default
+    if isinstance(raw, str):
+        raw = {"policy": raw}
+    if not isinstance(raw, dict):
+        raise TypeError("approval_policy must be an object or the string 'owner'")
+    _closed(raw, {"policy", "max_wait_seconds"}, "approval_policy")
+    policy = raw.get("policy", "owner")
+    if policy not in {"owner", "auto_when_evidence_verified"}:
+        raise ValueError("approval_policy.policy must be 'owner' or 'auto_when_evidence_verified'")
+    wait = raw.get("max_wait_seconds", 900)
+    if not isinstance(wait, int) or isinstance(wait, bool) or not 0 <= wait <= 86400:
+        raise TypeError("approval_policy.max_wait_seconds must be an int in [0, 86400]")
+    return {"policy": policy, "max_wait_seconds": wait} if policy != "owner" else default
+
+
 def _normalize_spec(raw: dict[str, Any], *, mission_id: str | None = None) -> dict[str, Any]:
     _closed(raw, _ALLOWED_SPEC_KEYS, "mission spec")
     schema = raw.get("schema", MISSION_SPEC_SCHEMA)
@@ -290,6 +319,7 @@ def _normalize_spec(raw: dict[str, Any], *, mission_id: str | None = None) -> di
     final_approval = raw.get("final_approval_required", True)
     if not isinstance(final_approval, bool):
         raise TypeError("final_approval_required must be boolean")
+    approval_policy = _normalize_approval_policy(raw.get("approval_policy"))
     return {
         "schema": MISSION_SPEC_SCHEMA,
         "mission_id": mid,
@@ -300,6 +330,7 @@ def _normalize_spec(raw: dict[str, Any], *, mission_id: str | None = None) -> di
         "context_refs": _normalize_context(raw.get("context_refs")),
         "skills": _normalize_skills(raw.get("skills")),
         "final_approval_required": final_approval,
+        "approval_policy": approval_policy,
     }
 
 
