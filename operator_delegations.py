@@ -1144,6 +1144,7 @@ def hermes_delegation_reconcile(
             stored["state"] == "cancelled"
             and bool(stored.get("cancel_requested"))
         )
+        cancellation_pending = bool(stored.get("cancel_requested")) or bool(stored.get("cancellation_in_progress"))
         desired = observed_desired
         resolved_cancel_requested = bool(stored.get("cancel_requested"))
         resolved_cancellation_in_progress = bool(stored.get("cancellation_in_progress"))

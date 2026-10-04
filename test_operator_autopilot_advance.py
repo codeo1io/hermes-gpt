@@ -274,7 +274,9 @@ def test_contract_carries_plan_declared_artifacts(env):
     _tick(root)
     assert len(backend.calls) == 1
     contract = backend.calls[0]
-    assert contract["expected_artifacts"] == [{"path": "work-contract.json", "must_exist": True, "min_bytes": 0}]
+    # v0.14 tightens the Stage4 default: declared artifacts must be nonempty
+    # (min_bytes: 1) unless the node's artifact_requirements overrides it.
+    assert contract["expected_artifacts"] == [{"path": "work-contract.json", "must_exist": True, "min_bytes": 1}]
     assert contract["completion_criteria"]["artifacts_present"] is True
 
 
