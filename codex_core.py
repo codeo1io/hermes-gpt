@@ -198,8 +198,49 @@ def resolve_project_file(image_path: str, project_root: str | None) -> Path:
     return image
 
 
+# Contract for the out-of-tree fetch seam behind ``CodexCore.web_extract``
+# (rm-150).  ``validate_public_url`` resolves the hostname once and requires
+# EVERY resolved address to be global; the actual fetch happens outside this
+# tree (server.py wires ``hermes_web_extract`` -> the installed agent's
+# web_tool), so the in-tree gate holds only while this contract holds:
+WEB_EXTRACT_SEAM_CONTRACT = """
+The web-extract seam receives ONLY URLs that validate_public_url() approved
+at check time (one fresh resolution; every resolved address global).
+The out-of-tree fetcher MUST:
+- fetch exactly the validated URL, and
+- refuse, or re-validate with the same public-address rule, every redirect
+  hop, so a cross-hop redirect or a post-validation DNS rebinding can never
+  land on a private, loopback, link-local, or metadata address.
+Any change to the seam's call shape or redirect behavior is a contract change
+and must update docs/codex.md and test_codex_public_url.py.
+"""
+
+
+def _resolve_url_addresses(
+    host: str, port: int
+) -> set[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    """Resolve a DNS hostname once, at check time.
+
+    The complete answer set is returned: the caller gates on EVERY address,
+    so a mixed public+private answer (the classic rebinding shape) is
+    rejected as a whole rather than sampled.
+    """
+    try:
+        return {
+            ipaddress.ip_address(item[4][0])
+            for item in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        }
+    except socket.gaierror as exc:
+        raise ValueError("The URL hostname could not be resolved safely.") from exc
+
+
 def validate_public_url(url: str) -> str:
-    """Reject local, private, metadata, credentialed, and non-HTTP URLs."""
+    """Reject local, private, metadata, credentialed, and non-HTTP URLs.
+
+    For DNS names the hostname is resolved once here (check time) and every
+    address in the answer must be global; what the out-of-tree fetcher may
+    do afterwards is pinned by ``WEB_EXTRACT_SEAM_CONTRACT``.
+    """
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"}:
         raise ValueError("Only http and https URLs are allowed.")
@@ -215,10 +256,7 @@ def validate_public_url(url: str) -> str:
     try:
         addresses = {ipaddress.ip_address(host)}
     except ValueError:
-        try:
-            addresses = {ipaddress.ip_address(item[4][0]) for item in socket.getaddrinfo(host, parsed.port or 443, type=socket.SOCK_STREAM)}
-        except socket.gaierror as exc:
-            raise ValueError("The URL hostname could not be resolved safely.") from exc
+        addresses = _resolve_url_addresses(host, parsed.port or 443)
 
     for address in addresses:
         if not address.is_global:
@@ -396,6 +434,8 @@ class CodexToolCore:
         try:
             safe_url = validate_public_url(url)
             limit = max(500, min(int(max_chars), MAX_EXTRACT_CHARS))
+            # Seam contract (WEB_EXTRACT_SEAM_CONTRACT): the fetcher beyond
+            # this tree receives exactly the validated URL, nothing else.
             return redact_value({"ok": True, "url": safe_url, "content": _decoded_json(self.web_extract([safe_url], limit))})
         except (ValueError, PermissionError) as exc:
             return _error("URL_BLOCKED", str(exc))

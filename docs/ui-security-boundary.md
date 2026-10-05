@@ -147,6 +147,13 @@ degraded or the level is below `workspace`; read-only lanes stay).
   unauthorized recovery UX (re-auth affordance, mutating controls disabled,
   read-only chat history stays viewable). Wiring the account store into the
   banner is the flight card's job (t_1135e15b owns `web/src/stores/account.ts`).
+- **Banner deployment scope (local-mode-only):** the SPA attaches no
+  credentials, so on auth-configured deployments `GET /api/me` cannot resolve
+  a real `accountStatus` and the banner never renders there — remote auth
+  failures surface through the server's 401 error envelope, not through
+  this banner. The banner is recovery UX for same-origin no-auth /api/me
+  deployments only (the loopback default boundary); its scope marker
+  `ACCOUNT_BANNER_SCOPE` and tests pin this.
 
 ## 6. Mutations remain auditable and gated
 

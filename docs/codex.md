@@ -126,6 +126,7 @@ Persistent core-tool writes are dry-run-first. Skill or cron writes require the 
 - Local image paths resolve symlinks and must stay within an approved project root / allowed root.
 - Secret-looking paths are rejected.
 - Web extraction accepts public HTTP(S) URLs by default and rejects file URLs, localhost, private/loopback/link-local/reserved addresses, and metadata targets unless a specific private-network override is deliberately enabled.
+- **Fetch seam contract** (`rm-150`): the network gate resolves the hostname once and requires *every* resolved address to be public before the URL is handed to the extraction backend. The backend fetch (the installed Hermes agent's `web_extract` tool, wired through `hermes_web_extract`) must fetch exactly the validated URL and must refuse — or re-validate with the same public-address rule — every redirect hop, so a cross-hop redirect or a post-validation DNS rebinding can never reach a private, loopback, link-local, or metadata address. Changing the backend's call shape or redirect behavior is a contract change; `codex_core.WEB_EXTRACT_SEAM_CONTRACT` and `test_codex_public_url.py` pin it.
 - Returned structured text is recursively redacted for common secret/token/cookie/private-key patterns.
 - The MCP server launches even when optional gates are absent so tools can return an actionable blocked response rather than disappearing silently.
 
@@ -286,7 +287,7 @@ Provide the correct project root and keep the image beneath it. Secret paths and
 
 ### Page extraction rejects a URL
 
-Use a public `http` or `https` URL unless a deliberate private-network override is part of your trusted deployment.
+Use a public `http` or `https` URL unless a deliberate private-network override is part of your trusted deployment. A URL that passed validation can still be rejected downstream: the extraction backend is contractually required to re-check redirect hops (see the fetch seam contract under core-tool safety behavior).
 
 ## Related docs
 

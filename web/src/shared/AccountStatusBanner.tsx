@@ -5,6 +5,13 @@
  * renders the recovery surface. Data wiring is the account store's job
  * (flight card, t_1135e15b); this component never fetches.
  *
+ * SCOPE (rm-050): local-mode-only recovery UX. The SPA attaches no
+ * credentials, so on auth-configured deployments GET /api/me cannot resolve
+ * a real accountStatus and this banner is not an auth-failure surface —
+ * remote auth failures surface through the server's 401 error envelope.
+ * Mount it only where a same-origin, no-auth /api/me is available (the
+ * loopback default boundary).
+ *
  * Behavior contract (§13):
  * - ok            -> renders nothing.
  * - expired       -> "Session expired" banner with a re-auth affordance.
@@ -20,6 +27,9 @@
 import type { AccountStatus } from "./types";
 
 import "./tokens.css";
+
+/** Machine-readable deployment scope, asserted by the banner's tests (rm-050). */
+export const ACCOUNT_BANNER_SCOPE = "local-mode-only" as const;
 
 interface AccountStatusBannerProps {
   status: AccountStatus;

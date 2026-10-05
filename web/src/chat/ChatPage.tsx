@@ -7,13 +7,36 @@ import { Message } from './Message';
 import { useConversationStore } from '../stores/conversation';
 import { useSessionListStore } from '../stores/session-list';
 
+// Latest-hydration-wins ticket (rm-160): every hydration request takes a
+// ticket, and a response only applies while it is still the newest request.
+// This survives unmount/remount (tickets live at module scope, so a stale
+// response from a superseded route can never clobber the newer one).
+let hydrationTicket = 0;
+
 export function ChatPage(): JSX.Element {
   const { sessionId: routeSessionId } = useParams();
   const navigate = useNavigate();
   const conversation = useConversationStore();
   const sessions = useSessionListStore();
   useEffect(() => { void sessions.load(); }, []);
-  useEffect(() => { if (!routeSessionId) { conversation.reset(); return; } void getMessages(routeSessionId).then((data) => conversation.hydrate(routeSessionId, data.messages)).catch((error: unknown) => conversation.setError(error instanceof Error ? error.message : 'Unable to load conversation')); }, [routeSessionId]);
+  useEffect(() => {
+    const ticket = ++hydrationTicket;
+    if (!routeSessionId) { conversation.reset(); return; }
+    const requestedId = routeSessionId;
+    void getMessages(requestedId)
+      .then((data) => {
+        if (ticket !== hydrationTicket) return; // superseded by a newer route/reset
+        // First-meta navigate: the store is already streaming this exact
+        // session, so persisting history over it would wipe the live turn.
+        const live = useConversationStore.getState();
+        if (live.streaming && live.sessionId === requestedId) return;
+        conversation.hydrate(requestedId, data.messages);
+      })
+      .catch((error: unknown) => {
+        if (ticket !== hydrationTicket) return;
+        conversation.setError(error instanceof Error ? error.message : 'Unable to load conversation');
+      });
+  }, [routeSessionId]);
   const send = async (message: string): Promise<void> => {
     conversation.appendUser(message);
     conversation.setError(null);

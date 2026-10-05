@@ -1,6 +1,8 @@
 // GatedActionButton — three-stage dangerous-action treatment (media spec §5):
-// idle -> dry-run plan -> confirm. Confirm is never pre-enabled; the dry-run
-// result must exist first. All calls go through POST /api/ops/action.
+// idle -> dry-run plan -> applied. Confirm is never pre-enabled; the dry-run
+// result must exist first, and a completed real apply settles in a distinct
+// `applied` state that never shows dry-run labeling. All calls go through
+// POST /api/ops/action.
 import { useState } from 'react';
 
 import { ApiError, api } from '../api/client';
@@ -22,7 +24,10 @@ interface PlanState {
 }
 
 export function GatedActionButton({ tool, args, label, levelTag, disabled = false, onResult, onError }: GatedActionButtonProps) {
-  const [stage, setStage] = useState<'idle' | 'dryrun' | 'confirm' | 'busy'>('idle');
+  // `applied` is the post-apply truth state: it renders the executed result
+  // and offers no Confirm control, so a second apply requires an explicit
+  // re-arm back through `idle`.
+  const [stage, setStage] = useState<'idle' | 'dryrun' | 'applied' | 'busy'>('idle');
   const [plan, setPlan] = useState<PlanState | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -59,12 +64,16 @@ export function GatedActionButton({ tool, args, label, levelTag, disabled = fals
         { tool, args: { ...args, confirm: true }, dry_run: false },
       );
       setPlan({ plan: (body.result ?? {}) as Record<string, unknown>, dryRun: false });
-      setStage('dryrun');
+      // A real apply settles in the post-apply state.  Never relabel an
+      // executed mutation as a dry-run plan (rm-159).
+      setStage('applied');
       onResult?.(body.result);
     } catch (err) {
       const message = err instanceof ApiError ? `${err.code}: ${err.message}` : 'action failed';
       setError(message);
       onError?.(message);
+      // No mutation executed: the dry-run plan below is still the truthful
+      // last-known state and the Confirm control stays available for a retry.
       setStage('dryrun');
     }
   }
@@ -99,16 +108,18 @@ export function GatedActionButton({ tool, args, label, levelTag, disabled = fals
         </div>
       ) : null}
 
-      {stage === 'confirm' && plan ? (
-        <div className="fd-gated-actions">
-          <span className="fd-chip fd-chip--warn">CONFIRM REQUIRED</span>
-          <pre className="fd-pre">{JSON.stringify(plan.plan, null, 2).slice(0, 400)}</pre>
-          <button type="button" className="fd-btn fd-btn--ghost" onClick={() => setStage('idle')}>
-            Cancel
-          </button>
-          <button type="button" className="fd-btn fd-btn--primary" onClick={() => void runConfirm()}>
-            Confirm {label.toLowerCase()}
-          </button>
+      {stage === 'applied' && plan ? (
+        <div className="fd-gated-plan">
+          <div className="fd-gated-actions">
+            <span className="fd-chip fd-chip--ok">APPLIED</span>
+            <span className="fd-hint">Executed result below; a second apply requires an explicit re-arm.</span>
+          </div>
+          <pre className="fd-pre" data-gate-result>{JSON.stringify(plan.plan, null, 2).slice(0, 400)}</pre>
+          <div className="fd-gated-actions">
+            <button type="button" className="fd-btn fd-btn--ghost" onClick={() => { setPlan(null); setStage('idle'); }}>
+              Reset
+            </button>
+          </div>
         </div>
       ) : null}
 
