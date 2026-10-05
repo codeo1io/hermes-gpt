@@ -14,14 +14,14 @@
 
 ## Open items
 
+### Autopilot per-task artifacts workspace provisioning (N1, re-proven)
+- id: `rm-271` | track: reliability | priority: 118.0 | status: candidate
+- acceptance: the dispatch path provisions `<data>/missions/artifacts/<task_id>` before runner spawn — mkdir with restrictive mode at dispatch, OR workspace semantics split so local backends get a provisioned cwd while remote/A2A peers receive peer-relative artifact paths (never local-absolute); a REAL-dispatch test (no doubled contract->backend handoff, no _observe mkdir masking, no acceptance LAUNCHER doubling) proves the workspace exists on disk at spawn time AND a locally produced artifact inside it passes _check_artifacts; a fleet test proves dispatch to a remote peer carries no local-absolute workspace path; full test_operator_autopilot*.py + test_operator_contract.py green
+- evidence: run 27b7fb9ea997 assess 1a228399 — live repro /tmp/1a228399-assess/repro_artifacts_workspace.py (workspace exists False; _check_artifacts FAIL for peer-output AND legacy missions/ placements; production mkdir sites NONE); operator_autopilot.py:966 sole construction, operator_runners.py:653/667 (allowed_scope.workspaces[0] as cwd AND sandbox base; :768 spawn FileNotFoundError on local); upstream verified unfixed on every open branch (research 389c9f6b RC1)
+
 ### Adopt upstream skill-loader hardening trio (upstream issue #74 full half)
 - id: `rm-081` | track: reliability | priority: 115.0 | status: candidate
 - acceptance: merged tree reconciles fork+upstream halves into a single resolution authority; loader failure is fail-closed with a test proving a required-but-unloadable skill blocks dispatch; probes use preprocess=False with a test asserting inline_shell side effects never run during validation; fork surfaces (plan create/validate/placement) keep enforcement at parity with upstream's breadth (work contracts/swarm); full suite + upstream's new tests green on both SDK lanes
-- evidence: campaign-recorded in hermes-gpt ROADMAP.md
-
-### Adopt upstream v0.13 Autopilot (9-commit gap; PR #82)
-- id: `rm-098` | track: reliability | priority: 115.0 | status: candidate
-- acceptance: the 9 upstream commits merge or cherry-pick onto the fork line with conflicts reviewed line-by-line against fork invariants (Owner Mode break-glass, secret-path denials, default read-only; Autopilot stays default-off at adoption); full suite green in CI shape; CHANGELOG records the catch-up; #83/#84 recorded as follow-on once merged upstream
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
 
 ### Move blocking SQLite off the serving event loop (ui_chat + live-events WS)
@@ -39,6 +39,21 @@
 - signals: reliability.no_tests:hermes_state.py, reliability.no_tests:tools/check_package_hygiene.py, reliability.no_tests:web/src/chat/ActivityCard.tsx, reliability.no_tests:web/src/chat/ChatPage.tsx, reliability.no_tests:web/src/chat/Composer.tsx (+11 more)
 - acceptance: Every module in ['hermes_state.py', 'tools/check_package_hygiene.py', 'web/src/chat/ActivityCard.tsx', 'web/src/chat/ChatPage.tsx', 'web/src/chat/Composer.tsx', 'web/src/flight/AccountPanel.tsx', 'web/src/flight/ApprovalsPanel.tsx', 'web/src/flight/ContractsPanel.tsx', 'web/src/flight/DeckOverview.tsx', 'web/src/flight/EventHistoryPanel.tsx', 'web/src/flight/FleetPanel.tsx', 'web/src/flight/schemas.ts', 'web/src/shared/AccountStatusBanner.tsx', 'web/src/shared/ConnectionStatus.tsx', 'web/src/stores/session-list.ts', 'web/vite.config.ts'] has a corresponding test file with at least one passing test
 - evidence: full suite green (python -m pytest -q) at HEAD; conductor validation digest validation:v1:<sha> recorded in the shipping PR
+
+### Validation verdict cache: sound-and-load-bearing, or remove (delegations)
+- id: `rm-273` | track: reliability | priority: 96.0 | status: candidate
+- acceptance: EITHER the verdict cache becomes sound AND load-bearing — key digests bounded content (or count+size with no 2000-entry walk truncation cliff), LRU eviction instead of whole-cache clear, and a HIT skips the duplicate full validation (perf test proves work actually saved) — OR the cache is removed and the call site keeps the fresh verdict; either way a regression test mutates a workspace file after caching and asserts the verdict recomputes (stale-SATISFIED cannot survive); the _manifest_cacheable fence (:719-726, excludes review_required / no_forbidden_actions) is preserved unchanged; PR re-cites the product invariant "Work Contract completion is validated from observed state and fails closed"
+- evidence: operator_delegations.py:679-680 (cache, cap 256 clear()), :683-717 scope signature truncating at 2000 entries (:712-716), :733-753 lookup, :1131-1135 full validation runs THEN fresh verdict overwritten by cached, :1207 verified_success trusts it; research 389c9f6b RC4; run 1a228399 assess
+
+### Dependency security floors: starlette / anyio / cryptography (OSV-verified)
+- id: `rm-272` | track: reliability | priority: 95.0 | status: candidate
+- acceptance: pyproject floors raised to starlette>=1.4, anyio>=4.14.2, cryptography>=50.0.0 with the mcp co-resolution constraint proven in BOTH CI SDK lanes (mcp 1.28.x and 2.2/2.3.x resolve cleanly against the new floors — resolver output diffed before/after, no silent upgrade of unrelated pins); OSV querybatch evidence attached showing 0 vulns at the new floors for the resolved set; CHANGELOG security note; full suite + range lane green
+- evidence: OSV live probe 2026-10-05 /tmp/389c9f6b-research/osv_probe.json — starlette 0.40.0=14 vulns (1.4.0=0, 1.0.0=10), cryptography 42.0.0=15 (50.0.0=0, 50.0.2 latest clean), anyio 4.0.0=4 (4.14.2=0, 4.15.1 clean); mcp 1.30.0/2.2.0/2.3.0 + uvicorn/pydantic/fastapi/httpx clean; research 389c9f6b RC3
+
+### Swarm/codex store locking + one durable atomic-write helper (dir fsync)
+- id: `rm-274` | track: reliability | priority: 92.0 | status: candidate
+- acceptance: sw-*.json mutations serialize on the (currently dead) RLock or an equivalent per-file lock; saves use unique-adjacent temp names with file fsync AND parent-dir fsync via ONE shared atomic-write helper, adopted for the other durable state writers (autopilot/cron/workspace/controller/job-supervisor); a two-thread test interleaves load->mutate->save and asserts no lost update — the final human approval gate cannot be reverted by a racing save; test_operator_swarm.py gains the concurrency case
+- evidence: operator_swarm.py:165 RLock never acquired (operator_codex.py:32 identical); _save_workflow :560-567 fixed shared '.json.tmp', no fsync; unlocked caller pairs :1113/:1316, :1403/:1580, :1715/:1770 on the MCP thread pool; run 1a228399 assess N2 re-verified at HEAD
 
 ### Refactor 20 high-complexity function(s)
 - id: `rm-001` | track: reliability | priority: 90.0 | status: candidate
@@ -66,10 +81,26 @@
 - acceptance: the WS loop advances its cursor to the returned next_cursor on empty pages too (or an equivalent watermark adoption), preserving rm-080's snapshot-ordering guarantee (a concurrent insert is delivered or rescanned, never skipped); a regression test asserts an idle filtered WS client advances past N non-matching events without rescanning them; the docs/live-events.md cursor-semantics paragraph holds verbatim
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
 
+### Finance worker request_id quarantine (prompt-injection)
+- id: `rm-276` | track: reliability | priority: 85.0 | status: candidate
+- acceptance: request_id (and any caller-controlled field) is rendered only inside the EVIDENCE_JSON quarantine block or excluded from the INSTRUCTION section entirely; operator_finance.py validates an identifier charset matching its error text (bounded opaque identifier, e.g. [A-Za-z0-9._-]{1,128}); an injection test proves a request_id containing instruction-like content cannot alter the worker's instruction parse
+- evidence: finance_worker.py:91-92 interpolates into INSTRUCTION outside the :103 quarantine; operator_finance.py:143-148 accepts any 1-128 chars; run 1a228399 assess N3
+
+### SSE stream resume: surface the discarded id: cursor
+- id: `rm-275` | track: reliability | priority: 80.0 | status: candidate
+- acceptance: readSseStream returns the last id: cursor (replacing the 'void seq;' discard); reconnectStream gains a real caller on the ChatPage error/reconnect path replaying from that cursor against the server ring; a web test proves mid-stream disconnect resumes without duplicate side effects AND retry-after-error does NOT re-send the user message (reconnect must be distinguishable from a new turn); server replay path (ui_chat.py) unchanged
+- evidence: web/src/api/client.ts:121-123 parses id: into seq then :137 discards it; reconnectStream web/src/api/chat.ts:47 zero callers; server replay already implemented (ui_chat.py replay ring); ChatPage error Retry currently re-sends lastUserMessage (double tool side-effects); research 389c9f6b RC7 + run 1a228399 assess N4
+
+### TLS minimum_version floors on both server contexts
+- id: `rm-277` | track: reliability | priority: 78.0 | status: candidate
+- acceptance: both TLS server contexts set minimum_version explicitly (>= TLSv1_2, consistent with the rm-272 floors); a test asserts the negotiated protocol floor through a wrapped client; docs note the floor; operator_fabric.py and operator_fabric_g4c.py both covered
+- evidence: operator_fabric.py:2977 + operator_fabric_g4c.py:2068 build ssl.SSLContext(PROTOCOL_TLS_SERVER) with no minimum_version (TLS 1.0/1.1 possible on py3.10/3.11 defaults); research 389c9f6b RC9
+
 ### Python floor bump 3.10->3.11 plus a 3.13 CI lane (dated deadline)
 - id: `rm-100` | track: reliability | priority: 75.0 | status: candidate
 - acceptance: CI matrix adds a green 3.13 lane (and 3.14 if deps allow); a dated plan lands the 3.11 floor bump with the next fork release (requires-python >=3.11, matrix drops 3.10, tomli conditional removed); CHANGELOG records both
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
+- update 2026-10-05 (research 389c9f6b RC11): the dated deadline has LAPSED — Python 3.10 EOL passed 2026-10-01 (endoflife.date, PEP 619) while requires-python>=3.10 (pyproject.toml:10), the 3.10 CI axis, and the tomli conditional (:13) all remain; a security-sensitive local server now runs a dead interpreter line as its floor. Prioritize the 0.15.0 floor bump (3.11 EOL is 2027-10-31).
 
 ### cron next-fire + timezone preview at arm time
 - id: `rm-132` | track: reliability | priority: 72.0 | status: in_progress
@@ -80,16 +111,19 @@
 - id: `rm-048` | track: reliability | priority: 70.0 | status: in_progress
 - acceptance: docs/mcp-compatibility.md corrected to describe the revision lineage per SDK family instead of claiming one "latest"; the rm-009 revision assertion parameterized per installed SDK pin (still fails loudly on unexpected revisions); a mcp==2.3.x lane added to CI (or pins refreshed per rm-009's cadence rule) with a spec-delta review note for hermes surfaces; MCP-Auth cross-RFC notes (RFC 9728/9700 now Proposed Standard, draft-ietf-oauth-parallel-refresh adopted) reflected in docs/oauth.md where they touch hermes behavior
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
+- update 2026-10-05 (research 389c9f6b RC12/RC18): exact pins frozen at mcp 1.30.0/2.2.0 under a stale 'research 2026-09-20' comment (ci.yml:47-55) while the >=2,<3 range lane silently resolves 2.3.0 (repo impact verified zero: no httpx dep, zero x-mcp-header annotations, no ctx.meta consumers); land the mcp==2.3.0 exact-pin lane + refresh the comment; fold subscriptions=False (mcp 2.3 surface reduction — zero repo consumers).
 
 ### Ship or document a browser-UI build path (web assets absent from wheel/MANIFEST)
 - id: `rm-077` | track: reliability | priority: 70.0 | status: candidate
 - acceptance: EITHER the wheel/sdist carries a prebuilt web/dist (with a package-hygiene assertion), OR README + docs/operator-mode.md document the exact supported build step (npm ci && npm run build / HERMES_GPT_UI_DIR) verified to produce a served UI; tools/check_package_hygiene.py extended to match whichever path is chosen
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
+- update 2026-10-05 (run 27b7fb9ea997): re-verified at config level (packaging diff empty since 5a9878d4ef) — clean checkouts still build zero-UI packages while CHANGELOG 0.13.0 states 'release packages include the built browser assets'; only the CI artifact-fed path ships the UI. Whichever branch of the EITHER is chosen, the CHANGELOG claim and the tools/check_package_hygiene.py assertions must match it (see also rm-056).
 
 ### fork distribution identity: local version segments or never-publish
 - id: `rm-133` | track: reliability | priority: 68.0 | status: candidate
 - acceptance: decision recorded FIRST — (a) local version segment (e.g. 0.12.0+codeo1io or +<line-tag>) on fork releases, or (b) explicit never-publish-on-PyPI policy with a private index — in RELEASE_CHECKLIST.md + README; artifact metadata carries line provenance (commit or origin URL) so pip + doctor distinguish codebases; doctor VERSION line gains the line identity (extends operator_diagnostics.py:904); decision + implementation land BEFORE any 0.13-numbered fork release.
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
+- update 2026-10-05 (research 389c9f6b RC10, PyPI live): upstream published hermes-gpt==0.14.0 to PyPI on 2026-10-04T01:16Z (0.13.0 the day before) — the fork declares the identical name+version (pyproject.toml:5-6) and can NEVER publish 0.14.0 under this name; the decision (never-publish policy / distribution rename / origin preflight in the updater, cf. rm-042) now BLOCKS any 0.15-numbered release work and the pip-mode updater path (updater.py:143-158 installs public-PyPI hermes-gpt into fork installs — escalation recorded).
 
 ### Extend skill validation to Work Contract and Swarm dispatch (hermetic #76 semantics)
 - id: `rm-054` | track: reliability | priority: 65.0 | status: candidate
@@ -105,6 +139,7 @@
 - id: `rm-134` | track: reliability | priority: 63.0 | status: candidate
 - acceptance: state-changing (POST) routes reject Sec-Fetch-Site: cross-site requests and Origin headers outside the allowed set (UI origin + chatgpt.com + issuer), and require Content-Type: application/json on JSON-body routes; the ChatGPT-side origin keeps working (it is in the CORS list today); non-browser MCP clients unaffected; any escape-hatch env documented; tests cover allow/deny/cross-site/preflight cases.
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
+- update 2026-10-05 (run 27b7fb9ea997 assess + research RC5): SCOPE EXTENDED — also gate the WS handshake (server.py:3187-3192 live_websocket_authorized returns True unconfigured; operator_live_events.py:353-359 accepts with only an optional auth_check, no Origin check) and add a loopback Host allowlist on the oauth pass-through path (oauth_auth.py:1359-1361 DefaultMcpAcceptMiddleware passes requests through untouched when no static bearer is configured and OAuth state is None — no Host/Origin validation), closing the DNS-rebinding route to the loopback listener; ui_ops.py:832 /api/ops/action joins the POST set; default-deny on mismatch documented as compatible with the loopback-default product invariant.
 
 ### Raise build floor to setuptools>=77 (PEP 639 license string)
 - id: `rm-027` | track: reliability | priority: 62.0 | status: in_progress
@@ -115,6 +150,7 @@
 - id: `rm-046` | track: reliability | priority: 60.0 | status: in_progress
 - acceptance: both docs either added to data-files or de-referenced from README/docs map; NEW guard test asserts every docs/*.md link target in README.md and docs/README.md is in data-files (explicit allowlist for intentionally-unshipped historical docs); runtime-checkout.md refreshed or re-labeled as historical; `python -m build` + `twine check dist/*` + tools/check_package_hygiene.py dist/* run with the two docs present
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
+- update 2026-10-05 (run 27b7fb9ea997): fresh counts — 36 docs tracked, 33 in wheel data-files, 23 in sdist; runtime-checkout.md + maintenance-cycle-log.md + vnext-capability-manifest-and-mission-ledger.md ship NOWHERE (the first two are also dependencies of rm-135/rm-136 refreshes).
 
 ### v0.13.0 release-readiness batch: publish + deployed-remote rollout
 - id: `rm-083` | track: reliability | priority: 60.0 | status: candidate
@@ -130,6 +166,7 @@
 - id: `rm-152` | track: reliability | priority: 60.0 | status: in_progress
 - acceptance: usage rows joined/filtered by sessions.started_at >= cutoff with the schema-drift fallback the intent comment describes (missing started_at -> fail loud or explicitly-degraded output, never silently all-time); a new test with a stale pre-cutoff usage row asserted EXCLUDED from _24h sums; the baked test updated to a two-window fixture; full test_operator_mission.py green
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
+- update 2026-10-05 (run 27b7fb9ea997 assess 1a228399 + research 389c9f6b, both at b1dfb2b8ad): SHARPENED — the v0.14 windowing fix is structurally a NO-OP. hermes_state.py:41-43 stores started_at/last_activity_at as REAL epochs (_now()=time.time() :104-105, INSERT :119, UPDATE :177) while operator_mission.py:904/:1415-1417/:1432-1436 compare ISO TEXT cutoffs; sqlite storage-class ordering (every REAL sorts below every TEXT) makes every window predicate ALWAYS FALSE — in-memory probe: a future-dated REAL epoch vs an ISO string cutoff matches 0 rows, vs a REAL cutoff 1 row. sessions_7d/sessions_24h/tokens_24h/cost_24h are structurally zero. Correct fix supersedes the acceptance above: unify BOTH sides to epoch REAL (or both to ISO TEXT) — never re-window; add a metric regression test seeding a recent REAL session row and asserting nonzero windows; correct the CHANGELOG 0.14.0 rm-152 bullet (it documents a no-op fix; see rm-056). Scope note: ui_chat.py:284 'last_active' is the agent SessionDB interface key (rt.activity AS last_active) and is NOT part of this defect — do not bundle.
 
 ### declare the browser-UI agent-runtime cross-project seam
 - id: `rm-136` | track: reliability | priority: 58.0 | status: candidate
@@ -140,6 +177,11 @@
 - id: `rm-038` | track: reliability | priority: 55.0 | status: candidate
 - acceptance: master branch protection requires the CI test+lint jobs with linear history; direct pushes restricted to admins; a red push/PR is observed to be rejected once
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
+
+### SHA-pin the hermes-agent CI checkout; nightly drift lane
+- id: `rm-278` | track: reliability | priority: 55.0 | status: candidate
+- acceptance: the agent-loader job checks out NousResearch/hermes-agent at an immutable SHA for PR/push lanes, with a separate nightly unpinned drift lane that fails loudly (or opens an issue) on tip movement; the comment states the pin policy and last-verified date; a third-party HEAD rename can no longer break a required lane at will
+- evidence: ci.yml:117-126 unpinned checkout (verified at HEAD 2026-10-05; tip af90026aa moved same-day on 10-04 — moving target); research 389c9f6b RC13
 
 ### Bound pyyaml (the last bare runtime dependency)
 - id: `rm-040` | track: reliability | priority: 55.0 | status: in_progress
@@ -192,6 +234,7 @@
 - id: `rm-035` | track: reliability | priority: 50.0 | status: candidate
 - acceptance: a committed [tool.ruff] selects the enforced rule set explicitly; dev pin moves to a 0.16.x line; CI lint job green under the pinned ruff; a finding-count table (classic vs adopted set) with per-class disposition lands in the PR
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
+- update 2026-10-05 (research 389c9f6b RC14): urgency ordering matters — ruff 0.16.10 walls with 497 new-rule errors out-of-pin while 0.15.22 is clean at HEAD, so land the [tool.ruff] rule selection BEFORE the next pin bump; also bound the dev extras (pytest/build/twine/keyring unbounded at pyproject.toml:31-42 + dependency-groups mirror).
 
 ### Regenerate .gitleaksignore against HEAD-reachable history and prune foreign refs
 - id: `rm-055` | track: reliability | priority: 50.0 | status: candidate
@@ -222,6 +265,7 @@
 - id: `rm-056` | track: reliability | priority: 45.0 | status: in_progress
 - acceptance: CHANGELOG Unreleased entry documents the fail-closed semantics with an upgrade note for plans referencing unresolvable skills; the shipped-docs guard (rm-046 remainder) covers any new docs; the F8 docstring corrected to describe directory-count semantics (or the counter fixed to count entries, with a test); AGENTS.md "behavior changes → CHANGELOG" rule satisfied for this and future validation-gate landings
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
+- update 2026-10-05 (run 27b7fb9ea997 + research RC20): three CHANGELOG claims verified false/no-op at the adopted tree — 0.13.0 'release packages include the built browser assets' (clean checkout ships zero; rm-077), 0.13.0 'CI exercises the Python/MCP matrix on Windows and Linux' (windows job parses 2 PowerShell examples only), 0.14.0 rm-152 windowing bullet (structurally no-op; rm-152); fold their corrections into this bundle or the owning items.
 
 ### Harden token/key file staging beyond chmod-after-write
 - id: `rm-153` | track: reliability | priority: 45.0 | status: in_progress
@@ -278,6 +322,11 @@
 - acceptance: CI compiles every tracked *.py (compileall on the package or a generated list — no hand-maintained registry); a drift unit test fails when a tracked root module is missing from py-modules (the one registry that must stay curated)
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
 
+### Release-asset dedupe + tracked-artifact hygiene
+- id: `rm-280` | track: reliability | priority: 30.0 | status: candidate
+- acceptance: one source of truth for release images (assets/ only, or build-time copy) with the 9 exact-path duplicate files removed; site/ rendered output untracked (vercel builds from source) or its role documented in the docs/README authority map per rm-045; test_verify.py's hardcoded C:/Users/asimo path removed or the file made a real test; tracked .conductor/ spool files untracked (fleet precedent a462f5e5bb); repo-size delta cited in the PR
+- evidence: assets/ 7.1MB + site/assets/ 7.1MB = 14.2MB tracked binaries, 20 files, 9 exact-path duplicates (comm -12, research 389c9f6b RC19); run 1a228399: 212 tracked .conductor/ files, vercel.json + site/vercel.json both tracked, test_verify.py C:/Users/asimo literal
+
 ### Remove the misleading operator_events `queried` allowlist indirection
 - id: `rm-079` | track: reliability | priority: 30.0 | status: in_progress
 - acceptance: filter once at the boundary and pass the filtered set (warning preserved on all paths), or drop the `queried` computation entirely; behavior for allowed/denied mixtures locked by tests on both list paths
@@ -293,6 +342,11 @@
 - acceptance: the check's detail text marks it "in-process only" (or reports the serving-process identity it introspected) and docs/operator-mode.md states the caveat; optional follow-on note names the durable-audit-log alternative if cross-process authority is ever needed.
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
 
+### A2A fabric conformance smoke lane
+- id: `rm-279` | track: reliability | priority: 25.0 | status: candidate
+- acceptance: a pinned a2a-sdk reference peer exercises the operator_fleet A2A fabric (agent-card fetch + one task round-trip) as a dev-lane smoke test, skip-if-not-installed with an owner note per rm-101 policy; uses peer-relative artifact paths so it rides rm-271's local-vs-remote workspace split rather than assuming local-absolute paths
+- evidence: python a2a-sdk 1.2.1 / npm @a2a-js/sdk 1.3.0 (live 2026-10-05); operator_fleet.py ships zero conformance coverage today; research 389c9f6b RC16
+
 ### Small reliability bundle: cron zero-interval floor, placement walk reuse, preview parity
 - id: `rm-057` | track: reliability | priority: 25.0 | status: in_progress
 - acceptance: schedule parser rejects or floors zero/negative intervals with a dedicated test; targets/manifest walk memoized per (root, sources) with bounded TTL and invalidation on profile changes (perf probe shows repeat-call reuse); no residual preview/score divergence after rm-054's refactor
@@ -303,6 +357,11 @@
 - acceptance: each environment-dependent skip carries an owner note or becomes a hard condition; an autouse fixture resets audit-log override state between tests; full suite green with the fixture in place and no ordering-dependent failures
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
 - update 2026-10-04 (campaign 5260fbbbcd3a cycle 3, run efe7657638c7, pre-review/uncommitted): implemented as batch rider — conftest.py gains autouse `_reset_audit_log_override` (snapshot/restore of `operator_policy._audit_log_override` around every test, conftest.py:177) and new test_suite_determinism.py pins both acceptance halves: every environment-dependent `skipif` is registered in an inventory guard (`test_environment_dependent_skipif_inventory_is_registered`, test_suite_determinism.py:42 — new environment-dependent skips fail the guard until registered) plus an audit-override leak pair (`test_audit_override_leaks_on_purpose` :64 / `test_audit_override_did_not_leak_from_previous_test` :70); recorded batch validation green at this delta: targeted command RC=0 (/tmp/5dcc0dec-targeted/run1.log) and full gate GATE_RC=0 (envelope result-2088694-354043546.json, digest `validation:v1:162865e8e0aedadbb4b9c06760278e38af343ef5814c42970939b776d2f21629`, 1812 outcomes, 0 failed/0 errored); status flip deferred to the landing gate per campaign convention
+
+### MCP elicitation consent surface (EXPLORATORY, Owner-gated)
+- id: `rm-281` | track: reliability | priority: 20.0 | status: candidate
+- acceptance: EXPLORATORY and Owner-gated — nothing ships without an explicit Owner decision recorded in the cycle log; any surface is consent-UX adjacent to EXISTING approval gates and a test proves elicitation responses cannot complete an approval node (Owner-only approval invariant re-cited); implementation uses the mcp 2.x types-level API only (no MCPServer elic* API exists — verified by probe); docs/mcp-compatibility.md records the SDK capability boundary
+- evidence: mcp 2.x ships ElicitRequest/Form/Url/Tasks types + ElicitResult in mcp.types with ZERO elic* methods on MCPServer (probe, research 389c9f6b RC17); repo-wide elicitation usage is zero (one historical v0.7 research mention); approval-bypass direction explicitly rejected
 
 ### subscriptions/listen alignment study (deferred until a push consumer exists)
 - id: `rm-014` | track: reliability | priority: 20.0 | status: in_progress
@@ -323,6 +382,11 @@
 - id: `rm-044` | track: reliability | priority: 12.0 | status: in_progress
 - acceptance: dependencies removed (clean install + green web build) or sanitization genuinely wired with a test proving raw HTML is stripped
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
+
+### Upstream feat/gemini-spark-integration adoption watch (no action until merged upstream)
+- id: `rm-293` | track: reliability | priority: 10.0 | status: candidate
+- acceptance: WATCH ITEM — no repo action while the upstream branch stays unmerged (tip 2a50749a06, 7 commits, unchanged 2026-10-05); when upstream merges it, record an explicit adoption decision in the cycle log and mint or extend an adoption item covering the opt-in Gemini Spark OAuth client profile built on the existing OAuth client-profile registry (the sanctioned extension point) — never the moving branch itself; docs/oauth.md notes reviewed as part of that decision
+- evidence: research 389c9f6b RC15 — branch not in upstream master and no upstream master movement since #90 (2026-10-04); fork is current (144 ahead / 0 behind) so this is a future adoption wave, not a catch-up gap; branch delta is docs extending OAuth notes
 
 ## Closed items
 
@@ -346,5 +410,6 @@
 - `rm-031` Repo-wide compile check; drift-guard the manual registries — superseded
 - `rm-032` MCP 2026-07-28 minor-spec adoption and SDK-3.0 proofing — superseded
 - `rm-033` Bound pyyaml (last bare runtime dependency) — superseded
+- `rm-098` Adopt upstream v0.13 Autopilot (9-commit gap; PR #82) — done via the v0.14.0 adoption wave: tree d163cda227 carries the upstream content ancestry-stitched (CHANGELOG 0.13.0 + 0.14.0 present); full suite 1874 passed / 5 skipped / 0 failed at b1dfb2b8ad (run 27b7fb9ea997 assess)
 
 <!-- managed by hermes-roadmap render; do not edit by hand -->
