@@ -18,11 +18,7 @@
 - id: `rm-081` | track: reliability | priority: 115.0 | status: candidate
 - acceptance: merged tree reconciles fork+upstream halves into a single resolution authority; loader failure is fail-closed with a test proving a required-but-unloadable skill blocks dispatch; probes use preprocess=False with a test asserting inline_shell side effects never run during validation; fork surfaces (plan create/validate/placement) keep enforcement at parity with upstream's breadth (work contracts/swarm); full suite + upstream's new tests green on both SDK lanes
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
-
-### Adopt upstream v0.13 Autopilot (9-commit gap; PR #82)
-- id: `rm-098` | track: reliability | priority: 115.0 | status: candidate
-- acceptance: the 9 upstream commits merge or cherry-pick onto the fork line with conflicts reviewed line-by-line against fork invariants (Owner Mode break-glass, secret-path denials, default read-only; Autopilot stays default-off at adoption); full suite green in CI shape; CHANGELOG records the catch-up; #83/#84 recorded as follow-on once merged upstream
-- evidence: campaign-recorded in hermes-gpt ROADMAP.md
+- update 2026-10-05 (cycle 3 research, run eaa40f1e21d6): upstream issue #74 closed 2026-09-29, resolved by merged PR #81 ("Fix profile-aware skill validation across planning and dispatch"); the fork line contains it (0 behind upstream master at 2026-10-05), so the upstream half is now an in-tree reconcile reference — the fork-half parity work is what remains open
 
 ### Move blocking SQLite off the serving event loop (ui_chat + live-events WS)
 - id: `rm-076` | track: reliability | priority: 110.0 | status: in_progress
@@ -51,11 +47,6 @@
 - acceptance: long-poll waits no longer occupy shared threadpool tokens — a dedicated anyio.CapacityLimiter (anyio.to_thread.run_sync(limiter=...) verified in .venv) for wait-bearing endpoints, or an asyncio-native wait bridge; a regression test saturates the shared limiter with 40 holders and asserts a mission-events request still completes; existing mission-events behavior (25s max wait, event delivery, cursor semantics) unchanged
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
 
-### ui_ops cron-dispatch semaphore leaks on resolve failure
-- id: `rm-131` | track: reliability | priority: 90.0 | status: in_progress
-- acceptance: dispatch-path ordering fixed — resolve root (and any other raising validation) BEFORE acquiring the semaphore, or try/finally the acquire→dispatch span so every exit releases the token; regression test injects a `_resolve_root` failure and asserts (a) a clean error response, (b) semaphore capacity unchanged — a subsequent dispatch is NOT 429-capped — repeated > `_CRON_DISPATCH_LIMIT` times.
-- evidence: campaign-recorded in hermes-gpt ROADMAP.md
-
 ### Registry and bound for fire-and-forget cron dispatch, with completion audit
 - id: `rm-097` | track: reliability | priority: 88.0 | status: in_progress
 - acceptance: cron dispatch goes through a bounded executor with an operator-visible registry (active/finished counts surfaced via doctor or an ops live event); a completion record (success/failure + duration) lands in the audit trail when the run finishes, not at dispatch; a cap-exceeded request is rejected loudly (429-class) like ui_chat; tests cover dispatch, completion-audit ordering, injected-failure audit, and cap rejection
@@ -66,20 +57,37 @@
 - acceptance: the WS loop advances its cursor to the returned next_cursor on empty pages too (or an equivalent watermark adoption), preserving rm-080's snapshot-ordering guarantee (a concurrent insert is delivered or rescanned, never skipped); a regression test asserts an idle filtered WS client advances past N non-matching events without rescanning them; the docs/live-events.md cursor-semantics paragraph holds verbatim
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
 
+### Standalone dependency-floor raise: starlette>=1.4, cryptography>=50, anyio>=4.14.2
+- id: `rm-306` | track: reliability | priority: 85.0 | status: candidate
+- acceptance: pyproject floors raised in ONE standalone PR — starlette >=0.40,<2 -> >=1.4,<2 (pyproject:29), cryptography >=42 -> >=50 (pyproject:20), anyio >=4,<5 -> >=4.14.2,<5 (pyproject:30); co-resolution proven in both CI SDK lanes (mcp 1.28.1 and 2.3.0 both pin starlette>=0.27; mcp 2.3.0 pins anyio>=4.9); CI green across the full matrix after the raise; an OSV re-probe of the new floors reports 0 known advisories (old floors: starlette 0.40.0=14 + cryptography 42.0.0=15 + anyio 4.0.0=4 = 33, api.osv.dev 2026-10-05); CHANGELOG records the raise with the advisory counts
+- evidence: research cycle 3 run eaa40f1e21d6 attempt b6f5f0f9 (/tmp/b6f5f0f9-research/research-candidates.md C1)
+
+### Pin + contract-test the hermes-agent CI interface
+- id: `rm-307` | track: reliability | priority: 78.0 | status: candidate
+- acceptance: ci.yml hermes-agent checkout (:121-135) gains a ref: pin with a dated rotation rule (sentinel-pin precedent ci.yml:23-28); a contract test freezes the consumed surface (SessionDB row keys, incl. the last_active alias consumed at ui_chat.py:284) and fails loudly when the pinned ref's shape drifts; every tip bump is a deliberate dated PR (the tip moved 3x on 2026-10-04 alone: af90026aa -> 8567d8a243 -> 439334127f)
+- evidence: research cycle 3 run eaa40f1e21d6 attempt b6f5f0f9 (/tmp/b6f5f0f9-research/research-candidates.md C2); gh api NousResearch/hermes-agent 2026-10-05
+
 ### Python floor bump 3.10->3.11 plus a 3.13 CI lane (dated deadline)
 - id: `rm-100` | track: reliability | priority: 75.0 | status: candidate
 - acceptance: CI matrix adds a green 3.13 lane (and 3.14 if deps allow); a dated plan lands the 3.11 floor bump with the next fork release (requires-python >=3.11, matrix drops 3.10, tomli conditional removed); CHANGELOG records both
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
+- update 2026-10-05 (cycle 3 research, run eaa40f1e21d6): Python 3.10 EOL passed 2026-10-01; every exact-pin SDK lane still runs python 3.10 (ci.yml:51-56) and requires-python stays >=3.10 — execute the 3.11 floor with 0.15.0, not later
 
 ### cron next-fire + timezone preview at arm time
 - id: `rm-132` | track: reliability | priority: 72.0 | status: in_progress
 - acceptance: hermes_cron_create dry-run plan (and the browser-UI confirm surface) include next-N (>= 3) computed fire times plus the effective timezone name used to resolve them; works for interval, daily-time, weekday, and once schedules; plan does not imply the external scheduler's tz is authoritative (contract documented in docs/operator-mode.md cron section); tests cover each schedule kind including a TZ-set environment.
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
 
+### CHANGELOG Unreleased + docs truth for fork PRs #29/#30/#31
+- id: `rm-308` | track: reliability | priority: 72.0 | status: candidate
+- acceptance: CHANGELOG gains an Unreleased section recording the v0.14 adoption (#29), the mcp_compat supersession (PR #30), and the typed approval_policy field (PR #31); docs/missions.md documents approval_policy alongside final_approval_required (:17,29) with defaults and gates per AGENTS.md docs rules; docs/README.md authority map reviewed for the new field; AGENTS.md release-discipline list satisfied
+- evidence: research cycle 3 run eaa40f1e21d6 attempt b6f5f0f9 (/tmp/b6f5f0f9-research/research-candidates.md C4); git grep approval_policy origin/master -- docs/* README.md CHANGELOG.md -> empty; CHANGELOG top section 0.14.0 (2026-10-03), no Unreleased
+
 ### MCP spec-revision lineage refresh + SDK 2.3.x lane
 - id: `rm-048` | track: reliability | priority: 70.0 | status: in_progress
 - acceptance: docs/mcp-compatibility.md corrected to describe the revision lineage per SDK family instead of claiming one "latest"; the rm-009 revision assertion parameterized per installed SDK pin (still fails loudly on unexpected revisions); a mcp==2.3.x lane added to CI (or pins refreshed per rm-009's cadence rule) with a spec-delta review note for hermes surfaces; MCP-Auth cross-RFC notes (RFC 9728/9700 now Proposed Standard, draft-ietf-oauth-parallel-refresh adopted) reflected in docs/oauth.md where they touch hermes behavior
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
+- update 2026-10-05 (cycle 3 research, run eaa40f1e21d6): exact-pin includes remain mcp 1.28.1/2.0.0/1.30.0/2.2.0 (ci.yml:51-56, all python 3.10) under a stale 'research 2026-09-20' comment while mcp 2.3.0 shipped 2026-10-02 — the 2.3.x lane (or pin refresh) is still the open half
 
 ### Ship or document a browser-UI build path (web assets absent from wheel/MANIFEST)
 - id: `rm-077` | track: reliability | priority: 70.0 | status: candidate
@@ -90,6 +98,7 @@
 - id: `rm-133` | track: reliability | priority: 68.0 | status: candidate
 - acceptance: decision recorded FIRST — (a) local version segment (e.g. 0.12.0+codeo1io or +<line-tag>) on fork releases, or (b) explicit never-publish-on-PyPI policy with a private index — in RELEASE_CHECKLIST.md + README; artifact metadata carries line provenance (commit or origin URL) so pip + doctor distinguish codebases; doctor VERSION line gains the line identity (extends operator_diagnostics.py:904); decision + implementation land BEFORE any 0.13-numbered fork release.
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
+- update 2026-10-05 (cycle 3 research, run eaa40f1e21d6): ESCALATED, decision forced — upstream hermes-gpt 0.14.0 is live on public PyPI (2026-10-04T01:16Z), the fork declares the same name+version (pyproject:6-7), and pip-mode update runs 'pip install --upgrade hermes-gpt' (updater.py:200 via _pip_update :176-200), so a pip-mode fork update SUBSTITUTES upstream code into a fork install; land the decision (VCS-pin / rename / origin-preflight) before the next fork-numbered release
 
 ### Extend skill validation to Work Contract and Swarm dispatch (hermetic #76 semantics)
 - id: `rm-054` | track: reliability | priority: 65.0 | status: candidate
@@ -105,6 +114,11 @@
 - id: `rm-134` | track: reliability | priority: 63.0 | status: candidate
 - acceptance: state-changing (POST) routes reject Sec-Fetch-Site: cross-site requests and Origin headers outside the allowed set (UI origin + chatgpt.com + issuer), and require Content-Type: application/json on JSON-body routes; the ChatGPT-side origin keeps working (it is in the CORS list today); non-browser MCP clients unaffected; any escape-hatch env documented; tests cover allow/deny/cross-site/preflight cases.
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
+
+### Provision the missions artifacts workspace before spawn
+- id: `rm-309` | track: reliability | priority: 62.0 | status: candidate
+- acceptance: the per-mission artifacts workspace (missions/artifacts/<task>) exists before operator_runners spawns a process with it as cwd (operator_runners.py:768) and before autopilot grants its allowed_scope (operator_autopilot.py:966) — created at mission/node creation with restrictive mode; the only existing mkdir in the operator path is operator_mission_runtime.py:131 (missions.db parent); regression test runs a fresh-root mission end-to-end and asserts no missing-cwd spawn failure; full test_operator_mission.py green
+- evidence: research cycle 3 run eaa40f1e21d6 attempt b6f5f0f9 (/tmp/b6f5f0f9-research/research-candidates.md C8, assess N1 carried); anchors re-read at HEAD d163cda227 2026-10-05
 
 ### Raise build floor to setuptools>=77 (PEP 639 license string)
 - id: `rm-027` | track: reliability | priority: 62.0 | status: in_progress
@@ -131,10 +145,20 @@
 - acceptance: usage rows joined/filtered by sessions.started_at >= cutoff with the schema-drift fallback the intent comment describes (missing started_at -> fail loud or explicitly-degraded output, never silently all-time); a new test with a stale pre-cutoff usage row asserted EXCLUDED from _24h sums; the baked test updated to a two-window fixture; full test_operator_mission.py green
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
 
+### Public-repo self-hosted-runner policy guard
+- id: `rm-310` | track: reliability | priority: 60.0 | status: candidate
+- acceptance: a workflow-lint step (CI job or tools/ script) fails any change that introduces runs-on: self-hosted while gh visibility is PUBLIC, across ci.yml, publish.yml, and future workflows, with the escape hatch tied to visibility (or a recorded Owner override); a test exercises the guard against a fixture workflow containing the violation; the guard docstring cites the 608bf6a05f policy ("no self-hosted runners against public repos, period")
+- evidence: research cycle 3 run eaa40f1e21d6 attempt b6f5f0f9 (/tmp/b6f5f0f9-research/research-candidates.md C6); 608bf6a05f commit message admits 12+ accidental public-CI-on-self-hosted runs (latest 2026-10-04 18:22) before the fix
+
 ### declare the browser-UI agent-runtime cross-project seam
 - id: `rm-136` | track: reliability | priority: 58.0 | status: candidate
 - acceptance: the seam is DECLARED — vendored/stubbed interfaces behind an explicit boundary module, OR a documented contract (which external tree provides them, at what version) + an import-contract test that runs on the clean checkout and fails LOUDLY (never silent IMPORT_UNAVAILABLE) when the declared provider is missing; pyproject/docs name the external requirement; if a degradation path is kept, it is visible in doctor.
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
+
+### Supersession sweep: fork-diff classification + upstream-parity tracking
+- id: `rm-311` | track: reliability | priority: 58.0 | status: candidate
+- acceptance: a tools/ script + docs procedure classify the fork-vs-upstream diff (334 files, +12118/-963, 227 fork-only at 2026-10-05) into needed-fork-first / superseded-by-upstream / upstreamable, as an advisory report (never a gate), surfaced via doctor or a scheduled job; mcp_compat.py (byte-identical post-#30) is the seed row; every upstream-adoption PR records its sweep delta; the parity trend is stated in docs
+- evidence: research cycle 3 run eaa40f1e21d6 attempt b6f5f0f9 (/tmp/b6f5f0f9-research/research-candidates.md C5); PR #30 doctrine ("when upstream provides a capability, the fork must not retain its own implementation"); git diff upstream/master..HEAD --stat 2026-10-05
 
 ### Branch protection on codeo1io master (extends rm-008 with red-master evidence)
 - id: `rm-038` | track: reliability | priority: 55.0 | status: candidate
@@ -160,6 +184,7 @@
 - acceptance: macOS binds the full runtime_roots list (or a comment documents why one root suffices on Darwin) with a unit test covering multi-root env-shebang resolution
 - acceptance: authorize success and error redirects include iss=<issuer>; AS metadata advertises authorization_response_iss_parameter_supported: true; tests pin both; docs note added
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
+- update 2026-10-05 (cycle 3 research, run eaa40f1e21d6): sharpened — upstream now owns the hermes-gpt PyPI name at 0.14.0 while the fork declares the identical name+version (pyproject:6-7), so the drift guard's divergence report must distinguish codebases, not just versions (pairs with rm-133's forced decision)
 
 ### Serve the curated skill set via the official MCP Skills extension (read-only)
 - id: `rm-082` | track: reliability | priority: 55.0 | status: candidate
@@ -170,6 +195,7 @@
 - id: `rm-099` | track: reliability | priority: 55.0 | status: in_progress
 - acceptance: pyproject declares starlette and anyio with bounds consistent with the resolved floor (e.g. starlette>=0.40,<2; anyio>=4,<5) and a comment naming mcp[cli] as the existing transitive source; CI installs green on the declared range; the declaration introduces no version drift (resolver output unchanged before/after)
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
+- update 2026-10-05 (cycle 3 research, run eaa40f1e21d6): the declaration is in the tree at HEAD (pyproject:29-30 starlette/anyio bounds + the rm-099 mcp[cli] transitive-source comment); status flip deferred to the landing gate; rm-306 proposes RAISING both floors past these bounds
 
 ### Document the convergence-shipped OAuth surface and repair the CHANGELOG
 - id: `rm-034` | track: reliability | priority: 52.0 | status: candidate
@@ -187,6 +213,7 @@
 - acceptance: bullet repaired; Unreleased section enumerates the user-visible converged changes; AGENTS.md release-discipline review list satisfied
 - acceptance: study recorded (wire shape, SDK-2-only constraints, 1.28.1 degradation matrix, client-support reality); if adopted: one operator mutation tool returns InputRequiredResult with a dual-SDK test proving graceful refusal on 1.x; docs/mcp-compatibility.md gains a SEP-2322 section
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
+- update 2026-10-05 (cycle 3 research, run eaa40f1e21d6): the publish-job rider is satisfied at origin/master (608bf6a05f: runs-on ubuntu-latest + environment: pypi + id-token: write + pypa/gh-action-pypi-publish@release/v1, publish.yml:14-30) — one trusted-publishing verification run closes that rider
 
 ### Commit a [tool.ruff] rule-set config on ruff 0.16 (extends run-fd2bc85f rm-028)
 - id: `rm-035` | track: reliability | priority: 50.0 | status: candidate
@@ -201,11 +228,6 @@
 ### Conformance-check skill resolution against the PUBLISHED MCP Skills extension (extends run-684b9786 rm-028 / PR #20)
 - id: `rm-036` | track: reliability | priority: 48.0 | status: candidate
 - acceptance: conformance note mapping hermes skill surfaces onto the published extension (naming, discovery roots, precedence); PR #20's tests verified against it; upstream #74 outcome recorded when it lands (contract agreed architecture-first per run-684b9786 rm-028)
-- evidence: campaign-recorded in hermes-gpt ROADMAP.md
-
-### SHA-pin the reusable private-leak-sentinel workflow
-- id: `rm-043` | track: reliability | priority: 48.0 | status: in_progress
-- acceptance: the reusable-workflow reference pins an immutable commit SHA (human-readable branch noted in a comment); a re-pin rotation procedure is documented
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
 
 ### OpenAPI description generated from the 20-route HTTP surface
@@ -248,6 +270,11 @@
 - acceptance: every staging site uses a unique-adjacent temp name (pid+token or mkstemp) created with restrictive mode and atomically replaced; a repo-wide guard test fails on any NEW fixed-name staging path (scan '.tmp' literals constructed without a uniquifier, mirroring the census command `rg -n "\.tmp" --glob '*.py' -g '!test_*'`); the touched files' existing tests stay green; no behavior change beyond the name
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
 
+### approval_policy status observability for the conductor resolver
+- id: `rm-312` | track: reliability | priority: 40.0 | status: candidate
+- acceptance: the mission status summary exposes approval_policy plus parked-since context (awaiting_since vs max_wait_seconds) so the conductor-side resolver (deliberately outside the fork per PRs #30/#31) can observe a parked auto_when_evidence_verified mission without re-reading spec internals; no approval logic moves into the fork (Owner-only approval invariant intact); tests pin the summary shape; docs ride rm-308
+- evidence: research cycle 3 run eaa40f1e21d6 attempt b6f5f0f9 (/tmp/b6f5f0f9-research/research-candidates.md C9); approval_policy lands in the stored spec at origin/master (operator_mission_runtime.py _normalize_approval_policy) with no status-summary surfacing
+
 ### Profile-aware skill-resolution gate before placement/dispatch
 - id: `rm-041` | track: reliability | priority: 38.0 | status: in_progress
 - acceptance: placement/dispatch validates that the target profile can actually resolve each referenced skill at execution time (or fails loudly pre-flight); contract agreed architecture-first with upstream before implementation
@@ -272,6 +299,11 @@
 - id: `rm-139` | track: reliability | priority: 35.0 | status: candidate
 - acceptance: tools/check_roadmap_ids.py validates a given ROADMAP.md — ids unique across id lines (or a documented canonical-occurrence rule for boundary duplicates), monotone frontier, status grammar from a fixed set, no id reused across blocks — and prints the next free id given a configurable fleet frontier; wired as a test or CI check; catches the historical duplicated-id cases when run on this file.
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
+
+### SDK-1 (mcp<2) retirement plan
+- id: `rm-313` | track: reliability | priority: 35.0 | status: candidate
+- acceptance: a dated deprecation declared at 0.15.0 (release note + docs/mcp-compatibility.md): drop the mcp>=1.28.1,<2 range half, the 1.28.1/1.30.0 CI pins, and the SDK-1 compat surface once no SDK-1 consumer remains (deployed remote runs mcp 2.2.0; mcp_compat is byte-identical with upstream post-#30); at least one release of warning precedes the drop; the resulting diff shrink is recorded by rm-311's sweep
+- evidence: research cycle 3 run eaa40f1e21d6 attempt b6f5f0f9 (/tmp/b6f5f0f9-research/research-candidates.md C11); ci.yml:51-56 pins; deployed /home/agent/.local/src/hermes-gpt at e928dd5476 with mcp 2.2.0
 
 ### Repo-wide compile check; drift-guard the manual registries
 - id: `rm-051` | track: reliability | priority: 30.0 | status: in_progress
@@ -313,6 +345,12 @@
 - id: `rm-039` | track: reliability | priority: 20.0 | status: candidate
 - acceptance: actions/setup-node cache enabled for the web job (or a recorded reason not to); stale comments refreshed to match hosted runners
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
+- update 2026-10-05 (cycle 3 research, run eaa40f1e21d6): 608bf6a05f moved ALL ci.yml jobs to GitHub-hosted runners (web job ubuntu-latest) but the comment at ci.yml:183-188 still justifies 'No cache: npm' with a self-hosted-runner rationale and an 820s self-hosted-era measurement — the recorded reason is now FALSE on hosted runners; re-measure on ubuntu-latest, then enable the cache or re-record the reason
+
+### Public-history retention decision for .conductor/ data
+- id: `rm-314` | track: reliability | priority: 22.0 | status: candidate
+- acceptance: a short decision doc (retain-and-document vs git-filter-repo rewrite) recorded in docs or RELEASE_CHECKLIST citing: repo PUBLIC (gh visibility), 212 .conductor/ run-bookkeeping files retained in master history, untracked forward by a462f5e5bb, no credential patterns found (assess 2026-10-05); if retain: the operational-detail exposure class documented once; if rewrite: the disruptive scope recorded first; decision is Owner-gated
+- evidence: research cycle 3 run eaa40f1e21d6 attempt b6f5f0f9 (/tmp/b6f5f0f9-research/research-candidates.md C12); git diff origin/master --name-status -> 212 A at the assess base d163cda227
 
 ### Reconcile divergent vercel.json configs
 - id: `rm-045` | track: reliability | priority: 15.0 | status: in_progress
@@ -346,5 +384,8 @@
 - `rm-031` Repo-wide compile check; drift-guard the manual registries — superseded
 - `rm-032` MCP 2026-07-28 minor-spec adoption and SDK-3.0 proofing — superseded
 - `rm-033` Bound pyyaml (last bare runtime dependency) — superseded
+- `rm-043` SHA-pin the reusable private-leak-sentinel workflow — done
+- `rm-098` Adopt upstream v0.13 Autopilot (9-commit gap; PR #82) — done
+- `rm-131` ui_ops cron-dispatch semaphore leaks on resolve failure — done
 
 <!-- managed by hermes-roadmap render; do not edit by hand -->
