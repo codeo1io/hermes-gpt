@@ -93,6 +93,19 @@ Authenticated `remote` mode also requires one of these transport boundaries:
 Wildcard, non-IP, and non-loopback trusted-proxy entries are rejected. Forwarded
 headers are ignored unless this explicit loopback-proxy mode is active.
 
+### Host/Origin request boundary
+
+Independent of authentication, every HTTP request and WebSocket handshake is
+checked against a Host allowlist (loopback by default, plus the configured
+bind address, the OAuth issuer host, and `HERMES_GPT_ALLOWED_HOSTS` entries).
+A request whose `Host` header is outside that allowlist is rejected with
+`421 host_not_allowed` before auth runs; this closes DNS-rebind styles of
+attack and applies even when no bearer token or OAuth authority is configured.
+Browser requests that carry an `Origin` header on state-changing methods
+(`POST`, `PUT`, `PATCH`, `DELETE`) must have a loopback or allow-listed
+origin, otherwise the request is rejected with `403 origin_not_allowed`.
+Non-browser clients send no `Origin` header and are unaffected.
+
 For a local HTTPS-terminating proxy, set:
 
 ```text

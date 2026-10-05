@@ -1978,3 +1978,89 @@ def test_in_place_database_migration_adds_dispatch_phase_and_manifest_table(tmp_
         tables = {row[0] for row in migrated.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert "dispatch_phase" in columns
     assert "delegation_validation_manifests" in tables
+
+
+def test_reconcile_validation_verdict_is_never_served_stale(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """rm-299: a cached SATISFIED verdict must never mask a fresh verdict.
+
+    Regression shape of the removed delegation-side verdict cache: reconcile
+    once to SATISFIED, then make the live validator return a different
+    verdict for the same manifest/observation inputs (later observed state).
+    The next reconcile must report the fresh verdict, not the remembered one.
+    """
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    root = tmp_path / "hermes"
+    _enable_workspace(monkeypatch, workspace)
+    monkeypatch.setattr(
+        delegations.contract_mod,
+        "hermes_contract_dispatch",
+        lambda *args, **kwargs: json.dumps({"success": True, "changed": True, "backend": "pi_rpc", "state": "queued"}),
+    )
+    contract = _contract(workspace, task_id="delegation-task-stale-verdict")
+    assert json.loads(
+        delegations.hermes_delegation_dispatch(
+            json.dumps(contract),
+            delegation_id="dlg-stale-verdict",
+            confirm=True,
+            dry_run=False,
+            hermes_root=root,
+        )
+    )["success"] is True
+    meta_path, _, _ = runners._job_paths("delegation-task-stale-verdict", root)
+    runners._atomic_json(
+        meta_path,
+        {
+            "schema_version": runners.SCHEMA_VERSION,
+            "task_id": "delegation-task-stale-verdict",
+            "backend": "pi_rpc",
+            "state": "completed",
+            "outcome": "completed",
+            "created_at": "2026-08-21T00:00:00+00:00",
+            "started_at": "2026-08-21T00:00:01+00:00",
+            "ended_at": "2026-08-21T00:00:02+00:00",
+            "error": "",
+        },
+    )
+    contract_json = json.dumps(contract)
+    first = json.loads(
+        delegations.hermes_delegation_reconcile(
+            "dlg-stale-verdict",
+            contract_json=contract_json,
+            apply=True,
+            hermes_root=root,
+        )
+    )
+    assert first["success"] is True
+    assert first["delegation"]["validation_verdict"] == "SATISFIED"
+
+    # Later observed state makes the live validator return NEEDS_WORK for the
+    # same manifest inputs; nothing about the workspace changed, which is
+    # exactly the case the old cache key could not distinguish.
+    original_validate = delegations.contract_mod._validate_manifest_impl
+    calls = {"n": 0}
+
+    def degrading_validate(manifest, observed, root_arg, *args, **kwargs):
+        result = original_validate(manifest, observed, root_arg, *args, **kwargs)
+        calls["n"] += 1
+        if calls["n"] > 0:
+            result["verdict"] = "SATISFIED" if calls["n"] <= 1 else "NEEDS_WORK"
+        return result
+
+    monkeypatch.setattr(delegations.contract_mod, "_validate_manifest_impl", degrading_validate)
+    second = json.loads(
+        delegations.hermes_delegation_reconcile(
+            "dlg-stale-verdict",
+            contract_json=contract_json,
+            apply=True,
+            hermes_root=root,
+        )
+    )
+    assert second["success"] is True
+    assert calls["n"] >= 1, "reconcile must run the live validator"
+    assert second["delegation"]["validation_verdict"] == "NEEDS_WORK", (
+        "a previously observed SATISFIED verdict masked the fresh live verdict"
+    )
+    # No verdict cache exists to consult anymore.
+    assert not hasattr(delegations, "_VALIDATION_VERDICT_CACHE")
+    assert not hasattr(delegations, "_validation_verdict_cached")

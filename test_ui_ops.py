@@ -816,7 +816,9 @@ def test_ui_mount_failure_is_operator_visible(tmp_path, monkeypatch):
         # Server still boots MCP-only: the full middleware stack serves requests.
         from starlette.testclient import TestClient
 
-        with TestClient(app) as client:
+        # Loopback base_url: the Host/Origin request boundary denies the
+        # synthetic "testserver" Host TestClient would otherwise send.
+        with TestClient(app, base_url="http://127.0.0.1") as client:
             assert client.get("/").status_code in (200, 400, 401, 403, 404)
 
         envelope = json.loads(
@@ -850,3 +852,26 @@ def test_ui_mount_failure_is_operator_visible(tmp_path, monkeypatch):
         assert check["code"] == "UI_MOUNT_FAILED"
     finally:
         op_policy.set_audit_log_override(None)
+
+
+def test_action_denies_cross_origin_browser_requests(client):
+    # rm-134: the gated mutation endpoint re-asserts the Host/Origin boundary
+    # at route level; a cross-site browser page gets 403 before any tool path.
+    resp = client.post(
+        "/api/ops/action",
+        json={"tool": "hermes_nonexistent", "args": {}},
+        headers={"Origin": "https://attacker.example"},
+    )
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "ORIGIN_DENIED"
+
+
+def test_action_allows_loopback_origin_through_the_gate(client):
+    resp = client.post(
+        "/api/ops/action",
+        json={"tool": "hermes_nonexistent", "args": {}},
+        headers={"Origin": "http://localhost:5173"},
+    )
+    # Gate passed: the request reaches the normal unknown-tool 404.
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "UNKNOWN_TOOL"

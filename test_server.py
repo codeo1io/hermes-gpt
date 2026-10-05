@@ -15,8 +15,10 @@ from types import SimpleNamespace
 
 import pytest
 from starlette.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 import oauth_auth
+import operator_policy
 import server
 import versioning
 
@@ -355,6 +357,36 @@ def test_remote_profile_requires_explicit_unsafe_ack(monkeypatch):
 
     with pytest.raises(SystemExit, match="Remote profile requires real authentication"):
         server.main()
+
+
+def test_asgi_app_denies_cross_site_websocket_handshake(monkeypatch):
+    # rm-134: with no bearer/OAuth authority configured the WebSocket auth
+    # helper used to early-return True. The Host/Origin boundary now denies
+    # cross-site browser handshakes (CSWSH) while plain clients connect.
+    clear_gate_envs(monkeypatch)
+    monkeypatch.delenv("HERMES_GPT_ALLOWED_HOSTS", raising=False)
+    monkeypatch.delenv("HERMES_GPT_HOST", raising=False)
+    monkeypatch.delenv("HERMES_GPT_PORT", raising=False)
+    # The /events/ws endpoint requires read-only Operator authority; enable
+    # exactly that so the boundary verdict (not Operator policy) is under test.
+    monkeypatch.setenv(operator_policy.OPERATOR_ENABLED_ENV, "1")
+    monkeypatch.setenv(operator_policy.OPERATOR_LEVEL_ENV, "read_only")
+    built = server.build_server(http=True)
+    app = server.build_asgi_app(built, http=True)
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        # A page on another origin cannot set custom headers on a WebSocket
+        # handshake, so its Origin is visible and must be refused.
+        # websocket_connect does not take Host from base_url, so pin it.
+        with pytest.raises(WebSocketDisconnect), client.websocket_connect(
+            "/events/ws", headers={"Host": "127.0.0.1", "Origin": "https://attacker.example"}
+        ):
+            pass
+        # Loopback-origin browser handshakes and Origin-less client
+        # handshakes proceed to the normal endpoint (closed on context exit).
+        with client.websocket_connect("/events/ws", headers={"Host": "127.0.0.1", "Origin": "http://127.0.0.1:7677"}):
+            pass
+        with client.websocket_connect("/events/ws", headers={"Host": "127.0.0.1"}):
+            pass
 
 
 def test_http_asgi_app_exposes_confidential_oauth_and_protects_mcp(monkeypatch):

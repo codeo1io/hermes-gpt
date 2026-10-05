@@ -30,7 +30,7 @@ As defense in depth, declare the legitimate public hostname to Hermes GPT:
 HERMES_GPT_ALLOWED_HOSTS=gpt.example.com
 ```
 
-Multiple hosts may be comma-separated. This extends the existing MCP transport-security allowlist; it does not disable DNS-rebinding protection. Loopback hosts remain allowed automatically.
+Multiple hosts may be comma-separated. This allowlist configures both network boundaries: the MCP transport-security middleware and the outer HTTP application (all routes, including the UI and WebSocket endpoints), which share one Host/Origin allowlist. It does not disable DNS-rebinding protection. Loopback hosts remain allowed automatically, and the same boundary applies even when no bearer token or OAuth authority is configured.
 
 This public-host allowlist is specific to public proxy traffic. Do not add a public Host entry merely because you use OpenAI Secure MCP Tunnel; the Secure MCP Tunnel path targets the loopback MCP URL locally.
 

@@ -3183,9 +3183,32 @@ def build_asgi_app(server: FastMCP, *, http: bool) -> Any:
     raw_mcp_app = server.streamable_http_app() if http else server.sse_app()
     mcp_app = oauth_auth.DefaultMcpAcceptMiddleware(raw_mcp_app)
     static_bearer = oauth_auth.static_bearer_from_env() or ""
+    # Host/Origin boundary allowlist for the outer HTTP app: reuse the exact
+    # allowlist build_server handed the MCP transport (bind host/port,
+    # loopback, HERMES_GPT_ALLOWED_HOSTS extras, OAuth issuer) so the outer
+    # routes and /mcp agree on the network boundary (rm-134).
+    _http_options = getattr(server, "_hermes_http_options", None) or {}
+    _transport_security = _http_options.get("transport_security")
+    boundary_hosts = list(
+        getattr(_transport_security, "allowed_hosts", None) or oauth_auth.boundary_allowed_hosts(oauth_state)
+    )
+    boundary_origins = list(getattr(_transport_security, "allowed_origins", None) or ())
 
     async def live_websocket_authorized(websocket: Any) -> bool:
         """Reuse the normal Hermes HTTP auth authority for WebSocket handshakes."""
+        # Request boundary first (rm-134): the Host/Origin gate must hold even
+        # when no bearer/OAuth authority is configured, which would otherwise
+        # return early below. Browsers cannot set custom headers on WebSocket
+        # handshakes, so a cross-site page's handshake carries its cross-site
+        # Origin and a rebound page carries its Host; both are denied here.
+        denial = oauth_auth.boundary_denial(
+            "POST",
+            oauth_auth._scope_headers(websocket.scope),
+            boundary_hosts,
+            boundary_origins,
+        )
+        if denial is not None:
+            return False
         if oauth_state is None and not static_bearer:
             return True
         admitted = False
@@ -3198,6 +3221,8 @@ def build_asgi_app(server: FastMCP, *, http: bool) -> Any:
             admitted_app,
             oauth_state,
             static_token=static_bearer,
+            boundary_hosts=boundary_hosts,
+            boundary_origins=boundary_origins,
         )
         scope = dict(websocket.scope)
         scope.update(
@@ -3293,7 +3318,13 @@ def build_asgi_app(server: FastMCP, *, http: bool) -> Any:
     issuer_origin = f"{parsed_issuer.scheme}://{parsed_issuer.netloc}" if parsed_issuer.netloc else ""
     origins = [origin for origin in ("https://chatgpt.com", issuer_origin) if origin]
     return CORSMiddleware(
-        oauth_auth.BearerAuthMiddleware(app, oauth_state, static_token=static_bearer),
+        oauth_auth.BearerAuthMiddleware(
+            app,
+            oauth_state,
+            static_token=static_bearer,
+            boundary_hosts=boundary_hosts,
+            boundary_origins=boundary_origins,
+        ),
         allow_origins=origins,
         allow_methods=["GET", "POST", "OPTIONS"],
         allow_headers=["*"],

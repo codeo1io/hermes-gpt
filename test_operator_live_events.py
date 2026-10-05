@@ -195,7 +195,7 @@ def test_websocket_stream_and_control_frames(hermes_root: Path):
         payload={"status": "draft"},
         hermes_root=hermes_root,
     )
-    with client.websocket_connect("/events/ws?cursor=0&mission_id=msn-ws") as ws:
+    with client.websocket_connect("/events/ws?cursor=0&mission_id=msn-ws", headers={"Host": "127.0.0.1"}) as ws:
         batch = ws.receive_json()
         assert batch["type"] == "events"
         assert batch["events"][0]["subject_id"] == "msn-ws"
@@ -214,7 +214,7 @@ def test_websocket_refuses_when_operator_disabled(tmp_path: Path, monkeypatch):
     monkeypatch.delenv(op.OPERATOR_ENABLED_ENV, raising=False)
     app = Starlette(routes=live.websocket_routes(lambda: root))
     client = TestClient(app)
-    with pytest.raises(WebSocketDisconnect), client.websocket_connect("/events/ws"):
+    with pytest.raises(WebSocketDisconnect), client.websocket_connect("/events/ws", headers={"Host": "127.0.0.1"}):
         pass
 
 
@@ -236,7 +236,7 @@ def test_server_registers_live_tools_and_composed_websocket(hermes_root: Path, m
         payload={"status": "running"},
         hermes_root=hermes_root,
     )
-    with TestClient(app) as client, client.websocket_connect("/events/ws?mission_id=msn-server-ws") as ws:
+    with TestClient(app) as client, client.websocket_connect("/events/ws?mission_id=msn-server-ws", headers={"Host": "127.0.0.1"}) as ws:
         batch = ws.receive_json()
         assert batch["type"] == "events"
         assert batch["events"][0]["subject_id"] == "msn-server-ws"
@@ -250,11 +250,11 @@ def test_composed_websocket_reuses_server_bearer_boundary(hermes_root: Path, mon
     app = server.build_asgi_app(built, http=True)
 
     with TestClient(app) as client:
-        with pytest.raises(WebSocketDisconnect), client.websocket_connect("/events/ws"):
+        with pytest.raises(WebSocketDisconnect), client.websocket_connect("/events/ws", headers={"Host": "127.0.0.1"}):
             pass
         with client.websocket_connect(
             "/events/ws",
-            headers={"Authorization": f"Bearer {bearer}"},
+            headers={"Authorization": f"Bearer {bearer}", "Host": "127.0.0.1"},
         ) as ws:
             ws.send_json({"action": "ping"})
             assert ws.receive_json()["type"] == "pong"
@@ -293,7 +293,7 @@ def test_websocket_empty_page_adopts_watermark_without_rescan(hermes_root, monke
 
     monkeypatch.setattr(live, "read_since", recording_read_since)
 
-    with client.websocket_connect("/events/ws?cursor=0&topic=mission") as ws:
+    with client.websocket_connect("/events/ws?cursor=0&topic=mission", headers={"Host": "127.0.0.1"}) as ws:
         # No event matches topic=mission: the client stays idle but its
         # cursor must still adopt the high watermark...
         ws.send_json({"action": "ping"})

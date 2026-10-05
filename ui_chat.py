@@ -716,6 +716,8 @@ async def _handle_session_messages(request: Request) -> Response:
 
 
 async def _handle_chat_post(request: Request) -> Response:
+    if not ui_security.origin_trusted(request):
+        return _error(403, "ORIGIN_DENIED", "Cross-origin browser requests are not allowed")
     try:
         body = await request.json()
     except Exception:
@@ -791,6 +793,8 @@ async def _handle_chat_stream(request: Request) -> Response:
 
 
 async def _handle_chat_stop(request: Request) -> Response:
+    if not ui_security.origin_trusted(request):
+        return _error(403, "ORIGIN_DENIED", "Cross-origin browser requests are not allowed")
     try:
         body = await request.json()
     except Exception:

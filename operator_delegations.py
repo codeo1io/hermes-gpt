@@ -676,81 +676,19 @@ def _invocation_unreached_backend(row: dict[str, Any], root: Path) -> bool:
     return _latest_observation(str(row.get("task_id") or ""), root) is None
 
 
-_VALIDATION_VERDICT_CACHE: dict[tuple[str, str, str, str], str] = {}
-_VALIDATION_CACHE_MAX = 256
+# rm-299: the delegation-side Work Contract verdict cache was removed. A
+# cached "SATISFIED" could mask a fresh FAILED/NEEDS_WORK verdict computed from
+# later observed state (the cache key only covered workspace stats and the
+# manifest digests, not the full validation inputs, and the audit tail / review
+# state were knowingly excluded). Reconciliation now always runs the live
+# validation, which the validation budget tolerates: validations happen once
+# per delegation observation, and eligible tests are the slow path only for
+# manifests that opt into them.
 
 
-def _validation_scope_signature(manifest: dict[str, Any], root: Path) -> str:
-    """Digest the mutable filesystem inputs of manifest validation.
-
-    Validation depends on the immutable manifest context plus the workspace /
-    artifact content it points at. Digesting that content lets identical
-    re-observations reuse the verdict instead of re-running the full Work
-    Contract validation (including eligible tests) for every Delegation
-    observation a Mission performs.
-    """
-    context = manifest.get("context") or {}
-    scope = context.get("allowed_scope") or {}
-    entries: list[tuple] = []
-    for workspace in scope.get("workspaces") or []:
-        base = Path(str(workspace))
-        try:
-            base = base.resolve()
-        except OSError:
-            continue
-        if not base.is_dir():
-            entries.append((str(workspace), "missing"))
-            continue
-        for dirpath, dirnames, filenames in os.walk(base):
-            dirnames.sort()
-            for name in sorted(filenames):
-                file_path = Path(dirpath) / name
-                try:
-                    stat = file_path.stat()
-                    rel = str(file_path.relative_to(base))
-                except (OSError, ValueError):
-                    continue
-                entries.append((rel, stat.st_mtime_ns, stat.st_size))
-            if len(entries) > 2000:
-                entries.append(("truncated", ""))
-                break
-        if len(entries) > 2000:
-            break
-    encoded = json.dumps(entries, sort_keys=True, separators=(",", ":"), default=str)
-    return hashlib.sha256(encoded.encode()).hexdigest()
-
-
-def _manifest_cacheable(manifest: dict[str, Any]) -> bool:
-    context = manifest.get("context") or {}
-    criteria = context.get("completion_criteria") or {}
-    review_required = bool((context.get("review_requirements") or {}).get("required"))
-    # Review and forbidden-action checks also read the global audit tail,
-    # which is not part of the scope signature; only verdicts that are
-    # independent of the audit trail may be cached.
-    return not review_required and not criteria.get("no_forbidden_actions")
-
-
-def _validation_verdict_cached(manifest: dict[str, Any], observed: dict[str, Any] | None, root: Path) -> str:
-    if not _manifest_cacheable(manifest):
-        return str(contract_mod._validate_manifest_impl(manifest, None, root).get("verdict") or "")
-    observed_sig = "none"
-    if observed:
-        encoded = json.dumps(observed, sort_keys=True, default=str, separators=(",", ":"))
-        observed_sig = hashlib.sha256(encoded.encode()).hexdigest()
-    key = (
-        str(manifest.get("contract_sha256") or ""),
-        str(manifest.get("context_sha256") or ""),
-        _validation_scope_signature(manifest, root),
-        observed_sig,
-    )
-    cached = _VALIDATION_VERDICT_CACHE.get(key)
-    if cached is not None:
-        return cached
-    verdict = str(contract_mod._validate_manifest_impl(manifest, None, root).get("verdict") or "")
-    if len(_VALIDATION_VERDICT_CACHE) >= _VALIDATION_CACHE_MAX:
-        _VALIDATION_VERDICT_CACHE.clear()
-    _VALIDATION_VERDICT_CACHE[key] = verdict
-    return verdict
+def _validation_verdict(manifest: dict[str, Any], observed: dict[str, Any] | None, root: Path) -> str:
+    """Live Work Contract verdict for a manifest; never served from a cache."""
+    return str(contract_mod._validate_manifest_impl(manifest, None, root).get("verdict") or "")
 
 
 def _mission_dispatch_guard(mission_id: str, delegation_id: str, contract_sha: str, root: Path) -> None:
@@ -1131,7 +1069,7 @@ def hermes_delegation_reconcile(
 
         validation = contract_mod._validate_manifest_impl(manifest, None, root)
         # Fork hardening (PR #56 lineage): cacheable manifests reuse the verdict cache.
-        verdict = _validation_verdict_cached(manifest, observed, root)
+        verdict = _validation_verdict(manifest, observed, root)
         validation["verdict"] = verdict
         safe_validation = validation_summary(validation)
         summary_json = json.dumps(safe_validation, sort_keys=True, separators=(",", ":"))

@@ -254,7 +254,17 @@ class SessionDB:
             clauses.append("message_count >= ?")
             params.append(min_message_count)
         order = "ORDER BY last_activity_at DESC, started_at DESC" if order_by_last_active else "ORDER BY started_at DESC"
-        sql = f"SELECT * FROM sessions WHERE {' AND '.join(clauses)} {order} LIMIT ? OFFSET ?"
+        # Contract alias (rm-297): the full Hermes Agent session-list query
+        # exposes the computed activity timestamp as ``last_active`` (see
+        # ``rt.activity AS last_active`` / ``_sql_session_last_active(...) AS
+        # last_active`` in the agent's hermes_state_sessions.py), and consumers
+        # such as ui_chat._serialize_session read that key. The shim projects
+        # its native ``last_activity_at`` column under the same alias so both
+        # providers honor one contract.
+        sql = (
+            f"SELECT *, last_activity_at AS last_active FROM sessions "
+            f"WHERE {' AND '.join(clauses)} {order} LIMIT ? OFFSET ?"
+        )
         params.extend([limit, offset])
         rows = self._conn().execute(sql, params).fetchall()
         return [dict(row) for row in rows]

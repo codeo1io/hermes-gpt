@@ -696,6 +696,8 @@ def _map_mutation_result(tool: str, spec: _MutationSpec, payload: dict[str, Any]
 
 async def _action(request: Request) -> JSONResponse:
     """POST /api/ops/action — execute an existing gated hermes_* tool path."""
+    if not ui_security.origin_trusted(request):
+        return _json_resp(_err("ORIGIN_DENIED", "Cross-origin browser requests are not allowed", 403), 403)
     try:
         body = await request.json()
     except Exception:  # noqa: BLE001

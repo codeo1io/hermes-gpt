@@ -11,6 +11,7 @@ import time
 import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
+from collections.abc import Iterable
 from typing import Any
 
 from starlette.requests import Request
@@ -1328,6 +1329,121 @@ class DefaultMcpAcceptMiddleware:
         await self.app(scope, receive, send)
 
 
+# ── Request boundary: Host/Origin default-deny outside loopback (rm-134) ──
+
+#: Explicit escape hatch for fronted deployments (space/comma-separated
+#: hosts, same semantics as the MCP ``TransportSecuritySettings`` allowlist).
+BOUNDARY_ALLOWED_HOSTS_ENV = "HERMES_GPT_ALLOWED_HOSTS"
+LOOPBACK_HOST_LABELS = frozenset({"127.0.0.1", "localhost", "::1"})
+#: Browser requests with these methods must carry a trusted Origin header.
+BOUNDARY_STATE_CHANGING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+def _host_label(host_value: str) -> str:
+    """Host portion of a Host/Origin netloc: port and IPv6 brackets stripped."""
+    value = (host_value or "").strip()
+    if value.startswith("["):
+        end = value.find("]")
+        return value[1:end] if end != -1 else value.lstrip("[")
+    if value.count(":") == 1:
+        return value.rsplit(":", 1)[0]
+    return value
+
+
+def host_is_loopback(host_value: str) -> bool:
+    """True when a Host/Origin netloc names a loopback interface."""
+    label = _host_label(host_value).lower()
+    return label in LOOPBACK_HOST_LABELS or label.startswith("127.")
+
+
+def boundary_allowed_hosts(state: OAuthState | None = None) -> list[str]:
+    """Default Host/Origin allowlist: loopback plus deliberately configured hosts.
+
+    Loopback is always trusted because it is the product's default network
+    boundary. ``HERMES_GPT_HOST``/``HERMES_GPT_PORT`` add the configured bind
+    address, the OAuth issuer host is added when confidential-client OAuth is
+    configured, and ``HERMES_GPT_ALLOWED_HOSTS`` is the explicit escape hatch
+    for fronted deployments (for example a Cloudflare tunnel hostname).
+    """
+    hosts = ["127.0.0.1", "localhost", "[::1]", "::1"]
+    bind_host = (os.getenv("HERMES_GPT_HOST") or "").strip()
+    bind_port = (os.getenv("HERMES_GPT_PORT") or "").strip()
+    if bind_host:
+        hosts.append(bind_host)
+        if bind_port:
+            hosts.append(f"{bind_host}:{bind_port}")
+    hosts.extend(h for h in (os.getenv(BOUNDARY_ALLOWED_HOSTS_ENV) or "").replace(",", " ").split() if h)
+    issuer = (getattr(getattr(state, "config", None), "issuer", "") or "") if state is not None else ""
+    parsed = urllib.parse.urlparse(issuer)
+    if parsed.hostname:
+        hosts.extend([parsed.hostname, parsed.netloc])
+    return hosts
+
+
+def host_is_allowed(host_value: str, allowed_hosts: Iterable[str]) -> bool:
+    """True when a Host header value is loopback or explicitly allow-listed."""
+    value = (host_value or "").strip()
+    if not value:
+        return False
+    allowed = allowed_hosts if isinstance(allowed_hosts, (set, frozenset)) else set(allowed_hosts)
+    return value in allowed or host_is_loopback(value)
+
+
+def origin_is_allowed(origin: str, allowed_hosts: Iterable[str], allowed_origins: Iterable[str] = ()) -> bool:
+    """True when a browser Origin header is inside the local boundary.
+
+    Non-browser clients send no Origin at all, so this only classifies the
+    Origin values browsers actually send. The sandboxed/file ``null`` origin
+    is never trusted (it is a known CSRF bypass).
+    """
+    value = (origin or "").strip()
+    if not value or value.lower() == "null":
+        return False
+    if value in set(allowed_origins or ()):
+        return True
+    try:
+        netloc = urllib.parse.urlparse(value).netloc
+    except ValueError:
+        return False
+    if not netloc:
+        return False
+    allowed = allowed_hosts if isinstance(allowed_hosts, (set, frozenset)) else set(allowed_hosts)
+    return netloc in allowed or host_is_loopback(netloc)
+
+
+def _scope_headers(scope: Scope) -> dict[str, str]:
+    """Decode ASGI headers into a lowercase str-keyed mapping."""
+    return {
+        key.decode("latin-1", "replace").lower(): value.decode("latin-1", "replace")
+        for key, value in scope.get("headers") or []
+    }
+
+
+def boundary_denial(
+    method: str,
+    headers: dict[str, str] | None,
+    allowed_hosts: Iterable[str],
+    allowed_origins: Iterable[str] = (),
+) -> tuple[int, str] | None:
+    """Classify one request against the Host/Origin boundary.
+
+    Returns ``(status, error_code)`` to deny with, or None when the request is
+    inside the boundary. Host is validated for every HTTP request (DNS
+    rebinding defense); Origin is validated only for state-changing methods
+    (CSRF/CSWSH defense), so non-browser clients without an Origin header are
+    unaffected.
+    """
+    source = headers or {}
+    host = source.get("host") or source.get(":authority") or ""
+    if not host_is_allowed(host, allowed_hosts):
+        return 421, "host_not_allowed"
+    if str(method or "").upper() in BOUNDARY_STATE_CHANGING_METHODS:
+        origin = source.get("origin") or ""
+        if origin and not origin_is_allowed(origin, allowed_hosts, allowed_origins):
+            return 403, "origin_not_allowed"
+    return None
+
+
 class BearerAuthMiddleware:
     PUBLIC_PATHS = {
         "/",
@@ -1345,14 +1461,42 @@ class BearerAuthMiddleware:
         "/oauth/register",
     }
 
-    def __init__(self, app: ASGIApp, state: OAuthState | None = None, *, static_token: str | None = None) -> None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        state: OAuthState | None = None,
+        *,
+        static_token: str | None = None,
+        boundary_hosts: Iterable[str] | None = None,
+        boundary_origins: Iterable[str] | None = None,
+    ) -> None:
         self.app = app
         self.state = state
         self.static_token = static_token
+        # Request boundary (Host/Origin): default-deny outside loopback, even
+        # when no bearer/OAuth authority is configured (rm-134).
+        self.boundary_hosts = frozenset(boundary_allowed_hosts(state) if boundary_hosts is None else boundary_hosts)
+        self.boundary_origins = frozenset(boundary_origins or ())
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope.get("type") != "http":
             await self.app(scope, receive, send)
+            return
+        # The Host/Origin boundary runs before auth and before the
+        # unconfigured pass-through below: loopback-default serving must not
+        # accept DNS-rebound Hosts or cross-site browser requests even when no
+        # bearer/OAuth authority is configured. WebSocket handshakes reach this
+        # same gate through the synthetic HTTP scope (see server.py), which
+        # closes the cross-site WebSocket hijacking route.
+        denial = boundary_denial(
+            str(scope.get("method") or ""),
+            _scope_headers(scope),
+            self.boundary_hosts,
+            self.boundary_origins,
+        )
+        if denial is not None:
+            status, error = denial
+            await JSONResponse({"error": error}, status_code=status)(scope, receive, send)
             return
         expected_static = (static_bearer_from_env() or "") if self.static_token is None else self.static_token
         if not expected_static and self.state is None:

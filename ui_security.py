@@ -687,6 +687,23 @@ async def connection_endpoint(_request: Request) -> JSONResponse:
     return JSONResponse(ok(await asyncio.to_thread(connection_payload)))
 
 
+def origin_trusted(request: Request) -> bool:
+    """True when the browser Origin header (if present) is inside the local boundary.
+
+    Defense-in-depth for mutating UI endpoints: the outer app enforces the
+    Host/Origin boundary in ``oauth_auth.BearerAuthMiddleware``; handlers
+    re-assert it so routes stay safe even when mounted without that outer
+    middleware stack. Non-browser clients send no Origin header and are
+    unaffected (rm-134).
+    """
+    origin = request.headers.get("origin") or ""
+    if not origin:
+        return True
+    import oauth_auth
+
+    return oauth_auth.origin_is_allowed(origin, oauth_auth.boundary_allowed_hosts())
+
+
 def ui_security_routes() -> list[BaseRoute]:
     """Routes owned by the security/state card (composition entry point)."""
     return [

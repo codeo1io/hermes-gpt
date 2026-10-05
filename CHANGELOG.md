@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+Request-boundary and verdict truth (cycle 3 maintenance batch).
+
+- The outer HTTP application now enforces the local loopback network boundary for every request, not just the MCP transport. Host headers outside the allowlist are rejected with `421 host_not_allowed` before authentication runs, including when no bearer token or OAuth authority is configured; WebSocket handshakes are denied the same way, closing cross-site WebSocket hijacking against the events stream. Browser requests carrying a non-loopback, non-allow-listed `Origin` on state-changing methods are rejected with `403 origin_not_allowed`; non-browser clients (no `Origin` header) are unaffected. The allowlist is shared with the MCP transport security settings: loopback by default, plus the configured bind host/port, the OAuth issuer host, and `HERMES_GPT_ALLOWED_HOSTS` entries (see [docs/oauth.md](docs/oauth.md) and [docs/cloudflare-tunnel.md](docs/cloudflare-tunnel.md)).
+- Delegation Work Contract reconciliation no longer caches validation verdicts: every reconcile runs the live validation, so a previously observed `SATISFIED` can never mask a fresh verdict computed from later observed state.
+- The local SessionDB shim projects the agent's `last_active` row alias on listed sessions, and a new contract test pins that alias (agent provider, shim, and UI consumer) so an upstream rename of the session-list SQL degrades loudly instead of silently falling back to `started_at`.
+
 ## 0.14.0 - 2026-10-03
 
 Acceptance and recovery: declare deliverable checks before dispatch and recover from positively observed artifact failures within existing limits.

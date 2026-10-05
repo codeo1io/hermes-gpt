@@ -629,3 +629,27 @@ def test_session_endpoints_do_not_stall_event_loop_under_sessiondb_lock(app):
             release.set()
 
     asyncio.run(scenario())
+
+
+def test_chat_post_denies_cross_origin_browser_requests(client):
+    # rm-134: the mutating chat endpoint is CSRF-protected at route level even
+    # when mounted without the outer BearerAuthMiddleware stack.
+    resp = client.post(
+        "/api/chat",
+        json={"message": "hello"},
+        headers={"Origin": "https://attacker.example"},
+    )
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "ORIGIN_DENIED"
+
+
+def test_chat_post_allows_loopback_origin_through_the_gate(client):
+    # A loopback-origin browser request passes the gate and reaches normal
+    # request validation (an empty message is a 400, never a boundary 403).
+    resp = client.post(
+        "/api/chat",
+        json={"message": "  "},
+        headers={"Origin": "http://127.0.0.1:5173"},
+    )
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] != "ORIGIN_DENIED"

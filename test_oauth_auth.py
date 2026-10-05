@@ -8,6 +8,7 @@ import json
 import time
 import urllib.parse
 
+import oauth_auth
 import pytest
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -88,7 +89,9 @@ def oauth_client(oauth_state: OAuthState) -> TestClient:
             Route("/oauth/token", token_endpoint, methods=["POST"]),
         ]
     )
-    return TestClient(app)
+    # Loopback base_url: the request boundary (Host/Origin) denies the
+    # synthetic "testserver" Host that TestClient would otherwise send.
+    return TestClient(app, base_url="http://127.0.0.1")
 
 
 def authorize_code(
@@ -690,7 +693,7 @@ def test_unauthenticated_mcp_challenge_points_at_protected_resource_metadata(oau
         return JSONResponse({"ok": True})
 
     app = BearerAuthMiddleware(Starlette(routes=[Route("/mcp", endpoint, methods=["POST"])]), oauth_state)
-    client = TestClient(app)
+    client = TestClient(app, base_url="http://127.0.0.1")
     denied = client.post("/mcp")
     assert denied.status_code == 401
     assert denied.json() == {"error": "unauthorized"}
@@ -705,7 +708,7 @@ def test_bearer_middleware_preserves_static_token_compatibility(monkeypatch: pyt
 
     monkeypatch.setenv(AUTH_TOKEN_ENV, STATIC_BEARER)
     app = BearerAuthMiddleware(Starlette(routes=[Route("/mcp", endpoint, methods=["POST"])]), oauth_state)
-    client = TestClient(app)
+    client = TestClient(app, base_url="http://127.0.0.1")
     assert client.post("/mcp").status_code == 401
     assert client.post("/mcp", headers={"Authorization": f"Bearer {STATIC_BEARER}"}).status_code == 200
 
@@ -843,3 +846,129 @@ def test_authorization_response_iss_parameter(oauth_client: TestClient):
     )
     assert error_query["error"] == ["invalid_scope"]
     assert error_query["iss"] == [ISSUER]
+
+
+# ── Request boundary: Host/Origin default-deny outside loopback (rm-134) ──
+# The product invariant is that local loopback is the default network boundary:
+# even when no bearer token or OAuth authority is configured, the outer HTTP
+# app must not serve a DNS-rebound Host, and browser requests with a
+# cross-site Origin header on state-changing methods must be denied.
+# Non-browser clients send no Origin header and must be unaffected.
+
+
+def _boundary_app(state: OAuthState | None = None, **middleware_kwargs):
+    async def echo(request):
+        return JSONResponse({"ok": True})
+
+    return BearerAuthMiddleware(
+        Starlette(routes=[Route("/mcp", echo, methods=["GET", "POST"])]), state, **middleware_kwargs
+    )
+
+
+def test_boundary_denies_non_loopback_host_by_default(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv(oauth_auth.BOUNDARY_ALLOWED_HOSTS_ENV, raising=False)
+    client = TestClient(_boundary_app(), base_url="http://rebind.example.com")
+    response = client.get("/mcp")
+    assert response.status_code == 421
+    assert response.json() == {"error": "host_not_allowed"}
+
+
+def test_boundary_allows_loopback_host_without_auth_configured():
+    # No bearer/OAuth configured: the app previously passed everything
+    # through; the boundary still applies, and loopback passes.
+    for base_url in ("http://127.0.0.1", "http://localhost", "http://127.0.0.1:7677"):
+        client = TestClient(_boundary_app(), base_url=base_url)
+        assert client.get("/mcp").status_code == 200, base_url
+
+
+def test_boundary_denies_cross_origin_state_changing_requests():
+    client = TestClient(_boundary_app(), base_url="http://127.0.0.1")
+    denied = client.post("/mcp", headers={"Origin": "https://attacker.example"})
+    assert denied.status_code == 403
+    assert denied.json() == {"error": "origin_not_allowed"}
+
+
+def test_boundary_allows_loopback_origin_on_state_changing_requests():
+    client = TestClient(_boundary_app(), base_url="http://127.0.0.1")
+    allowed = client.post("/mcp", headers={"Origin": "http://localhost:7677"})
+    assert allowed.status_code == 200
+
+
+def test_boundary_ignores_origin_on_safe_methods():
+    # GET is not state-changing: a cross-site Origin on GET is covered by the
+    # Host check and the CORS layer, not by the CSRF gate.
+    client = TestClient(_boundary_app(), base_url="http://127.0.0.1")
+    assert client.get("/mcp", headers={"Origin": "https://attacker.example"}).status_code == 200
+
+
+def test_boundary_allows_non_browser_clients_without_origin_header():
+    client = TestClient(_boundary_app(), base_url="http://127.0.0.1")
+    assert client.post("/mcp").status_code == 200
+
+
+def test_boundary_denies_null_origin():
+    # The sandboxed/file "null" origin is a known CSRF bypass shape.
+    client = TestClient(_boundary_app(), base_url="http://127.0.0.1")
+    assert client.post("/mcp", headers={"Origin": "null"}).status_code == 403
+
+
+def test_boundary_host_allowlist_escape_hatch(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv(oauth_auth.BOUNDARY_ALLOWED_HOSTS_ENV, "tunnel.example.com")
+    client = TestClient(_boundary_app(), base_url="https://tunnel.example.com")
+    assert client.get("/mcp").status_code == 200
+
+
+def test_boundary_explicit_host_and_origin_parameters():
+    client = TestClient(
+        _boundary_app(boundary_hosts=["127.0.0.1", "api.example.com"], boundary_origins=["https://app.example.com"]),
+        base_url="https://api.example.com",
+    )
+    assert client.get("/mcp").status_code == 200
+    assert client.post("/mcp", headers={"Origin": "https://app.example.com"}).status_code == 200
+    assert client.post("/mcp", headers={"Origin": "https://other.example.com"}).status_code == 403
+
+
+def test_boundary_denial_pure_function_matrix():
+    hosts = ["127.0.0.1", "api.example.com"]
+    assert oauth_auth.boundary_denial("GET", {"host": "127.0.0.1"}, hosts) is None
+    assert oauth_auth.boundary_denial("GET", {"host": "api.example.com"}, hosts) is None
+    assert oauth_auth.boundary_denial("GET", {}, hosts) == (421, "host_not_allowed")
+    assert oauth_auth.boundary_denial("GET", {"host": "rebind.example"}, hosts) == (421, "host_not_allowed")
+    # :authority (HTTP/2) is honored when Host is absent.
+    assert oauth_auth.boundary_denial("GET", {":authority": "api.example.com"}, hosts) is None
+    assert oauth_auth.boundary_denial("POST", {":authority": "rebind.example"}, hosts) == (421, "host_not_allowed")
+    assert oauth_auth.boundary_denial(
+        "POST", {"host": "127.0.0.1", "origin": "https://attacker.example"}, hosts
+    ) == (403, "origin_not_allowed")
+    assert (
+        oauth_auth.boundary_denial("POST", {"host": "127.0.0.1", "origin": "null"}, hosts)
+        == (403, "origin_not_allowed")
+    )
+    assert oauth_auth.boundary_denial("POST", {"host": "127.0.0.1", "origin": ""}, hosts) is None
+    # Loopback is always allowed even when absent from the explicit list.
+    assert oauth_auth.boundary_denial("GET", {"host": "127.9.9.9:1"}, []) is None
+
+
+def test_boundary_helpers_classify_loopback_correctly():
+    assert oauth_auth.host_is_loopback("127.0.0.1")
+    assert oauth_auth.host_is_loopback("127.0.0.1:7677")
+    assert oauth_auth.host_is_loopback("localhost")
+    assert oauth_auth.host_is_loopback("LOCALHOST:80")
+    assert oauth_auth.host_is_loopback("[::1]:7677")
+    assert oauth_auth.host_is_loopback("127.200.1.1")
+    for negative in ("rebind.example.com", "::1.example.com", "localhost.example.com", "evi1host", ""):
+        assert not oauth_auth.host_is_loopback(negative), negative
+
+
+def test_boundary_allowed_hosts_includes_env_and_issuer(monkeypatch: pytest.MonkeyPatch, oauth_state: OAuthState):
+    monkeypatch.setenv("HERMES_GPT_HOST", "0.0.0.0")
+    monkeypatch.setenv("HERMES_GPT_PORT", "7677")
+    monkeypatch.setenv(oauth_auth.BOUNDARY_ALLOWED_HOSTS_ENV, "tunnel.example.com")
+    hosts = oauth_auth.boundary_allowed_hosts(oauth_state)
+    assert "127.0.0.1" in hosts
+    assert "0.0.0.0" in hosts
+    assert "0.0.0.0:7677" in hosts
+    assert "tunnel.example.com" in hosts
+    # The OAuth issuer host (https://mcp.example.com in this fixture) is added.
+    assert "mcp.example.com" in hosts
+    assert oauth_auth.host_is_allowed("mcp.example.com", hosts)
