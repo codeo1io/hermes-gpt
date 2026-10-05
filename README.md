@@ -379,7 +379,7 @@ Git checkout updates require a clean checkout on the default branch and use fast
 Current operational documentation:
 
 - [Documentation map and source-of-truth rules](docs/README.md)
-- [Runtime checkout pin (which checkout is live)](docs/runtime-checkout.md)
+- [Runtime checkout pin (which checkout is live)](docs/runtime-checkout.md) — host operational provenance, deliberately not shipped in the package
 - [Reuse / do-not-rebuild boundary](BOUNDARY.md)
 - [OpenAI Secure MCP Tunnel](docs/openai-secure-mcp-tunnel.md)
 - [OAuth and bearer authentication](docs/oauth.md)

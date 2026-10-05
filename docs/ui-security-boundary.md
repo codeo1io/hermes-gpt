@@ -108,6 +108,23 @@ user's own text only; unambiguous secret shapes are still removed.
   `HERMES_GPT_UI_ENABLED=1`, so same-origin `/api/*` and `/ui` calls never
   fall through to the MCP catch-all. With the env unset, the mount code is
   not even imported — installed wheels without the UI modules are unaffected.
+- Mutating UI POSTs (`POST /api/sessions`, `POST /api/chat`,
+  `POST /api/chat/stop`, `POST /api/ops/action`) pass a browser boundary
+  (`ui_security.post_boundary_rejection`) BEFORE any handler logic (rm-134):
+
+  | Condition | Response |
+  |---|---|
+  | `Sec-Fetch-Site: cross-site` | 403 `CROSS_SITE_POST` |
+  | `Origin` outside {UI origin, `https://chatgpt.com`, issuer origin} | 403 `ORIGIN_NOT_ALLOWED` |
+  | body present without `Content-Type: application/json` | 415 `JSON_CONTENT_TYPE_REQUIRED` |
+
+  The allowed-origin set is the SAME set the server's CORS allow-list uses
+  (`CHATGPT_UI_ORIGIN` + the oauth issuer from `oauth_auth.config_from_env`
+  + the UI's own origin) — one source of truth, never a second constant.
+  Non-browser clients (MCP tools, curl) send neither `Sec-Fetch-Site` nor
+  `Origin`, so they are unaffected; bodyless POSTs are not content-type-gated.
+  CORS preflights (`OPTIONS`) never reach the handlers, so the boundary
+  cannot interfere with them.
 
 ## 4. Account status (`GET /api/me`)
 
@@ -168,6 +185,7 @@ preserves_gate_codes` asserts that.
 | `HERMES_GPT_UI_DIR` | `web/dist` | static build output override |
 | `HERMES_GPT_UI_STALE_LEASE_S` | `600` | stale turn-lease threshold |
 | `HERMES_GPT_UI_TOOL_PREVIEW_BYTES` | `8192` | per-string / tool-preview cap |
+| `HERMES_GPT_UI_POST_BOUNDARY` | unset (`enforce`) | set `off` to disable the mutating-POST browser boundary (Sec-Fetch-Site / Origin / Content-Type checks). Escape hatch for exotic local reverse proxies; NEVER set it when the UI is reachable off-loopback |
 
 Existing env behavior is unchanged.
 

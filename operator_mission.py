@@ -521,6 +521,43 @@ def _state_db(profile_home: Path) -> Path:
     return profile_home / "state.db"
 
 
+def _sessions_window_cutoff(conn: sqlite3.Connection, column: str, when: datetime) -> float | str | None:
+    """Type-aware window cutoff for a sessions timestamp column (rm-152).
+
+    Production ``state.db`` (``hermes_state.SCHEMA_SQL``) stores
+    ``started_at``/``last_activity_at`` as REAL epoch seconds (``time.time()``),
+    while older databases and some fixture schemas store TEXT ISO-8601. SQLite
+    orders numbers before text, so comparing a REAL column against an
+    ISO-8601 string is always false and silently zeroes every window. Return
+    the cutoff in the column's own comparison domain — epoch seconds for
+    numeric storage, ISO-8601 for text — or ``None`` when the column is
+    missing so callers degrade explicitly instead of silently all-time.
+
+    ``column`` is always a call-site literal ("started_at" /
+    "last_activity_at"), never user input.
+    """
+    declared = ""
+    found = False
+    for row in conn.execute("PRAGMA table_info(sessions)"):
+        if row[1] == column:
+            declared = str(row[2] or "").upper()
+            found = True
+            break
+    if not found:
+        return None
+    if any(token in declared for token in ("INT", "REAL", "FLOA", "DOUB")):
+        return when.timestamp()
+    if any(token in declared for token in ("TEXT", "CHAR", "CLOB")):
+        return when.isoformat()
+    # Typeless/BLOB declaration: follow the first stored value's storage class.
+    probe = conn.execute(
+        f"SELECT typeof({column}) AS t FROM sessions WHERE {column} IS NOT NULL LIMIT 1"  # noqa: S608
+    ).fetchone()
+    if probe and str(probe[0]) in ("real", "integer"):
+        return when.timestamp()
+    return when.isoformat()
+
+
 def _cron_dir(profile_home: Path) -> Path:
     return profile_home / "cron"
 
@@ -896,19 +933,37 @@ def _profile_summary(profile: str, root: Path | None, warnings: list[str]) -> di
         pass
 
     # Sessions 7d + last activity from state.db (mode=ro), count/timestamp only.
+    # rm-152: the cutoff must match the column's storage domain — production
+    # state.db declares REAL epoch seconds; an ISO-8601 string never compares
+    # true against REAL and silently zeroes the 7d window.
     sessions_7d = 0
     last_activity: str | None = None
     try:
         conn = _open_ro(_state_db(home))
         try:
-            cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
-            row = conn.execute(
-                "SELECT COUNT(*) AS c, MAX(last_activity_at) AS last FROM sessions WHERE last_activity_at >= ?",
-                (cutoff,),
-            ).fetchone()
-            if row:
-                sessions_7d = int(row["c"] or 0)
-                last_activity = row["last"]
+            cutoff = _sessions_window_cutoff(
+                conn, "last_activity_at", datetime.now(timezone.utc) - timedelta(days=7)
+            )
+            if cutoff is None:
+                # Schema drift: degrade explicitly (warning surfaces through
+                # the caller) rather than silently reporting an empty window.
+                warnings.append(f"profiles:{profile}:sessions.last_activity_at_missing")
+            else:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS c, MAX(last_activity_at) AS last FROM sessions WHERE last_activity_at >= ?",
+                    (cutoff,),
+                ).fetchone()
+                if row:
+                    sessions_7d = int(row["c"] or 0)
+                    raw_last = row["last"]
+                    if isinstance(raw_last, (int, float)):
+                        # REAL epoch -> ISO-8601 so the payload shape stays stable.
+                        try:
+                            last_activity = datetime.fromtimestamp(float(raw_last), tz=timezone.utc).isoformat()
+                        except (OverflowError, OSError, ValueError):
+                            last_activity = None
+                    elif raw_last is not None:
+                        last_activity = str(raw_last)
         finally:
             conn.close()
     except (FileNotFoundError, sqlite3.Error, OSError):
@@ -1403,7 +1458,7 @@ def hermes_mission_usage(hermes_root: Path | None = None, trace_id: str | None =
     cost_known = 0.0
     by_profile: dict[str, dict[str, Any]] = {}
 
-    cutoff_24h = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    when_24h = datetime.now(timezone.utc) - timedelta(hours=24)
 
     for profile in _iter_profiles(root):
         try:
@@ -1412,12 +1467,22 @@ def hermes_mission_usage(hermes_root: Path | None = None, trace_id: str | None =
                 cols = {r[1] for r in conn.execute("PRAGMA table_info(session_model_usage)")}
                 has_cost = "estimated_cost_usd" in cols and "cost_status" in cols
 
-                # Sessions in last 24h.
-                s_row = conn.execute(
-                    "SELECT COUNT(*) AS c FROM sessions WHERE started_at >= ?", (cutoff_24h,)
-                ).fetchone()
-                prof_sessions = int(s_row["c"] or 0)
-                sessions_24h += prof_sessions
+                # rm-152: same storage-domain rule as the 7d window — the
+                # 24h cutoff must be epoch seconds against REAL columns.
+                cutoff_24h = _sessions_window_cutoff(conn, "started_at", when_24h)
+                prof_sessions = 0
+                if cutoff_24h is None:
+                    warnings.append(
+                        f"usage:{profile}:sessions.started_at missing;"
+                        " sessions_24h count unavailable (explicitly degraded)"
+                    )
+                else:
+                    # Sessions in last 24h.
+                    s_row = conn.execute(
+                        "SELECT COUNT(*) AS c FROM sessions WHERE started_at >= ?", (cutoff_24h,)
+                    ).fetchone()
+                    prof_sessions = int(s_row["c"] or 0)
+                    sessions_24h += prof_sessions
 
                 # Tokens + cost from session_model_usage, windowed to the
                 # last 24h by joining the owning session's started_at (the

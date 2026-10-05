@@ -18,11 +18,13 @@
 - id: `rm-081` | track: reliability | priority: 115.0 | status: candidate
 - acceptance: merged tree reconciles fork+upstream halves into a single resolution authority; loader failure is fail-closed with a test proving a required-but-unloadable skill blocks dispatch; probes use preprocess=False with a test asserting inline_shell side effects never run during validation; fork surfaces (plan create/validate/placement) keep enforcement at parity with upstream's breadth (work contracts/swarm); full suite + upstream's new tests green on both SDK lanes
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
+- update 2026-10-04 (repository-maintenance b4801f968fca cycle 3, run c7f77193824c, research c7c79bc485, verified at origin/master d163cda227): satisfied by adoption — upstream merged the v0.13-acceptance+v0.14 wave (#86 20967cc05a 2026-10-03T23:06Z → #90 f50ded35ad 2026-10-04T01:54Z, tags v0.13.0+v0.14.0) and fork PR #29 adopted it at origin/master (squash cf04a2f956, merged 2026-10-04T13:18:49Z); every wave head verified an ancestor of origin/master via git merge-base --is-ancestor; fork 0 commits behind upstream/master; the skill-loader hardening trio rides that tree (pyproject 0.14.0 at origin/master; adopted-tree suite greenness recorded by the sibling assess runs as 1874P/5S/0F); closes by fold — status flip deferred to the landing gate per campaign convention; do not re-implement
 
 ### Adopt upstream v0.13 Autopilot (9-commit gap; PR #82)
 - id: `rm-098` | track: reliability | priority: 115.0 | status: candidate
 - acceptance: the 9 upstream commits merge or cherry-pick onto the fork line with conflicts reviewed line-by-line against fork invariants (Owner Mode break-glass, secret-path denials, default read-only; Autopilot stays default-off at adoption); full suite green in CI shape; CHANGELOG records the catch-up; #83/#84 recorded as follow-on once merged upstream
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
+- update 2026-10-04 (repository-maintenance b4801f968fca cycle 3, run c7f77193824c, research c7c79bc485, verified at origin/master d163cda227): satisfied by adoption — the 9-commit v0.13 Autopilot gap is subsumed by the same upstream #86-#90 wave (releases v0.13.0 2026-10-03T23:22:09Z and v0.14.0 2026-10-04T01:16:34Z verified via gh api) landing through fork PR #29 (ancestry-proven, fork 0 behind upstream); CHANGELOG 0.14.0 records the catch-up; Autopilot stays default-off; #83/#84 remain upstream follow-ons; ONE residue of the adoption is NOT covered here and stays open elsewhere: the per-attempt artifacts workspace <data>/missions/artifacts/<task_id> is still provisioned by no production code (git grep 'missions/artifacts' at origin/master hits operator_autopilot.py:966 + docs/autopilot.md:107 only; every mkdir in autopilot/runners/contract/runtime is a state-file parent) — tracked as sibling-claimed rm-217 (unlanded run bd7f8ef7ddc1); closes by fold — status flip deferred to the landing gate per campaign convention; do not re-implement
 
 ### Move blocking SQLite off the serving event loop (ui_chat + live-events WS)
 - id: `rm-076` | track: reliability | priority: 110.0 | status: in_progress
@@ -70,6 +72,7 @@
 - id: `rm-100` | track: reliability | priority: 75.0 | status: candidate
 - acceptance: CI matrix adds a green 3.13 lane (and 3.14 if deps allow); a dated plan lands the 3.11 floor bump with the next fork release (requires-python >=3.11, matrix drops 3.10, tomli conditional removed); CHANGELOG records both
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
+- update 2026-10-04 (repository-maintenance b4801f968fca cycle 3, run c7f77193824c, research c7c79bc485): dated trigger FIRED — endoflife.date probe confirms Python 3.10 EOL passed (2026-10-01, final release 3.10.22 the same day); current lines 3.14.8 (2026-09-30) and 3.12.15; v0.14.0 has shipped, so 'the next fork release' is now the next numbered one — land the 3.11 floor decision (requires-python, matrix, tomli removal) on the 0.15.0 planning wave
 
 ### cron next-fire + timezone preview at arm time
 - id: `rm-132` | track: reliability | priority: 72.0 | status: in_progress
@@ -80,6 +83,7 @@
 - id: `rm-048` | track: reliability | priority: 70.0 | status: in_progress
 - acceptance: docs/mcp-compatibility.md corrected to describe the revision lineage per SDK family instead of claiming one "latest"; the rm-009 revision assertion parameterized per installed SDK pin (still fails loudly on unexpected revisions); a mcp==2.3.x lane added to CI (or pins refreshed per rm-009's cadence rule) with a spec-delta review note for hermes surfaces; MCP-Auth cross-RFC notes (RFC 9728/9700 now Proposed Standard, draft-ietf-oauth-parallel-refresh adopted) reflected in docs/oauth.md where they touch hermes behavior
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
+- update 2026-10-04 (repository-maintenance b4801f968fca cycle 3, run c7f77193824c, research c7c79bc485): mcp python-sdk 2.3.0 released 2026-10-02 (PyPI probe; 1.30.0 last 1.x) and verified safe to adopt now — httpx2>=2.10 requirement touches no direct repo dependency, and x-mcp-header annotations failing at registration (InvalidSignature) hits zero repo annotations (grep-verified) — so the mcp==2.3.x CI lane can land immediately; ci.yml:47-51 exact pins still freeze at 1.28.1/2.0.0/1.30.0/2.2.0 behind a comment citing 'research 2026-09-20' while the >=2,<3 range lane silently resolves 2.3.0 — refresh the comment date in the same change; rider: MCPServer(subscriptions=False) surface reduction is available in 2.3.0 and unused here; spec lineage unchanged (latest revision still 2026-07-28)
 
 ### Ship or document a browser-UI build path (web assets absent from wheel/MANIFEST)
 - id: `rm-077` | track: reliability | priority: 70.0 | status: candidate
@@ -90,6 +94,7 @@
 - id: `rm-133` | track: reliability | priority: 68.0 | status: candidate
 - acceptance: decision recorded FIRST — (a) local version segment (e.g. 0.12.0+codeo1io or +<line-tag>) on fork releases, or (b) explicit never-publish-on-PyPI policy with a private index — in RELEASE_CHECKLIST.md + README; artifact metadata carries line provenance (commit or origin URL) so pip + doctor distinguish codebases; doctor VERSION line gains the line identity (extends operator_diagnostics.py:904); decision + implementation land BEFORE any 0.13-numbered fork release.
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
+- update 2026-10-04 (repository-maintenance b4801f968fca cycle 3, run c7f77193824c, research c7c79bc485): urgency UP and the 0.13-numbered window has CLOSED — upstream published hermes-gpt 0.13.0 (2026-10-03T23:22:09Z) AND 0.14.0 (2026-10-04T01:16:34Z) to the shared PyPI name within 26h (gh api releases) while fork master declares the same name+version (pyproject 0.14.0) on top of 142 fork-only commits: the fork can never publish under that identity, and any further fork release without this decision creates silent same-name-same-version divergence on a shared index; the decision must land BEFORE any fork release numbered past 0.14.0
 
 ### Extend skill validation to Work Contract and Swarm dispatch (hermetic #76 semantics)
 - id: `rm-054` | track: reliability | priority: 65.0 | status: candidate
@@ -115,6 +120,7 @@
 - id: `rm-046` | track: reliability | priority: 60.0 | status: in_progress
 - acceptance: both docs either added to data-files or de-referenced from README/docs map; NEW guard test asserts every docs/*.md link target in README.md and docs/README.md is in data-files (explicit allowlist for intentionally-unshipped historical docs); runtime-checkout.md refreshed or re-labeled as historical; `python -m build` + `twine check dist/*` + tools/check_package_hygiene.py dist/* run with the two docs present
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
+- update 2026-10-04 (repository-maintenance b4801f968fca cycle 3, run c7f77193824c, research c7c79bc485, verified at origin/master): counts re-verified — shared-data ships 33 docs of 36 tracked: runtime-checkout.md (linked from the docs/README authority map), maintenance-cycle-log.md, AND vnext-capability-manifest.md ship nowhere; the guard test must cover the third doc too (or it joins the shipped set)
 
 ### v0.13.0 release-readiness batch: publish + deployed-remote rollout
 - id: `rm-083` | track: reliability | priority: 60.0 | status: candidate
@@ -213,6 +219,12 @@
 - acceptance: an OpenAPI 3 document GENERATED from the route table (not hand-maintained prose), served at a read-only discovery endpoint or shipped in docs, with envelope schemas from the existing ok/err normalization; a contract test fails when a route's shape drifts from the document; the document is marked loopback-default/read-only-gates per product invariants.
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
 
+### Contribute the fork's fail-closed file-backup parse to upstream PR #85 (stewardship)
+- id: `rm-228` | track: reliability | priority: 46.0 | status: candidate (run c7f77193824c cycle 3; research c7c79bc485; minted past the fleet frontier — sibling worktree claims hold rm-217..rm-227 — per the rm-139 allocation doctrine)
+- signals: upstream PR #85 'make file backups configurable' (open since 2026-09-30, the only open upstream PR — gh api pulls?state=open) ships a fail-open draft parse, while the fork already landed the stronger fail-closed semantics + HERMES_GPT_OPERATOR_FILE_BACKUPS knob (operator_workspace.py:70-86, docstring cites PR #85; unrecognized values keep backups ON with an operator-visible warning); if #85 lands fail-open verbatim, the next adoption wave imports a weaker restore gate and re-opens fork/upstream drift on a safety net
+- acceptance: a comment or patch carrying the fork's fail-closed semantics lands on upstream PR #85 BEFORE it merges, OR #85 is observed merged and the fork reconciles the adoption to at-least-fork strength (parse stays fail-closed, knob preserved, parity test green); the contribution or reconciliation recorded in the maintenance cycle log; no fork-side behavior change from the contribution itself
+- evidence: PR #85 timeline exhibits (comment/commit refs via gh api) or the post-merge reconciliation diff + green suite run
+
 ### Fail-fast on empty/invalid code_challenge at issuance
 - id: `rm-018` | track: reliability | priority: 45.0 | status: in_progress
 - acceptance: issue_authorization_code raises on empty/malformed challenge (internal callers get loud errors, not dead credentials); rm-003's empty-challenge-rejected-at-exchange test still passes; no valid flow regresses
@@ -247,6 +259,7 @@
 - id: `rm-154` | track: reliability | priority: 40.0 | status: in_progress
 - acceptance: every staging site uses a unique-adjacent temp name (pid+token or mkstemp) created with restrictive mode and atomically replaced; a repo-wide guard test fails on any NEW fixed-name staging path (scan '.tmp' literals constructed without a uniquifier, mirroring the census command `rg -n "\.tmp" --glob '*.py' -g '!test_*'`); the touched files' existing tests stay green; no behavior change beyond the name
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
+- update 2026-10-04 (repository-maintenance b4801f968fca cycle 3, run c7f77193824c, assess 831640be — durability extension): census of all 8 atomic-write helpers at HEAD c43d085121 — operator_autopilot._atomic_json (:191-211) is best-in-class (unique tmp + file fsync + replace + flock) but NO helper fsyncs the parent directory (repo-wide grep for O_DIRECTORY|dir_fd: zero hits), and the cron/workspace/controller/fabric_artifacts/job_supervisor/codex/swarm sites fsync nothing at all; acceptance EXTENDED: consolidate on one shared durable helper (unique tmp, restrictive mode, file fsync, atomic replace, parent-dir fsync via an O_DIRECTORY dir_fd) and migrate the fsync-less sites onto it; coordinate with the in-flight rm-153/rm-154 implementation (run 9037c3156272) and sibling-claimed rm-219 (swarm/codex concurrency, unlanded run bd7f8ef7ddc1) so the guard test pins both uniqueness and durability
 
 ### Profile-aware skill-resolution gate before placement/dispatch
 - id: `rm-041` | track: reliability | priority: 38.0 | status: in_progress

@@ -48,12 +48,16 @@ jobs:
         sdk: ["mcp>=1.28.1,<2", "mcp>=2,<3"]
         # Exact pins run on the full matrix only (push(master)/nightly/
         # dispatch). Current upstream releases under test (research
-        # 2026-09-20): mcp 1.30.0 and 2.2.0 shipped 2026-09-07; exact pins
-        # keep them covered deliberately rather than incidentally via the
-        # range lanes.
+        # 2026-10-04, re-verified 2026-10-05, run c7f77193824c): mcp 1.30.0
+        # is the last 1.x; mcp 2.3.0 (2026-10-02) verified locally — protocol
+        # revision still 2026-07-28 (revision tests unchanged), httpx2>=2.10
+        # touches no repo dependency, and the new server-side x-mcp-header
+        # annotation validation at registration (tools/base.py) hits zero
+        # repo annotations (grep-verified). 2.2.0 stays covered incidentally
+        # by the >=2,<3 range lane; exact pins keep the newest 2.x deliberate.
         include: >-
           ${{ github.event_name == 'pull_request' && fromJSON('[]')
-          || fromJSON('[{"python": "3.10", "sdk": "mcp==1.28.1"}, {"python": "3.10", "sdk": "mcp==2.0.0"}, {"python": "3.10", "sdk": "mcp==1.30.0"}, {"python": "3.10", "sdk": "mcp==2.2.0"}]') }}
+          || fromJSON('[{"python": "3.10", "sdk": "mcp==1.28.1"}, {"python": "3.10", "sdk": "mcp==2.0.0"}, {"python": "3.10", "sdk": "mcp==1.30.0"}, {"python": "3.10", "sdk": "mcp==2.3.0"}]') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

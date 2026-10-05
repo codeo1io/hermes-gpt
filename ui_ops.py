@@ -829,5 +829,7 @@ def ui_ops_routes() -> list[Route]:
         Route("/api/ops/cron/{job_id}", _cron_detail, methods=["GET"]),
         Route("/api/ops/review/{contract_sha256}", _review_detail, methods=["GET"]),
         Route("/api/ops/{surface}", _ops_surface, methods=["GET"]),
-        Route("/api/ops/action", _action, methods=["POST"]),
+        # rm-134: the gated mutation lane passes the browser boundary
+        # (Sec-Fetch-Site / Origin / Content-Type) before any handler logic.
+        Route("/api/ops/action", ui_security.post_boundary(_action), methods=["POST"]),
     ]

@@ -817,9 +817,11 @@ def ui_chat_routes() -> List[Route]:
     """Chat + sessions routes composed by ``ui_api.routes()``."""
     return [
         Route("/api/sessions", _handle_sessions_list, methods=["GET"]),
-        Route("/api/sessions", _handle_sessions_create, methods=["POST"]),
+        # rm-134: mutating POSTs pass the browser boundary (Sec-Fetch-Site /
+        # Origin / Content-Type) before any handler logic — see ui_security.
+        Route("/api/sessions", ui_security.post_boundary(_handle_sessions_create), methods=["POST"]),
         Route("/api/sessions/{session_id}/messages", _handle_session_messages, methods=["GET"]),
-        Route("/api/chat", _handle_chat_post, methods=["POST"]),
+        Route("/api/chat", ui_security.post_boundary(_handle_chat_post), methods=["POST"]),
         Route("/api/chat/stream", _handle_chat_stream, methods=["GET"]),
-        Route("/api/chat/stop", _handle_chat_stop, methods=["POST"]),
+        Route("/api/chat/stop", ui_security.post_boundary(_handle_chat_stop), methods=["POST"]),
     ]

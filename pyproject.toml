@@ -163,6 +163,7 @@ py-modules = [
   "docs/flight-deck-coverage.md",
   "docs/flight-deck-missions.md",
   "docs/gemini-spark.md",
+  "docs/vnext-capability-manifest-and-mission-ledger.md",
 ]
 "share/hermes-gpt/examples" = [
   "examples/start-hermes-gpt.example.ps1",

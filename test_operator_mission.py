@@ -26,14 +26,22 @@ import operator_mission as mission
 
 
 def _make_state_db(path: Path, *, sessions: int = 2, delegations: list[dict] | None = None) -> None:
-    """Create a minimal state.db with sessions / async_delegations / usage."""
+    """Create a minimal state.db with sessions / async_delegations / usage.
+
+    The sessions table mirrors the PRODUCTION storage domain
+    (``hermes_state.SCHEMA_SQL``): ``started_at``/``last_activity_at`` as
+    REAL epoch seconds (``time.time()``). rm-152: seeding TEXT ISO-8601 here
+    masked the REAL-vs-ISO window comparison bug — SQLite orders numbers
+    before text, so an ISO cutoff never matched a REAL column and every
+    window was structurally zero in production while green in tests.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     try:
         conn.execute(
             "CREATE TABLE IF NOT EXISTS sessions ("
             " id TEXT PRIMARY KEY, source TEXT, model TEXT, profile_name TEXT,"
-            " started_at TEXT, ended_at TEXT, last_activity_at TEXT)"
+            " started_at REAL, ended_at REAL, last_activity_at REAL)"
         )
         conn.execute(
             "CREATE TABLE IF NOT EXISTS async_delegations ("
@@ -45,12 +53,30 @@ def _make_state_db(path: Path, *, sessions: int = 2, delegations: list[dict] | N
             " id INTEGER PRIMARY KEY, session_id TEXT, input_tokens INTEGER,"
             " output_tokens INTEGER, estimated_cost_usd REAL, cost_status TEXT)"
         )
+
+        def _epoch(age: timedelta) -> float:
+            return (datetime.now(timezone.utc) - age).timestamp()
+
         for i in range(sessions):
+            age = timedelta(hours=i * 2)
             conn.execute(
                 "INSERT OR IGNORE INTO sessions VALUES (?,?,?,?,?,?,?)",
-                (f"ses-{i}", "user", "model-x", "default",
-                 (datetime.now(timezone.utc) - timedelta(hours=i * 2)).isoformat(),
-                 None, (datetime.now(timezone.utc) - timedelta(hours=i * 2)).isoformat()),
+                (f"ses-{i}", "user", "model-x", "default", _epoch(age), None, _epoch(age)),
+            )
+        # rm-152 two-window fixture:
+        # - ses-stale (30h): inside the 7d window, outside the 24h window.
+        # - ses-week (6d): inside the 7d window, outside the 24h window.
+        # - ses-old (8d): outside BOTH windows.
+        # Their usage rows are excluded from every `_24h` aggregate, and
+        # ses-old is additionally excluded from sessions_7d.
+        for sid, age in (
+            ("ses-stale", timedelta(hours=30)),
+            ("ses-week", timedelta(days=6)),
+            ("ses-old", timedelta(days=8)),
+        ):
+            conn.execute(
+                "INSERT OR IGNORE INTO sessions VALUES (?,?,?,?,?,?,?)",
+                (sid, "user", "model-x", "default", _epoch(age), None, _epoch(age)),
             )
         conn.execute(
             "INSERT OR IGNORE INTO session_model_usage VALUES (1, 'ses-0', 100, 50, 0.05, 'known')"
@@ -58,17 +84,14 @@ def _make_state_db(path: Path, *, sessions: int = 2, delegations: list[dict] | N
         conn.execute(
             "INSERT OR IGNORE INTO session_model_usage VALUES (2, 'ses-1', 200, 100, 0.10, 'unknown')"
         )
-        # rm-152: a stale (30h-old) session with usage rows. The `_24h`
-        # aggregates must exclude it; an unfiltered read would report
-        # all-time totals under the `_24h` keys.
-        conn.execute(
-            "INSERT OR IGNORE INTO sessions VALUES (?,?,?,?,?,?,?)",
-            ("ses-stale", "user", "model-x", "default",
-             (datetime.now(timezone.utc) - timedelta(hours=30)).isoformat(),
-             None, (datetime.now(timezone.utc) - timedelta(hours=30)).isoformat()),
-        )
         conn.execute(
             "INSERT OR IGNORE INTO session_model_usage VALUES (3, 'ses-stale', 1000, 500, 5.0, 'known')"
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO session_model_usage VALUES (4, 'ses-week', 500, 250, 1.0, 'known')"
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO session_model_usage VALUES (5, 'ses-old', 2000, 1000, 10.0, 'known')"
         )
         for d in delegations or []:
             conn.execute(
@@ -594,18 +617,19 @@ def test_usage_aggregates_across_profiles(hermes_root):
 def test_usage_24h_window_excludes_stale_sessions(hermes_root):
     """rm-152: the `_24h` keys must be windowed, never all-time.
 
-    The fixture seeds an out-of-window session (`ses-stale`, 30h old, usage
-    1000 in / 500 out / $5.00) in every profile. Windowed sums must exclude
-    it and the dev profile's orphan `ses-1` usage row; an unfiltered read
-    would report 2600 in / 1300 out / +$10 under the `_24h` keys (1300 per
-    profile — dev's stale 1000-in row is also orphaned, not windowed).
+    The fixture seeds out-of-window sessions with usage in every profile:
+    `ses-stale` (30h old, 1000 in / 500 out / $5.00), `ses-week` (6d old,
+    500 in / 250 out / $1.00) and `ses-old` (8d old, 2000 in / 1000 out /
+    $10.00), plus dev's orphan `ses-1` usage row (no owning session there).
+    Windowed sums exclude all of them; an unfiltered read would report the
+    per-profile all-time total (3800 in for default) under the `_24h` keys.
     """
     out = _run("hermes_mission_usage_tool", hermes_root)
     data = out["data"]
-    assert data["sessions_24h"] == 3  # stale session is outside the window
+    assert data["sessions_24h"] == 3  # stale/week/old sessions are outside the window
     assert data["tokens_24h"]["input"] == 400  # (100 + 200) + 100
     assert data["tokens_24h"]["output"] == 200  # (50 + 100) + 50
-    # Known costs only: default (0.05 + 0.10) + dev ses-0 (0.05).
+    # Costs include unknown-status estimates: default (0.05 + 0.10) + dev ses-0 (0.05).
     assert data["estimated_cost_24h_usd"] == pytest.approx(0.20)
     assert data["by_profile"]["default"]["tokens_in"] == 300
     assert data["by_profile"]["dev"]["tokens_in"] == 100
@@ -639,11 +663,121 @@ def test_usage_schema_drift_falls_back_to_all_time_with_warning(hermes_root):
     drift = [w for w in out["warnings"] if "ALL-TIME" in w]
     assert drift, f"expected explicit all-time degradation warning, got {out['warnings']}"
     assert "default" in drift[0]
-    # Default falls back to all-time (100 + 200 + 1000 = 1300 in);
+    # Default falls back to all-time (100 + 200 + 1000 + 500 + 2000 = 3800 in);
     # dev still windows (100 in — ses-0 only, orphan excluded).
-    assert out["data"]["by_profile"]["default"]["tokens_in"] == 1300
+    assert out["data"]["by_profile"]["default"]["tokens_in"] == 3800
     assert out["data"]["by_profile"]["dev"]["tokens_in"] == 100
-    assert out["data"]["tokens_24h"]["input"] == 1400
+    assert out["data"]["tokens_24h"]["input"] == 3900
+
+
+def test_usage_windows_on_production_real_schema(hermes_root):
+    """rm-152: windows must work against the PRODUCTION storage domain.
+
+    `hermes_state.SCHEMA_SQL` declares started_at/last_activity_at REAL
+    epoch seconds; the fixture seeds that domain (it previously seeded TEXT
+    ISO-8601, masking the bug: an ISO cutoff never compares true against a
+    REAL column, so every window was structurally zero in production).
+    """
+    out = _run("hermes_mission_usage_tool", hermes_root)
+    data = out["data"]
+    # 24h window: default ses-0 (0h) + ses-1 (2h), dev ses-0.
+    assert data["sessions_24h"] == 3
+    assert data["tokens_24h"]["input"] == 400
+    assert data["tokens_24h"]["output"] == 200
+    assert data["by_profile"]["default"]["sessions_24h"] == 2
+    assert data["by_profile"]["dev"]["sessions_24h"] == 1
+    assert data["estimated_cost_24h_usd"] == pytest.approx(0.20)
+
+
+def test_profiles_sessions_7d_window_real_epoch(hermes_root):
+    """rm-152: sessions_7d counts REAL last_activity_at within 7d and
+    reports last_activity as an ISO-8601 string converted from the epoch."""
+    out = _run("hermes_mission_profiles_tool", hermes_root)
+    by_profile = {p["profile"]: p for p in out["data"]["profiles"]}
+    default, dev = by_profile["default"], by_profile["dev"]
+    # 7d window: ses-0, ses-1, ses-stale (30h), ses-week (6d); ses-old (8d) excluded.
+    assert default["sessions_7d"] == 4
+    assert dev["sessions_7d"] == 3  # ses-0 + ses-stale + ses-week
+    # last_activity is a str (converted from REAL epoch), parseable, recent.
+    assert isinstance(default["last_activity"], str)
+    parsed = datetime.fromisoformat(default["last_activity"])
+    assert parsed > datetime.now(timezone.utc) - timedelta(hours=1)  # ses-0 is ~0h old
+    assert not any("last_activity_at_missing" in w for w in out["warnings"])
+
+
+def test_usage_windows_with_legacy_text_iso_schema(tmp_path, monkeypatch):
+    """rm-152: legacy databases storing TEXT ISO-8601 still window correctly
+    (the cutoff follows each column's storage domain, so both schema eras
+    compare truthfully instead of one of them silently zeroing)."""
+    root = tmp_path / "hermes"
+    root.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    op.set_audit_log_override(tmp_path / "audit.jsonl")
+    mission._cache_clear()
+    (root / "config.yaml").write_text("model:\n  default: m\n", encoding="utf-8")
+    now = datetime.now(timezone.utc)
+    conn = sqlite3.connect(root / "state.db")
+    try:
+        conn.execute(
+            "CREATE TABLE sessions ("
+            " id TEXT PRIMARY KEY, source TEXT, model TEXT, profile_name TEXT,"
+            " started_at TEXT, ended_at TEXT, last_activity_at TEXT)"
+        )
+        conn.execute(
+            "CREATE TABLE session_model_usage ("
+            " id INTEGER PRIMARY KEY, session_id TEXT, input_tokens INTEGER,"
+            " output_tokens INTEGER, estimated_cost_usd REAL, cost_status TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO sessions VALUES ('s-fresh', 'user', 'm', 'default', ?, NULL, ?)",
+            ((now - timedelta(hours=1)).isoformat(), (now - timedelta(hours=1)).isoformat()),
+        )
+        conn.execute(
+            "INSERT INTO sessions VALUES ('s-old', 'user', 'm', 'default', ?, NULL, ?)",
+            ((now - timedelta(days=9)).isoformat(), (now - timedelta(days=9)).isoformat()),
+        )
+        conn.execute("INSERT INTO session_model_usage VALUES (1, 's-fresh', 10, 5, 0.01, 'known')")
+        conn.execute("INSERT INTO session_model_usage VALUES (2, 's-old', 900, 450, 9.0, 'known')")
+        conn.commit()
+    finally:
+        conn.close()
+    out = _run("hermes_mission_usage_tool", root)
+    assert out["data"]["sessions_24h"] == 1
+    assert out["data"]["tokens_24h"]["input"] == 10
+    assert out["data"]["tokens_24h"]["output"] == 5
+    assert not out["warnings"]
+
+
+def test_usage_missing_started_at_degrades_explicitly(hermes_root):
+    """rm-152 schema drift: sessions without started_at degrade EXPLICITLY —
+    the profile's sessions_24h is reported unavailable (warning), token/cost
+    sums degrade to all-time WITH an ALL-TIME warning, never silently."""
+    conn = sqlite3.connect(hermes_root / "state.db")
+    try:
+        conn.execute("ALTER TABLE sessions RENAME TO sessions_started")
+        conn.execute(
+            "CREATE TABLE sessions ("
+            " id TEXT PRIMARY KEY, source TEXT, model TEXT, profile_name TEXT,"
+            " last_activity_at REAL)"
+        )
+        conn.execute(
+            "INSERT INTO sessions SELECT id, source, model, profile_name, last_activity_at"
+            " FROM sessions_started"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    mission._cache_clear()
+    out = _run("hermes_mission_usage_tool", hermes_root)
+    warns = out["warnings"]
+    assert any("started_at missing" in w and "default" in w for w in warns), warns
+    assert any("ALL-TIME" in w and "default" in w for w in warns), warns
+    # The drifted profile contributes no windowed session count …
+    assert out["data"]["by_profile"]["default"]["sessions_24h"] == 0
+    assert out["data"]["by_profile"]["default"]["tokens_in"] == 3800  # all-time, warned
+    # … while dev (own state.db) still windows cleanly.
+    assert out["data"]["by_profile"]["dev"]["sessions_24h"] == 1
+    assert out["data"]["by_profile"]["dev"]["tokens_in"] == 100
 
 
 # ---------------------------------------------------------------------------

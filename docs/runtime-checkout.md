@@ -1,5 +1,11 @@
 # Live runtime checkout pin (host deployment provenance)
 
+> **Not shipped**: this note records live host state (which checkout the host's
+> `hermes-gpt-server.service` currently serves). It is deliberately excluded
+> from built packages — see `test_docs_shipping.py` and the docs map in
+> [`docs/README.md`](README.md). Repo readers: verify it fresh; it can change
+> without a code change.
+
 This note records **which checkout the live `hermes-gpt-server.service` actually
 serves**, so agents do not assume the live surface equals the branch they happened
 to inspect. It is host-deployment state, not a product contract. Verify it fresh

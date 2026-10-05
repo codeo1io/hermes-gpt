@@ -19,6 +19,20 @@ client support. New-protocol clients do not use the legacy initialization
 handshake. These are SDK transport semantics, not a change to Hermes Operator
 authority. See the [SDK migration guide](https://py.sdk.modelcontextprotocol.io/migration/).
 
+### SDK-family lineage for `x-mcp-header` (as of mcp 1.30.0 / 2.2.0 / 2.3.0)
+
+The `x-mcp-header` annotation surface (per-call header metadata on tools) is
+SDK 2 machinery: the shared codec (`mcp.shared.inbound`) ships with SDK 2.x,
+and **mcp 2.3.0 adds server-side validation at tool registration** — an
+invalid `x_mcp_header` annotation fails registration instead of being
+ignored. SDK 1.x has no such surface. Hermes GPT registers **zero
+`x-mcp-header` annotations** (grep-verified across the repo), so the 2.3.0
+validation is a no-op here; the exact-pin CI lane `mcp==2.3.0` keeps that
+true deliberately. `LATEST_PROTOCOL_VERSION` is `2026-07-28` under SDK 2.2.0
+and 2.3.0 (verified locally), while the SDK 1.x lane keeps its own family
+latest (`2025-11-25`, pinned by `test_mcp_compat.py`); the protocol-revision
+tests are per-family asserts and are unchanged by the pin refresh.
+
 The shared `mcp_compat.HermesMCP` adapter preserves explicit HTTP/SSE options:
 SDK 1 accepts them at construction; SDK 2 accepts them at ASGI app creation.
 Both retain JSON, stateless Streamable HTTP when started with `--http` and

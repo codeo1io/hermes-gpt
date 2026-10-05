@@ -37,10 +37,12 @@ Import-safe: no hard dependency on Hermes internals. ``operator_mission`` and
 from __future__ import annotations
 
 import asyncio
+import functools
 import os
 import re
 import threading
 import time
+import urllib.parse
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -61,6 +63,15 @@ UI_PROFILE_ENV = "HERMES_GPT_UI_PROFILE"
 UI_DIR_ENV = "HERMES_GPT_UI_DIR"
 UI_STALE_LEASE_S_ENV = "HERMES_GPT_UI_STALE_LEASE_S"
 UI_TOOL_PREVIEW_BYTES_ENV = "HERMES_GPT_UI_TOOL_PREVIEW_BYTES"
+#: rm-134: disable the mutating-POST browser boundary (see
+#: ``docs/ui-security-boundary.md``). Escape hatch for exotic local reverse
+#: proxies; must never be set when the UI is reachable off-loopback.
+UI_POST_BOUNDARY_ENV = "HERMES_GPT_UI_POST_BOUNDARY"
+
+#: rm-134: browser origin explicitly allowed for the ChatGPT conversational
+#: UI — the SAME constant the CORS allow-list in ``server.build_server`` /
+#: ``build_asgi_app`` is built around. Single source of truth: do not fork it.
+CHATGPT_UI_ORIGIN = "https://chatgpt.com"
 
 DEFAULT_STALE_LEASE_S = 600
 DEFAULT_TOOL_PREVIEW_BYTES = 8192
@@ -467,6 +478,112 @@ def error_envelope(code: str, message: str, *, trace_id: str | None = None) -> d
 def err(code: str, message: str, *, status_code: int = 400, trace_id: str | None = None) -> JSONResponse:
     """Return an error JSONResponse (envelope shape per interface-contracts.md §7)."""
     return JSONResponse(error_envelope(code, message, trace_id=trace_id), status_code=status_code)
+
+
+# ---------------------------------------------------------------------------
+# rm-134: mutating-POST browser boundary (cross-site / origin / content-type)
+# ---------------------------------------------------------------------------
+
+
+def _post_boundary_enabled() -> bool:
+    value = os.environ.get(UI_POST_BOUNDARY_ENV, "").strip().lower()
+    return value not in {"off", "0", "false", "disabled"}
+
+
+def _issuer_origin() -> str:
+    """Issuer origin from the SAME oauth env config the server derives its
+    CORS allow-list from (``oauth_auth.config_from_env``), so the POST
+    boundary can never diverge from it. Import-safe: read lazily; any failure
+    (oauth unconfigured, import error) degrades to "" (issuer not allowed).
+    """
+    try:
+        import oauth_auth  # import-safe: lazy, mirrors the module docstring rule
+
+        config = oauth_auth.config_from_env()
+        issuer = getattr(config, "issuer", "") or ""
+    except Exception:
+        return ""
+    if not issuer:
+        return ""
+    parsed = urllib.parse.urlparse(issuer)
+    return f"{parsed.scheme}://{parsed.netloc}" if parsed.netloc else ""
+
+
+def post_boundary_rejection(request: Request, *, json_body: bool = True) -> JSONResponse | None:
+    """Enforce the browser boundary on a mutating POST (rm-134).
+
+    Called before any handler logic. Returns an error response the caller
+    must return, or ``None`` when the request may proceed.
+
+    Rules (AGENTS.md invariant preserved: local loopback stays the default
+    network boundary; public unauthenticated Operator hosting unsupported):
+
+    - ``Sec-Fetch-Site: cross-site`` -> 403 ``CROSS_SITE_POST``. The header is
+      browser-only metadata, so non-browser clients (MCP tools, curl) are
+      unaffected by construction.
+    - ``Origin`` present but outside the allowed set -> 403
+      ``ORIGIN_NOT_ALLOWED``. The allowed set is exactly {the UI's own origin,
+      ``CHATGPT_UI_ORIGIN``, the issuer origin when oauth is configured} —
+      the same set ``server.build_server`` allows for CORS.
+    - ``json_body``: when the request carries a body, ``Content-Type`` must be
+      ``application/json`` -> 415 ``JSON_CONTENT_TYPE_REQUIRED``. Browsers
+      cannot make a cross-site ``application/json`` request without passing
+      the checks above (form posts default to urlencoded/multipart); bodyless
+      POSTs (e.g. session create) are not content-type-gated.
+
+    ``HERMES_GPT_UI_POST_BOUNDARY=off`` disables every rule (documented escape
+    hatch; never use it off-loopback).
+    """
+    if not _post_boundary_enabled():
+        return None
+    fetch_site = request.headers.get("sec-fetch-site", "").strip().lower()
+    if fetch_site == "cross-site":
+        return err(
+            "CROSS_SITE_POST",
+            "Cross-site browser POSTs are not accepted by this UI",
+            status_code=403,
+        )
+    origin = request.headers.get("origin", "").strip()
+    if origin:
+        allowed = {
+            CHATGPT_UI_ORIGIN,
+            _issuer_origin(),
+            f"{request.url.scheme}://{request.url.netloc}",
+        }
+        allowed.discard("")
+        if origin.rstrip("/") not in {item.rstrip("/") for item in allowed}:
+            return err(
+                "ORIGIN_NOT_ALLOWED",
+                "Origin is not allowed to POST to this UI",
+                status_code=403,
+            )
+    if json_body:
+        has_body = (
+            "content-length" in request.headers
+            and request.headers.get("content-length", "0") not in ("", "0")
+        ) or "transfer-encoding" in request.headers
+        if has_body:
+            content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+            if content_type != "application/json":
+                return err(
+                    "JSON_CONTENT_TYPE_REQUIRED",
+                    "POST bodies must use Content-Type: application/json",
+                    status_code=415,
+                )
+    return None
+
+
+def post_boundary(handler: Any) -> Any:
+    """Wrap an async POST handler with ``post_boundary_rejection``."""
+
+    @functools.wraps(handler)
+    async def _wrapped(request: Request) -> Any:
+        rejection = post_boundary_rejection(request)
+        if rejection is not None:
+            return rejection
+        return await handler(request)
+
+    return _wrapped
 
 
 # ---------------------------------------------------------------------------
