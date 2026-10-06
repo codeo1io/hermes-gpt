@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Restored the README development-verification install instruction to
+  `python -m pip install -e ".[dev]"`, matching the consolidated pyproject
+  dev extra; the previous line still pointed at the deleted
+  `requirements-dev.txt` manifest.
+
 ## 0.14.0 - 2026-10-03
 
 Acceptance and recovery: declare deliverable checks before dispatch and recover from positively observed artifact failures within existing limits.
