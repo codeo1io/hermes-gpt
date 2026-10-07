@@ -11,6 +11,7 @@ regression in the guard itself is caught without a full build.
 from __future__ import annotations
 
 import io
+import os
 import subprocess
 import sys
 import tarfile
@@ -109,6 +110,67 @@ def test_scan_does_not_false_positive_on_public_content(text):
     assert guard.scan_text(text) == []
 
 
+def test_scan_flags_the_shipped_rm207_docstring_that_broke_ci():
+    """rm-318 regression pin, leg 1: the RE itself stays strong enough to
+    have caught the 0.14.0 docstring ("207 profile" adjacency; master CI red
+    on every lane, runs 37239574336 / 37303778846). If this fails, someone
+    weakened OPERATIONAL_METRIC_RE to make the tree scan clean — forbidden.
+    """
+    text = "Scope one call to a profile home under the shared rm-207 profile gate."
+    findings = guard.scan_text(text)
+    assert any(
+        name == "operational_metric" and matched == "207 profile"
+        for name, matched in findings
+    ), findings
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Scope one call to a profile home under the shared profile gate (rm-207).",
+        "shared profile gate from the rm-207 landing",
+    ],
+)
+def test_scan_allows_the_rm318_docstring_rewrites(text):
+    """rm-318 regression pin, leg 2: the chosen rewrites break the digit+
+    profile adjacency without hiding the number, so cross-referencing prose
+    keeps working and the tree scans clean."""
+    assert not any(
+        name == "operational_metric" for name, _ in guard.scan_text(text)
+    ), guard.scan_text(text)
+
+
+def test_declared_py_modules_are_operational_metric_clean():
+    """rm-318 regression pin, leg 3: every module shipped in the wheel must
+    scan clean for operational metrics TODAY (no build needed), so the next
+    prose regression fails in seconds instead of on the release guard.
+
+    Sweeps exactly the pyproject ``py-modules`` list the wheel packs.
+    """
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        import tomli as tomllib
+    with open(REPO_ROOT / "pyproject.toml", "rb") as fh:
+        pyproject = tomllib.load(fh)
+    modules = pyproject["tool"]["setuptools"]["py-modules"]
+    assert modules, "pyproject.toml declares no py-modules"
+    offenders: list[tuple[str, str]] = []
+    for module in modules:
+        source = REPO_ROOT / f"{module}.py"
+        assert source.is_file(), f"declared py-module missing from tree: {module}"
+        text = source.read_text(encoding="utf-8", errors="replace")
+        offenders.extend(
+            (module, matched)
+            for name, matched in guard.scan_text(text)
+            if name == "operational_metric"
+        )
+    assert not offenders, (
+        "shipped py-modules trip OPERATIONAL_METRIC_RE (release-blocking "
+        f"hygiene false positive, the rm-318 failure mode): {offenders}"
+    )
+
+
 @pytest.mark.parametrize(
     ("name", "expected"),
     [
@@ -172,7 +234,16 @@ def test_synthetic_archives_reject_nested_private_configuration_and_key_bundles(
 
 @pytest.fixture(scope="module")
 def built_artifacts(tmp_path_factory):
-    """Build wheel + sdist once per module and return the artifact paths."""
+    """Build wheel + sdist once per module and return the artifact paths.
+
+    rm-318: a build-less or failing environment is LOUD, not silent. Before
+    this, the fixture ``pytest.skip``ped on ``FileNotFoundError`` (build not
+    installed) AND on ``CalledProcessError`` (build failed), so every
+    build-less venv reported the three release-blocking built-artifact tests
+    as green-looking skips — which is how red master shipped unremarked
+    (assess 988c9b7a F2). Now it fails with the remediation in the message;
+    the only escape hatch is the explicit opt-out env marker below.
+    """
     outdir = tmp_path_factory.mktemp("dist")
     try:
         subprocess.run(
@@ -184,7 +255,16 @@ def built_artifacts(tmp_path_factory):
             timeout=300,
         )
     except (subprocess.CalledProcessError, FileNotFoundError) as exc:
-        pytest.skip(f"python -m build unavailable or failed: {exc}")
+        if os.environ.get("HERMES_GPT_HYGIENE_ALLOW_BUILD_SKIP") == "1":
+            pytest.skip(
+                "built-artifact hygiene tests SKIPPED by explicit opt-out "
+                f"HERMES_GPT_HYGIENE_ALLOW_BUILD_SKIP=1: {exc}"
+            )
+        pytest.fail(
+            "built-artifact hygiene tests require a successful "
+            f"`python -m build` (pip install build): {exc}",
+            pytrace=False,
+        )
     artifacts = sorted(outdir.glob("*.whl")) + sorted(outdir.glob("*.tar.gz"))
     assert artifacts, "build produced no artifacts"
     return artifacts

@@ -24,6 +24,7 @@ from starlette.routing import BaseRoute, Mount, Route
 
 import oauth_auth
 import operator_policy as op_policy
+from operator_profile_scope import profile_override_gate
 import operator_cron as op_cron
 import operator_skills as op_skills
 import operator_config as op_config
@@ -656,22 +657,40 @@ class ReadOnlySessionAdapter:
             eprint(f"hermes-gpt: read-only session disposal failed: {_redact_error(exc)}")
 
 
+def _default_skill_home() -> Path:
+    """Override-independent home for un-profiled skill reads (rm-319).
+
+    ``get_hermes_home`` reflects the process-global override another
+    profile-scoped call may hold mid-window, so it must never pick the gate
+    key for a read: the read gates on the env/default home so a concurrent
+    window for a different home makes it wait (bounded, fail-closed) instead
+    of listing the holder's skills.
+    """
+    env_home = os.environ.get("HERMES_HOME")
+    return Path(env_home).expanduser() if env_home else Path.home() / ".hermes"
+
+
 def skill_roots() -> list[Path]:
     roots: list[Path] = []
-    hermes_home = None
-    if callable(get_hermes_home):
-        try:
-            hermes_home = Path(get_hermes_home())
-        except Exception:
-            hermes_home = None
-    if hermes_home is None:
-        env_home = os.environ.get("HERMES_HOME")
-        hermes_home = Path(env_home).expanduser() if env_home else Path.home() / ".hermes"
+    # rm-319: resolve under the shared profile gate. While this gate key is
+    # held, any live override must target the same home (every in-process
+    # override site holds the gate on the home it installs), so the
+    # resolution below can no longer observe another profile's window
+    # mid-call. Same-home windows still overlap.
+    with profile_override_gate(_default_skill_home()):
+        hermes_home = None
+        if callable(get_hermes_home):
+            try:
+                hermes_home = Path(get_hermes_home())
+            except Exception:
+                hermes_home = None
+        if hermes_home is None:
+            hermes_home = _default_skill_home()
 
-    roots.append(hermes_home / "skills")
-    profiles = hermes_home / "profiles"
-    if profiles.exists():
-        roots.extend(path / "skills" for path in profiles.iterdir() if path.is_dir())
+        roots.append(hermes_home / "skills")
+        profiles = hermes_home / "profiles"
+        if profiles.exists():
+            roots.extend(path / "skills" for path in profiles.iterdir() if path.is_dir())
     if HERMES_ROOT:
         roots.append(HERMES_ROOT / "skills")
 
@@ -719,12 +738,16 @@ def parse_skill_doc(path: Path) -> dict[str, str]:
 
 def discover_skills() -> list[dict[str, str]]:
     skills: list[dict[str, str]] = []
-    for root in skill_roots():
-        for skill_md in root.rglob("SKILL.md"):
-            try:
-                skills.append(parse_skill_doc(skill_md))
-            except Exception as exc:
-                eprint(f"hermes-gpt: could not read skill {skill_md}: {exc}")
+    # rm-319: the whole discovery walk runs under the shared profile gate so
+    # skill_roots resolution and the SKILL.md reads cannot interleave with a
+    # different home's override window.
+    with profile_override_gate(_default_skill_home()):
+        for root in skill_roots():
+            for skill_md in root.rglob("SKILL.md"):
+                try:
+                    skills.append(parse_skill_doc(skill_md))
+                except Exception as exc:
+                    eprint(f"hermes-gpt: could not read skill {skill_md}: {exc}")
     return sorted(skills, key=lambda item: (item["name"].lower(), item["path"].lower()))
 
 
@@ -886,7 +909,11 @@ def hermes_skill_list(query: str = "", limit: int = 50, include_manual: bool = F
         require_imports()
         capped_limit = max(1, min(int(limit), 200))
         needle = query.strip().lower()
-        skills = _dedupe_skills(discover_skills())
+        # rm-319: discovery resolves under the shared profile gate (reentrant
+        # with skill_roots/discover_skills) so an un-profiled listing never
+        # materializes another profile's home mid-window.
+        with profile_override_gate(_default_skill_home()):
+            skills = _dedupe_skills(discover_skills())
         if not include_manual:
             skills = [skill for skill in skills if not _skill_manual_only(skill)]
         if needle:
@@ -926,30 +953,34 @@ def hermes_skill_view(
     try:
         require_imports()
         query = name.strip().lower()
-        matches = [
-            skill
-            for skill in _dedupe_skills(discover_skills())
-            if skill["name"].lower() == query or Path(skill["path"]).parent.name.lower() == query
-        ]
-        if not matches:
-            return f"No skill matched {name!r}."
+        # rm-319: name resolution AND the content read run under the shared
+        # profile gate so a view can never resolve into, or read the contents
+        # of, another profile's home held mid-window by a concurrent call.
+        with profile_override_gate(_default_skill_home()):
+            matches = [
+                skill
+                for skill in _dedupe_skills(discover_skills())
+                if skill["name"].lower() == query or Path(skill["path"]).parent.name.lower() == query
+            ]
+            if not matches:
+                return f"No skill matched {name!r}."
 
-        skill_doc = Path(matches[0]["path"]).resolve()
-        skill_dir = skill_doc.parent
-        relative = Path(file_path or "SKILL.md")
-        if relative.is_absolute() or any(part == ".." for part in relative.parts):
-            raise ValueError("file_path must be a relative path inside the skill directory")
-        target = (skill_dir / relative).resolve()
-        try:
-            target.relative_to(skill_dir)
-        except ValueError as exc:
-            raise ValueError("file_path must stay inside the skill directory") from exc
-        if not target.is_file():
-            return f"Skill {matches[0]['name']!r} has no file {file_path!r}."
+            skill_doc = Path(matches[0]["path"]).resolve()
+            skill_dir = skill_doc.parent
+            relative = Path(file_path or "SKILL.md")
+            if relative.is_absolute() or any(part == ".." for part in relative.parts):
+                raise ValueError("file_path must be a relative path inside the skill directory")
+            target = (skill_dir / relative).resolve()
+            try:
+                target.relative_to(skill_dir)
+            except ValueError as exc:
+                raise ValueError("file_path must stay inside the skill directory") from exc
+            if not target.is_file():
+                return f"Skill {matches[0]['name']!r} has no file {file_path!r}."
 
-        start = max(1, int(offset))
-        capped_limit = max(1, min(int(limit), 2000))
-        text = target.read_text(encoding="utf-8", errors="replace")
+            start = max(1, int(offset))
+            capped_limit = max(1, min(int(limit), 2000))
+            text = target.read_text(encoding="utf-8", errors="replace")
         lines = text.splitlines()
         chunk = lines[start - 1 : start - 1 + capped_limit]
         rendered = "\n".join(chunk)

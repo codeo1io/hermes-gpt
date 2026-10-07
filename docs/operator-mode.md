@@ -510,6 +510,12 @@ If `HERMES_HOME` points at a named profile or the Hermes Agent source directory,
 
 `HERMES_GPT_OPERATOR_ALLOWED_PATHS` should contain only the workspaces the Operator server is expected to touch.
 
+### Profile isolation under concurrency
+
+Profile-scoped operations hold a shared gate (`operator_profile_scope`) keyed by the profile home: windows for the same home overlap, windows for different homes never do. Skill mutations and the skill read tools (`hermes_skill_list`, `hermes_skill_view`, including their Operator aliases) resolve under this gate, so an un-profiled read cannot list another profile's skills or return their contents while that profile's window is open — the read waits instead.
+
+The wait is bounded: if a different home's window does not drain within `HERMES_GPT_PROFILE_GATE_TIMEOUT` seconds (default 300; invalid or non-positive values fall back to the default), the call fails closed with a timeout error rather than proceeding ungated or hanging. Reads scoped to the same home as the open window never wait.
+
 ## Remote access posture
 
 Keep the MCP server bound to `127.0.0.1`.

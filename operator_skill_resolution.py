@@ -194,7 +194,7 @@ def _agent_modules() -> tuple[Any, Any] | None:
 
 @contextmanager
 def _profile_scope(profile_home: Path, constants: Any):
-    """Scope one call to a profile home under the shared rm-207 profile gate.
+    """Scope one call to a profile home under the shared profile gate (rm-207).
 
     The Agent override is process-global, so concurrent Operator tool calls
     for different profiles must not hold windows at the same time; the gate

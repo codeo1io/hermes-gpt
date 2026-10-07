@@ -10,6 +10,14 @@ each other's profile home mid-call (assess finding F03). These tests pin:
 * same-profile windows still overlap (no throughput regression);
 * the full repo paths (``operator_skill_resolution._explicit_load_ok`` and
   ``operator_skills._call_skill_manager``) are scoped under the shared gate;
+* rm-319: the server READ path (``skill_roots`` / ``discover_skills`` /
+  ``hermes_skill_list`` / ``hermes_skill_view``) also resolves under the
+  shared gate, so an un-profiled read never lists another profile's skills
+  or returns their contents while that profile's window is open, and
+  same-home windows still overlap;
+* rm-319: the cross-home wait is bounded — past
+  ``HERMES_GPT_PROFILE_GATE_TIMEOUT`` (default 300s) the gate fails closed
+  with ``ProfileScopeTimeout`` instead of blocking forever;
 * a subprocess spawned inside a window observes only that window's profile
   through the operator env-construction pattern, and the parent's
   ``os.environ`` is never mutated;
@@ -36,6 +44,7 @@ import pytest
 import operator_profile_scope as profile_scope
 import operator_skills as osk
 import operator_skill_resolution as resolution
+import server
 
 
 class _FakeAgentConstants:
@@ -242,6 +251,54 @@ def test_scope_degrades_to_noop_without_override_pair(tmp_path):
     with profile_scope.profile_override_scope(tmp_path, broken):
         assert constants.current_home() is None  # nothing installed
     assert constants.current_home() is None  # nothing left behind
+
+
+# ---------------------------------------------------------------------------
+# rm-319: the cross-home wait is bounded and fails closed
+# ---------------------------------------------------------------------------
+
+
+def test_gate_wait_timeout_env_parsing(monkeypatch):
+    """HERMES_GPT_PROFILE_GATE_TIMEOUT tunes the bound; garbage never
+    disables it (the wait must never become unbounded again)."""
+    monkeypatch.delenv("HERMES_GPT_PROFILE_GATE_TIMEOUT", raising=False)
+    assert profile_scope._gate_wait_timeout() == 300.0
+    for raw in ("garbage", "0", "-5", ""):
+        monkeypatch.setenv("HERMES_GPT_PROFILE_GATE_TIMEOUT", raw)
+        assert profile_scope._gate_wait_timeout() == 300.0, raw
+    monkeypatch.setenv("HERMES_GPT_PROFILE_GATE_TIMEOUT", "0.25")
+    assert profile_scope._gate_wait_timeout() == 0.25
+
+
+def test_gate_wait_is_bounded_and_fails_closed(tmp_path, monkeypatch):
+    """Waiting out a different home's window raises ProfileScopeTimeout
+    past the bound (no hang) and leaves no gate residue behind."""
+    homes = _two_homes(tmp_path)
+    monkeypatch.setenv("HERMES_GPT_PROFILE_GATE_TIMEOUT", "0.25")
+    inside = threading.Event()
+    release = threading.Event()
+
+    def holder() -> None:
+        with profile_scope.profile_override_gate(homes["alpha"]):
+            inside.set()
+            assert release.wait(timeout=10)
+
+    thread = threading.Thread(target=holder)
+    thread.start()
+    assert inside.wait(timeout=5.0)
+
+    started = time.monotonic()
+    with pytest.raises(profile_scope.ProfileScopeTimeout):
+        with profile_scope.profile_override_gate(homes["beta"]):
+            pass  # pragma: no cover - must not be reached
+    elapsed = time.monotonic() - started
+    assert 0.2 <= elapsed < 5.0, elapsed
+
+    release.set()
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+    with profile_scope.profile_override_gate(homes["beta"]):  # no residue
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -473,3 +530,155 @@ def test_scoped_paths_log_no_profile_material(tmp_path):
         assert str(home) not in message, message
         assert "alpha" not in message, message
         assert "profiles" not in message, message
+
+
+# ---------------------------------------------------------------------------
+# rm-319: the server READ path resolves under the shared gate
+# ---------------------------------------------------------------------------
+
+
+def _skill_read_env(tmp_path, monkeypatch, constants):
+    """Two homes: the default (base) home and a foreign profile 'beta'.
+
+    Mirrors the real mechanics hermetically: server's ``get_hermes_home``
+    stand-in returns whatever override the fake process-global currently
+    holds, falling back to the base home — exactly the resolution the real
+    global performs.
+    """
+    base = tmp_path / "home-base"
+    beta = tmp_path / "hermes" / "profiles" / "beta"
+    for home, marker in ((base, "base"), (beta, "beta-secret")):
+        skill = home / "skills" / f"{marker}-skill"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text(
+            f"---\nname: {marker}-skill\ndescription: demo {marker}\n---\n"
+            f"contents of {marker}\n",
+            encoding="utf-8",
+        )
+    monkeypatch.setenv("HERMES_HOME", str(base))
+    monkeypatch.setattr(server, "HERMES_ROOT", None)
+    monkeypatch.setattr(server, "require_imports", lambda: None)
+    monkeypatch.setattr(
+        server,
+        "get_hermes_home",
+        lambda: constants.current_home() or str(base),
+    )
+    return base, beta
+
+
+def _hold_foreign_window(beta: Path, constants):
+    """Thread body holding beta's override window until released."""
+    window_open = threading.Event()
+    release = threading.Event()
+
+    def holder() -> None:
+        with profile_scope.profile_override_scope(beta, constants):
+            window_open.set()
+            assert release.wait(timeout=10)
+
+    thread = threading.Thread(target=holder)
+    thread.start()
+    return window_open, release, thread
+
+
+def test_skill_read_waits_out_foreign_profile_window(tmp_path, monkeypatch):
+    """rm-319 regression: an un-profiled listing never materializes another
+    profile's home held mid-window by a concurrent call.
+
+    Pre-gate behavior (assess 988c9b7a F6): skill_roots read the process
+    global override directly, so this listing returned beta's skills
+    immediately. Now the read is serialized behind the shared gate: while
+    the foreign window is open it waits (bounded) and fails closed instead
+    of leaking; once the window drains it lists only the base home.
+    """
+    constants = _FakeAgentConstants()
+    base, beta = _skill_read_env(tmp_path, monkeypatch, constants)
+    monkeypatch.setenv("HERMES_GPT_PROFILE_GATE_TIMEOUT", "0.3")
+
+    window_open, release, thread = _hold_foreign_window(beta, constants)
+    assert window_open.wait(timeout=5.0)
+    assert constants.current_home() == str(beta)  # foreign override is live
+
+    with pytest.raises(RuntimeError) as excinfo:
+        server.hermes_skill_list()
+    assert "HERMES_GPT_PROFILE_GATE_TIMEOUT" in str(excinfo.value)
+
+    release.set()
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+
+    listing = server.hermes_skill_list()
+    assert "base-skill" in listing, listing
+    assert "beta-secret" not in listing, listing
+
+
+def test_discover_skills_waits_out_foreign_window(tmp_path, monkeypatch):
+    """The shared discovery helper itself is gated (skill_roots -> SKILL.md
+    walk), not just the tools that call it."""
+    constants = _FakeAgentConstants()
+    base, beta = _skill_read_env(tmp_path, monkeypatch, constants)
+    monkeypatch.setenv("HERMES_GPT_PROFILE_GATE_TIMEOUT", "0.3")
+
+    window_open, release, thread = _hold_foreign_window(beta, constants)
+    assert window_open.wait(timeout=5.0)
+    with pytest.raises(profile_scope.ProfileScopeTimeout):
+        server.discover_skills()
+
+    release.set()
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+
+    names = {skill["name"] for skill in server.discover_skills()}
+    assert names == {"base-skill"}, names
+    roots = server.skill_roots()
+    assert len(roots) == 1, roots
+    assert roots[0].parent.name == base.name, roots
+
+
+def test_skill_view_never_reads_foreign_profile_contents(tmp_path, monkeypatch):
+    """rm-319 regression: hermes_skill_view can neither resolve into nor
+    return the contents of another profile's skill mid-window, and beta is
+    invisible to the un-profiled view at rest."""
+    constants = _FakeAgentConstants()
+    base, beta = _skill_read_env(tmp_path, monkeypatch, constants)
+    monkeypatch.setenv("HERMES_GPT_PROFILE_GATE_TIMEOUT", "0.3")
+
+    window_open, release, thread = _hold_foreign_window(beta, constants)
+    assert window_open.wait(timeout=5.0)
+
+    with pytest.raises(RuntimeError):
+        server.hermes_skill_view("beta-secret-skill")  # bounded, never contents
+
+    release.set()
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+
+    assert "No skill matched" in server.hermes_skill_view("beta-secret-skill")
+    visible = server.hermes_skill_view("base-skill")
+    assert "contents of base" in visible, visible
+    assert "contents of beta" not in visible, visible
+
+
+def test_skill_read_overlaps_same_home_window(tmp_path, monkeypatch):
+    """A same-home (default-profile) window does not block un-profiled
+    reads: per-profile parallelism is preserved."""
+    constants = _FakeAgentConstants()
+    base, beta = _skill_read_env(tmp_path, monkeypatch, constants)
+
+    with profile_scope.profile_override_scope(base, constants):
+        listing = server.hermes_skill_list()  # same key: must not wait
+
+    assert "base-skill" in listing, listing
+    assert "beta-secret" not in listing, listing
+
+
+def test_read_hazard_is_live_mid_window(tmp_path, monkeypatch):
+    """Non-vacuity: mid-window the resolution server consults really does
+    point at the foreign home — the tests above guard a live hazard (the
+    exact state ungated skill_roots used to read), not a fictional one."""
+    constants = _FakeAgentConstants()
+    base, beta = _skill_read_env(tmp_path, monkeypatch, constants)
+
+    with profile_scope.profile_override_scope(beta, constants):
+        assert server.get_hermes_home() == str(beta)
+    assert server.get_hermes_home() == str(base)

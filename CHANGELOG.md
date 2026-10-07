@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Restored master CI green: a shipped `operator_skill_resolution` docstring tripped the release-blocking operational-metric hygiene pattern inside the built wheel and sdist, failing every test lane since the 0.14.0 push. The prose is reworded without hiding the cross-reference, the package-hygiene tests now pin the hygiene pattern itself (the old string still matches, the rewrite does not, real operational metrics still do) and sweep every shipped module for the pattern, and the built-artifact hygiene tests fail loudly when `python -m build` is unavailable or fails instead of silently skipping (explicit opt-out for build-less sandboxes: `HERMES_GPT_HYGIENE_ALLOW_BUILD_SKIP=1`).
+- Closed the profile read-side isolation gap: `hermes_skill_list` and `hermes_skill_view` (including their Operator aliases) and the skill discovery under them now resolve under the same profile gate as profile-scoped mutations, so a concurrent profile-scoped window for another home can no longer bleed its skill listings or contents into an un-profiled read; same-home reads still overlap. Cross-home gate waits are bounded by `HERMES_GPT_PROFILE_GATE_TIMEOUT` seconds (default 300, invalid values fall back to the default) and fail closed with a timeout error instead of blocking forever.
+
 ## 0.14.0 - 2026-10-03
 
 Acceptance and recovery: declare deliverable checks before dispatch and recover from positively observed artifact failures within existing limits.
