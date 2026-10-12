@@ -60,6 +60,8 @@ Every failure is classified by the existing failure classifier; Autopilot adds n
 
 A failed attempt normally fails the whole Mission when reconciled, so a replaced attempt is marked superseded once its successor exists. See [missions.md](missions.md) for how that marker is protected against misuse.
 
+A crash-stranded delegation whose invocation provably never reached a backend is recovered by the delegation lifecycle's stale-invocation mechanism — it rests re-drivable at pure `reserved` and the worker re-drives it — rather than by the failure classifier. See [delegations.md](delegations.md#stale-invocation-recovery).
+
 ## States and status
 
 Run states: `starting`, `running`, `waiting_for_owner`, `stopping`, `stopped`, `completed`, `failed`. `waiting_for_owner` means the approval frontier (or the Mission's own approval gate) is reached and nothing else can proceed.

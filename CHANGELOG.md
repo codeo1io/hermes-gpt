@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+Delegation crash-window recovery: a delegation whose invocation provably never reached a backend now rests in a re-drivable state instead of wedging a Mission forever. Reconciliation treats the authoritative absence of every observed run record, with no cancellation pending, as a stale invocation and resets the row to pure `reserved` (`state='reserved'`, `dispatch_phase='reserved'`, `backend_state='not_invoked'`) — the only shape the deterministic dispatch re-drive compare-and-swap can claim. The recovered resting state is stable across later reconciles instead of self-erasing, the mission reservation it feeds keeps its contract evidence reference so a re-drive is not refused, the Autopilot worker reaches the recovery path instead of idling past it, a closed set of typed pre-backend refusals (for example `UNKNOWN_AGENT`, `CONFIRMATION_REQUIRED`) resets to `reserved` deterministically instead of looping as an ambiguous submission, and cancelling a fleet delegation terminates through an explicit latch release rather than wedging behind an unobservable peer. Merged incrementally as one incident chain on 2026-10-11/12 (#32–#38).
+
 ## 0.14.0 - 2026-10-03
 
 Acceptance and recovery: declare deliverable checks before dispatch and recover from positively observed artifact failures within existing limits.

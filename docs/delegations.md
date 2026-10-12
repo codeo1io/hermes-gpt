@@ -30,6 +30,12 @@ An exact cancellation retry does not invoke backend cancellation again while `ca
 
 Authoritative reconciliation resolves that provisional latch only from a fresh terminal backend observation. Explicit `cancelled`/`canceled` observation promotes durable cancellation; terminal failure clears the latch and records failure; terminal completion clears the latch but still requires the normal matching Work Contract validation before success. Missing, ambiguous, unknown, or nonterminal observation retains `cancellation_in_progress` and remains fail-closed as `reconciling`.
 
+### Stale-invocation recovery
+
+A crash between the durable dispatch bookkeeping and the backend invocation strands a delegation with no run record to observe. Reconciliation treats a row as a stale invocation when the observation store authoritatively holds no run record for the task id, no cancellation is pending, and the row shape says the invocation may have died mid-flight (`dispatch_phase='invoking'` with `state` `reserved` or `reconciling`, or `dispatch_phase='reserved'` with `state='reconciling'`). A stale invocation resets to the pre-invocation resting state — `state='reserved'`, `dispatch_phase='reserved'`, `backend_state='not_invoked'` — so the deterministic dispatch re-drive compare-and-swap, which claims only rows at `state='reserved'` AND `dispatch_phase='reserved'` with no cancellation requested, can re-claim the same delegation id.
+
+That resting state is stable: a row already at pure reserved with zero observed run records keeps it on later reconciles instead of flipping back to `reconciling`, the mission attachment sync preserves the reservation's contract evidence reference so a re-drive is not refused, and the Autopilot worker reaches this recovery path rather than idling past the reconcile. A closed set of typed refusals that provably fire before any backend submission (for example `UNKNOWN_AGENT` or `CONFIRMATION_REQUIRED`) likewise resets the delegation to `reserved` with a typed rejection instead of looping as an ambiguous submission.
+
 ## OpenCode backend
 
 v0.9 also adds `opencode` as a first-class local runner backend. Hermes invokes the installed non-interactive OpenCode CLI using `opencode run --format json --pure --dir <workspace>`. The objective is piped over stdin rather than placed on process argv. `--auto` is never enabled by Hermes.
