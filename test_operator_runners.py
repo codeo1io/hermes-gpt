@@ -1039,3 +1039,64 @@ def test_stale_request_envelope_cleanup_removes_old_prompt(tmp_path: Path):
     _os.utime(request_path, (old, old))
     assert runners._cleanup_stale_request_envelopes(hermes_root=tmp_path, ttl_seconds=3600) == 1
     assert not request_path.exists()
+
+
+def test_opencode_relay_nonascii_bearer_gets_401_not_500():
+    # rm-041: a non-ASCII Authorization header used to raise TypeError from
+    # str hmac.compare_digest inside _forward, surfacing as a broken response
+    # instead of a clean 401. Byte comparison must return 401.
+    observed: dict[str, object] = {}
+
+    class UpstreamHandler(runners.BaseHTTPRequestHandler):
+        def log_message(self, _format, *_args):
+            return
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(length)
+            observed["hit"] = True
+            payload = b"{}"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    upstream = runners.ThreadingHTTPServer(("127.0.0.1", 0), UpstreamHandler)
+    upstream_thread = runners.threading.Thread(target=upstream.serve_forever, daemon=True)
+    upstream_thread.start()
+    material = {
+        "model": "cliproxyapi/glm-test",
+        "provider_id": "cliproxyapi",
+        "model_id": "glm-test",
+        "provider_name": "CLIProxyAPI",
+        "npm": "@ai-sdk/openai-compatible",
+        "timeout_ms": 60_000,
+        "model_meta": {},
+        "upstream": runners.urllib.parse.urlparse(f"http://127.0.0.1:{upstream.server_port}/v1"),
+        "real_key": "parent-secret-value",
+    }
+    relay = runners._OpenCodeCredentialProxy(material)
+    relay_thread = runners.threading.Thread(target=relay.serve_forever, daemon=True)
+    relay_thread.start()
+    try:
+        connection = runners.http.client.HTTPConnection("127.0.0.1", relay.server_port, timeout=5)
+        # Bytes header value: http.client passes it through untouched, which
+        # is how non-ASCII header bytes reach _forward.
+        connection.request(
+            "POST",
+            "/v1/chat/completions",
+            body=b"{}",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bearer токен-日本語".encode("utf-8"),
+            },
+        )
+        response = connection.getresponse()
+        assert response.status == 401
+        response.read()
+        connection.close()
+        assert observed == {}
+    finally:
+        relay.shutdown()
+        upstream.shutdown()

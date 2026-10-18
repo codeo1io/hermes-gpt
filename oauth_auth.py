@@ -845,8 +845,12 @@ def _error_response(exc: OAuthError) -> JSONResponse:
 
 def validate_bearer_token(token_value: str, state: OAuthState | None, *, static_token: str | None = None) -> bool:
     expected = (static_bearer_from_env() or "") if static_token is None else static_token
-    if expected and token_value and hmac.compare_digest(token_value, expected):
-        return True
+    if expected and token_value:
+        # B4/rm-041: compare bytes, not str — a non-ASCII bearer credential
+        # (headers are latin-1-decoded upstream) used to raise TypeError inside
+        # hmac.compare_digest and surface as a 500 instead of an auth failure.
+        if hmac.compare_digest(token_value.encode("utf-8"), expected.encode("utf-8")):
+            return True
     return bool(state and state.validate_access_token(token_value))
 
 

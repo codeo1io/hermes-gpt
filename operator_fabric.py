@@ -1260,10 +1260,15 @@ class FabricPeerService:
                 "verified Fabric requires bearer authentication",
             )
         presented = authorization[7:]
+        # Byte comparison: str compare_digest raises TypeError on non-ASCII
+        # credentials, surfacing as a 500 instead of an auth failure (rm-041).
+        presented_bytes = presented.encode("utf-8", "surrogateescape")
         matches = [
             principal
             for principal, token in self.tokens.items()
-            if hmac.compare_digest(token, presented)
+            if hmac.compare_digest(
+                token.encode("utf-8", "surrogateescape"), presented_bytes
+            )
         ]
         if len(matches) != 1:
             raise FabricError(

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Hardened cron `jobs.json` durability: an unreadable or corrupt `jobs.json` is preserved byte-for-byte as a `jobs.json.corrupt-<stamp>` sidecar and every mutating cron tool (`create`/`copy`/`move`) refuses to overwrite it with an explicit error, so a corrupt read can no longer silently wipe all scheduled jobs; writes now use a unique per-writer temp name with `fsync` of file and directory plus in-process write serialization, so concurrent writers cannot interleave or truncate the file.
+- Fixed non-ASCII bearer credentials to fail authentication cleanly instead of crashing: the OpenCode credential relay proxy and the verified Fabric peer `authenticate()` now compare tokens as bytes, so a non-ASCII `Authorization` header returns `401` / `FABRIC_PRINCIPAL_AUTH_FAILED` rather than raising `TypeError` (a `500`).
+- CI now compiles every module shipped in `pyproject.toml` (derived from `py-modules`) instead of a hand-maintained list covering only 29 of the 57 shipped modules, and the `cryptography` floor is raised to `>=50` — the first release line with no known OSV advisories (everything below 50 is affected by at least `GHSA-g6cj-pr64-35w5`/`PYSEC-2026-3552`).
 - Support MCP Python SDK 2.x alongside 1.28.1+, preserving local stdio, HTTP/SSE transport settings, authentication and Operator gates.
 - Correct the Codex Operator aliases' return signatures to describe normalized results, avoiding SDK 2 output-validation failures.
 - Test both SDK families and minimum versions in CI, with wire-level negotiation and result assertions.

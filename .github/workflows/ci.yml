@@ -60,38 +60,25 @@ jobs:
           test_ui_fabric.py
       - name: Run binary export regression tests
         run: python -m pytest -q test_operator_export.py test_server_export.py
-      - name: Compile operator modules
-        run: >-
-          python -m py_compile
-          server.py
-          codex_core.py
-          codex_mcp.py
-          mcp_compat.py
-          codex_config.py
-          operator_codex.py
-          operator_contract.py
-          fabric_artifacts.py
-          fabric_write_guard.py
-          operator_fabric.py
-          operator_fabric_control.py
-          operator_fabric_router.py
-          operator_fabric_g4c.py
-          operator_fabric_view.py
-          operator_fleet.py
-          operator_runners.py
-          operator_swarm.py
-          operator_swarm_workflows.py
-          operator_workspace.py
-          operator_export.py
-          updater.py
-          operator_recovery.py
-          operator_review.py
-          operator_events.py
-          operator_oauth.py
-          token_store.py
-          seams.py
-          ui_api.py
-          ui_fabric.py
+      - name: Compile all shipped modules (derived from pyproject py-modules)
+        run: |
+          python - <<'PY'
+          try:
+              import tomllib
+          except ModuleNotFoundError:
+              # py3.10 matrix lanes: stdlib tomllib is 3.11+; the tomli
+              # backport is already a declared dependency (python_version < '3.11').
+              import tomli as tomllib
+          import py_compile
+          mods = tomllib.load(open("pyproject.toml", "rb"))["tool"]["setuptools"]["py-modules"]
+          assert mods, "py-modules missing or empty - derivation broken, compiling nothing"
+          for m in mods:
+              py_compile.compile(m + ".py", doraise=True)
+          # Canary: this project ships 57 modules today. A silent count drift
+          # means pyproject and CI expectations diverged - fail loudly.
+          assert len(mods) == 57, f"shipped py-modules count drifted: {len(mods)} != 57"
+          print(f"py_compile ok: {len(mods)} shipped modules")
+          PY
       - name: Check whitespace
         run: git diff --check
 

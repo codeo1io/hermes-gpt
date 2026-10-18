@@ -708,6 +708,16 @@ def test_bearer_middleware_preserves_static_token_compatibility(monkeypatch: pyt
     assert client.post("/mcp", headers={"Authorization": f"Bearer {STATIC_BEARER}"}).status_code == 200
 
 
+def test_non_ascii_static_bearer_token_fails_closed_not_typeerror():
+    """Regression (rm-041 residual, review round 1): str hmac.compare_digest
+    raised TypeError on a non-ASCII bearer credential (header bytes are
+    latin-1-decoded upstream, so arbitrary codepoints reach the comparison)
+    and the caller surfaced a 500; byte comparison must fail closed."""
+    assert validate_bearer_token("токен", None, static_token="expected-token") is False
+    # Byte comparison keeps genuine matches working for any codepoints.
+    assert validate_bearer_token("ключ-носителя", None, static_token="ключ-носителя") is True
+
+
 def test_refreshed_access_token_passes_bearer_middleware(oauth_client: TestClient, oauth_state: OAuthState):
     issued = exchange_code(oauth_client, authorize_code(oauth_client), code_verifier=DEFAULT_VERIFIER).json()
     refreshed = refresh(oauth_client, issued["refresh_token"]).json()
@@ -767,3 +777,13 @@ def test_non_ascii_basic_auth_credentials_are_rejected(oauth_client: TestClient)
     )
     assert response.status_code in (400, 401)
     assert response.json()["error"] == "invalid_client"
+
+
+def test_bearer_token_from_latin1_wire_bytes_fails_closed():
+    """Wire-level shape of the rm-041 residual: a broken client sends UTF-8
+    credential bytes, the ASGI server decodes the Authorization header
+    latin-1 (oauth_auth.py:909), and validate_bearer_token receives mojibake
+    str. Authentication must reject it without raising (was TypeError 500)."""
+    wire = "Bearer секрет-не-совпадает".encode("utf-8").decode("latin-1")
+    presented = wire.split(" ", 1)[1]
+    assert validate_bearer_token(presented, None, static_token=STATIC_BEARER) is False

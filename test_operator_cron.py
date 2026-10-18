@@ -734,3 +734,119 @@ def test_cron_create_model_only_scheduler_contract(hermes_root, clean_env, audit
     assert "provider" not in written
     assert not isinstance(written["model"], dict)
 
+
+
+# ---------------------------------------------------------------------------
+# Durability (rm-038): corrupt jobs.json must be preserved, never wiped
+# ---------------------------------------------------------------------------
+
+
+def test_corrupt_jobs_backed_up_and_read_only_tools_still_work(hermes_root, clean_env, monkeypatch):
+    monkeypatch.setenv(op.OPERATOR_ENABLED_ENV, "1")
+    monkeypatch.setenv(op.OPERATOR_ALLOWED_PROFILES_ENV, "*")
+    profile_home = hermes_root / "profiles" / "shape-test"
+    cron_dir = profile_home / "cron"
+    cron_dir.mkdir(parents=True)
+    (cron_dir / "jobs.json").write_text("{not json", encoding="utf-8")
+
+    out = oc.hermes_cron_list(profile="shape-test", hermes_root=hermes_root)
+    parsed = json.loads(out)
+    assert parsed["success"] is True
+    assert parsed["count"] == 0
+    # Raw corrupt payload preserved as a sidecar; jobs.json untouched.
+    sidecars = list(cron_dir.glob("jobs.json.corrupt-*"))
+    assert len(sidecars) == 1
+    assert sidecars[0].read_text(encoding="utf-8") == "{not json"
+    assert (cron_dir / "jobs.json").read_text(encoding="utf-8") == "{not json"
+
+
+def test_binary_jobs_backed_up_on_read(hermes_root, clean_env, monkeypatch):
+    monkeypatch.setenv(op.OPERATOR_ENABLED_ENV, "1")
+    monkeypatch.setenv(op.OPERATOR_ALLOWED_PROFILES_ENV, "*")
+    profile_home = hermes_root / "profiles" / "shape-test"
+    cron_dir = profile_home / "cron"
+    cron_dir.mkdir(parents=True)
+    raw = b"\xff\xfe\x00{not utf8"
+    (cron_dir / "jobs.json").write_bytes(raw)
+
+    out = oc.hermes_cron_list(profile="shape-test", hermes_root=hermes_root)
+    parsed = json.loads(out)
+    assert parsed["success"] is True
+    assert parsed["count"] == 0
+    sidecars = list(cron_dir.glob("jobs.json.corrupt-*"))
+    assert len(sidecars) == 1
+    assert sidecars[0].read_bytes() == raw
+
+
+def test_corrupt_jobs_refuses_create_mutation_instead_of_wiping(
+    hermes_root, clean_env, audit_override, monkeypatch
+):
+    monkeypatch.setenv(op.OPERATOR_ENABLED_ENV, "1")
+    monkeypatch.setenv(op.OPERATOR_LEVEL_ENV, "cron")
+    monkeypatch.setenv(op.OPERATOR_APPLY_MODE_ENV, "direct")
+    monkeypatch.setenv(op.OPERATOR_ALLOWED_PROFILES_ENV, "default")
+    cron_dir = hermes_root / "cron"
+    (cron_dir / "jobs.json").write_text(" garbage", encoding="utf-8")
+
+    out = oc.hermes_cron_create(
+        profile="default", schedule="every 5m", prompt="x", dry_run=False,
+        hermes_root=hermes_root,
+    )
+    parsed = json.loads(out)
+    assert parsed["success"] is False
+    assert "refusing to overwrite" in parsed["error"]
+    # The corrupt payload is preserved verbatim — no wipe happened.
+    assert (cron_dir / "jobs.json").read_text(encoding="utf-8") == " garbage"
+    assert len(list(cron_dir.glob("jobs.json.corrupt-*"))) == 1
+
+
+def test_corrupt_target_refuses_copy_mutation(
+    hermes_root, clean_env, audit_override, monkeypatch
+):
+    monkeypatch.setenv(op.OPERATOR_ENABLED_ENV, "1")
+    monkeypatch.setenv(op.OPERATOR_LEVEL_ENV, "cron")
+    monkeypatch.setenv(op.OPERATOR_APPLY_MODE_ENV, "direct")
+    monkeypatch.setenv(op.OPERATOR_ALLOWED_PROFILES_ENV, "default,hermes-researcher")
+    _write_jobs(hermes_root, [_make_job()])
+    target_home = hermes_root / "profiles" / "hermes-researcher"
+    (target_home / "cron" / "jobs.json").write_text("}{broken", encoding="utf-8")
+
+    out = oc.hermes_cron_copy(
+        source_profile="default", target_profile="hermes-researcher",
+        job_id="abc123", dry_run=False, hermes_root=hermes_root,
+    )
+    parsed = json.loads(out)
+    assert parsed["success"] is False
+    assert "refusing to overwrite" in parsed["error"]
+    assert (target_home / "cron" / "jobs.json").read_text(encoding="utf-8") == "}{broken"
+
+
+def test_concurrent_writers_leave_one_valid_payload_and_no_stale_tmp(
+    hermes_root, clean_env
+):
+    import threading as _threading
+
+    profile_home = hermes_root / "profiles" / "shape-test"
+    (profile_home / "cron").mkdir(parents=True)
+    errors: list[Exception] = []
+
+    def writer(n: int) -> None:
+        try:
+            oc._write_jobs(profile_home, [_make_job(job_id=f"j{n}", name=f"w{n}")])
+        except Exception as exc:  # pragma: no cover - only on regression
+            errors.append(exc)
+
+    threads = [_threading.Thread(target=writer, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert errors == []
+    payload = json.loads((profile_home / "cron" / "jobs.json").read_text())
+    jobs = payload["jobs"] if isinstance(payload, dict) else payload
+    # Exactly one writer's complete payload — no interleaved or empty write.
+    assert len(jobs) == 1
+    assert str(jobs[0]["id"]).startswith("j")
+    # Unique per-writer tmp names + cleanup: no stale tmp files remain.
+    assert list((profile_home / "cron").glob("*.tmp")) == []

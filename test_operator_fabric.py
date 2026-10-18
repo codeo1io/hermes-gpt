@@ -734,3 +734,13 @@ def test_http_peer_rejects_generic_text_before_any_agent_path(tmp_path, monkeypa
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+def test_peer_nonascii_bearer_token_fails_auth_not_typeerror(tmp_path, monkeypatch):
+    # rm-041: str hmac.compare_digest raises TypeError on non-ASCII input,
+    # which would surface as a 500 instead of an auth failure.
+    svc = service(tmp_path, monkeypatch)
+    request = fabric._request("capabilities", "coord-main", data={})
+    with pytest.raises(fabric.FabricError) as exc:
+        svc.handle(request, "Bearer токен-日本語-not-ascii")
+    assert exc.value.code == "FABRIC_PRINCIPAL_AUTH_FAILED"

@@ -31,10 +31,16 @@ import json
 import os
 import shutil
 import threading
+import time
 from pathlib import Path
 from typing import Any, Optional
 
 import operator_policy as op
+
+# Serializes jobs.json writes within this process (rm-038). Cross-process
+# safety comes from the unique per-writer tmp name + os.replace atomicity —
+# Hermes' own cron engine does not take this lock.
+_JOBS_WRITE_LOCK = threading.Lock()
 
 # Preserve the original jobs.json container shape per profile_home so writes
 # round-trip list-shaped files and Hermes' canonical {"jobs": [...]} form.
@@ -96,44 +102,143 @@ def _jobs_shape_key(profile_home: Path) -> str:
         return str(profile_home)
 
 
-def _read_jobs(profile_home: Path) -> list[dict[str, Any]]:
-    """Read jobs.json. Returns [] if missing or unparseable."""
+def _backup_corrupt_jobs(path: Path) -> None:
+    """Preserve an unparseable jobs.json before the next atomic write
+    replaces it (rm-021: silent overwrite destroyed the only copy).
+    Best-effort: never raises, never blocks reads. The backup file's
+    presence next to jobs.json is the operator-visible signal."""
+    try:
+        payload = path.read_bytes()
+        if any(p.read_bytes() == payload for p in path.parent.glob(f"{path.name}.corrupt-*")):
+            return
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        backup = path.with_name(f"{path.name}.corrupt-{stamp}")
+        suffix = 1
+        while backup.exists():
+            if suffix > 99:
+                return
+            backup = path.with_name(f"{path.name}.corrupt-{stamp}-{suffix}")
+            suffix += 1
+        backup.write_bytes(payload)
+    except OSError:
+        pass
+
+
+def _read_jobs_state(profile_home: Path) -> tuple[list[dict[str, Any]], bool]:
+    """Read jobs.json. Returns (jobs, corrupt).
+
+    corrupt=True means jobs.json EXISTS but could not be parsed (or opened);
+    the raw bytes have been preserved as a ``jobs.json.corrupt-<stamp>``
+    sidecar when readable. Mutating tools MUST refuse to write when
+    corrupt=True — writing over it would durably destroy the only copy
+    (rm-038 refuse-to-wipe; _read_jobs returning [] alone caused exactly
+    that wipe when a mutation followed a corrupt read).
+    """
     path = _jobs_file(profile_home)
     if not path.exists():
         _jobs_shape_cache.setdefault(_jobs_shape_key(profile_home), "dict")
-        return []
+        return [], False
     try:
         with open(path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
-    except (OSError, json.JSONDecodeError):
-        return []
-    shape = "dict" if isinstance(data, dict) else "list" if isinstance(data, list) else "dict"
-    _jobs_shape_cache[_jobs_shape_key(profile_home)] = shape
-    if isinstance(data, dict):
-        # Some Hermes versions store {"jobs": [...]}.
-        jobs = data.get("jobs", [])
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        # Keep the corrupt payload recoverable instead of letting the next
+        # atomic write silently destroy the only copy. UnicodeDecodeError
+        # covers binary/non-UTF-8 corruption (a ValueError, not a
+        # JSONDecodeError) — same recovery path, no crash.
+        _backup_corrupt_jobs(path)
+        return [], True
+    except OSError:
+        # Present but unreadable (permissions, I/O error): do NOT report an
+        # empty job list — a mutation would then overwrite live data.
+        _backup_corrupt_jobs(path)
+        return [], True
+    if isinstance(data, dict) and isinstance(data.get("jobs"), list):
+        shape = "dict"
     elif isinstance(data, list):
-        jobs = data
+        shape = "list"
     else:
-        jobs = []
-    return [j for j in jobs if isinstance(j, dict)]
+        # Valid JSON but wrong shape (scalar `null`/number/string, or a dict
+        # without a list `jobs` member): reporting "no jobs" here would let
+        # the next mutation overwrite the only copy with no sidecar — the
+        # narrow silent-wipe class rm-038 exists to prevent (review round 1).
+        # Preserve the bytes and refuse mutations instead.
+        _backup_corrupt_jobs(path)
+        return [], True
+    _jobs_shape_cache[_jobs_shape_key(profile_home)] = shape
+    jobs = data["jobs"] if shape == "dict" else data
+    return [j for j in jobs if isinstance(j, dict)], False
+
+
+def _read_jobs(profile_home: Path) -> list[dict[str, Any]]:
+    """Read jobs.json. Returns [] if missing or unparseable (read-only view;
+    corrupt payloads are preserved as .corrupt-<stamp> sidecars)."""
+    jobs, _corrupt = _read_jobs_state(profile_home)
+    return jobs
+
+
+def _refuse_if_corrupt(profile_home: Path, profile: str) -> None:
+    """Raise (→ tool-level error result) when jobs.json is corrupt/unreadable.
+
+    Called by every mutating tool BEFORE any write: the corrupt bytes are
+    already preserved by _read_jobs_state's backup, and refusing here is what
+    prevents a silent full-job wipe (rm-038)."""
+    _jobs, corrupt = _read_jobs_state(profile_home)
+    if corrupt:
+        raise ValueError(
+            f"cron/jobs.json for profile {profile!r} exists but cannot be read; "
+            "refusing to overwrite it (the original bytes were preserved as a "
+            "jobs.json.corrupt-<stamp> sidecar next to it). Inspect or restore "
+            "that file before mutating cron jobs."
+        )
 
 
 def _write_jobs(profile_home: Path, jobs: list[dict[str, Any]]) -> None:
-    """Atomically write jobs.json. Creates cron dir if missing."""
+    """Atomically write jobs.json. Creates cron dir if missing.
+
+    Durability (rm-038): per-writer UNIQUE tmp name (two processes or threads
+    sharing a fixed tmp name could interleave/truncate each other's writes),
+    fsync of file and directory so a crash cannot leave jobs.json empty or
+    half-written, and in-process write serialization via _JOBS_WRITE_LOCK.
+    Cross-process last-writer-wins is unchanged (Hermes' cron engine does not
+    take our lock) but every write is now atomic and complete.
+    """
     cron_dir = _cron_dir(profile_home)
     cron_dir.mkdir(parents=True, exist_ok=True)
     target = _jobs_file(profile_home)
-    tmp = target.with_suffix(".json.tmp")
     shape = _jobs_shape_cache.get(_jobs_shape_key(profile_home), "dict")
     payload: Any
     if shape == "list":
         payload = jobs
     else:
         payload = {"jobs": jobs}
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(payload, fh, indent=2, ensure_ascii=False)
-    os.replace(tmp, target)
+    with _JOBS_WRITE_LOCK:
+        tmp = target.with_name(
+            f"{target.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2, ensure_ascii=False)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, target)
+        finally:
+            # On success tmp is gone (replaced); on failure remove our own
+            # partial file so no stale tmp is ever left behind.
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+        try:
+            dir_fd = os.open(str(cron_dir), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            # Directory fsync is best-effort (not all platforms/filesystems).
+            pass
 
 
 def _hash_prompt(prompt: str | None) -> tuple[int, str]:
@@ -570,6 +675,7 @@ def hermes_cron_copy(
         target_home = op.resolve_profile_home(target_profile, hermes_root)
         source_jobs = _read_jobs(source_home)
         target_jobs = _read_jobs(target_home)
+        _refuse_if_corrupt(target_home, target_profile)
 
         source_job = _find_job(source_jobs, job_id)
         if not source_job:
@@ -696,6 +802,7 @@ def hermes_cron_move(
         target_home = op.resolve_profile_home(target_profile, hermes_root)
         source_jobs = _read_jobs(source_home)
         target_jobs = _read_jobs(target_home)
+        _refuse_if_corrupt(target_home, target_profile)
 
         source_job = _find_job(source_jobs, job_id)
         if not source_job:
@@ -939,6 +1046,7 @@ def hermes_cron_create(
 
         profile_home = op.resolve_profile_home(profile, hermes_root)
         jobs = _read_jobs(profile_home)
+        _refuse_if_corrupt(profile_home, profile)
 
         new_id = _new_job_id()
         job_name = (

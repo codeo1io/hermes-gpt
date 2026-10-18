@@ -1023,7 +1023,13 @@ class _OpenCodeCredentialProxyHandler(BaseHTTPRequestHandler):
         material = self.relay.material
         supplied = self.headers.get("Authorization", "")
         expected = f"Bearer {material['relay_token']}"
-        if not hmac.compare_digest(supplied, expected):
+        # Byte comparison: str compare_digest raises TypeError on non-ASCII
+        # header values, turning a bad credential into a 500 instead of a 401
+        # (rm-041). surrogateescape preserves arbitrary header bytes.
+        if not hmac.compare_digest(
+            supplied.encode("utf-8", "surrogateescape"),
+            expected.encode("utf-8", "surrogateescape"),
+        ):
             self._send_plain(401, "unauthorized")
             return
         upstream = material["upstream"]
