@@ -34,11 +34,21 @@
 - acceptance: both payloads' token-store reads execute off the loop (asyncio.to_thread or the in-file equivalent); regression test holds the token-store path blocked and asserts a concurrent lightweight async handler still completes (a sync TestClient cannot observe this — use the async test pattern rm-076's suite established); payload shapes unchanged; a note lands in docs/ui-security-boundary.md transport-health section that the poll endpoint is off-loop
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
 
+### Chat turn exclusivity: refresh the turn lease and key the turn registry by turn_id
+- id: `rm-165` | track: reliability | priority: 100.0 | status: candidate
+- acceptance: the turn lease is refreshed on activity inside `_run_turn`/`_execute_turn` (the dead `SessionDB.refresh_session_turn_lease` API, hermes_state.py:309-320, becomes load-bearing) OR `_handle_chat_post` gains a per-session `_active_turn(session_id)` check alongside the acquire, so a >300 s turn can never lose exclusivity to a second POST /chat; a regression test drives one turn past the 300 s TTL with a tool loop and asserts a concurrent POST is refused; the turn registry is keyed by turn_id (not session_id only) so `_register_turn` (ui_chat.py:161) never replaces a running turn's Turn object — its SSE replay ring and stop semantics stay reachable; the TURN_RETENTION_S=1800 promise (ui_chat.py:70) holds for the previous turn's buffer until the window elapses (reconnect with the old turn_id still replays inside 30 min)
+- evidence: assess ae5d6905880a attempt d0610511 findings.md N1+N2 (ui_chat.py:748 acquire-only ttl=300; refresh API 0 callers repo-wide; dynamic repro /tmp/d0610511-lease-demo: A acquires -> TTL expiry -> B acquires while A still running -> A release None; registry keyed by session_id only)
+
 ### Add test coverage for 16 untested module(s)
 - id: `rm-002` | track: reliability | priority: 100.0 | status: candidate
 - signals: reliability.no_tests:hermes_state.py, reliability.no_tests:tools/check_package_hygiene.py, reliability.no_tests:web/src/chat/ActivityCard.tsx, reliability.no_tests:web/src/chat/ChatPage.tsx, reliability.no_tests:web/src/chat/Composer.tsx (+11 more)
 - acceptance: Every module in ['hermes_state.py', 'tools/check_package_hygiene.py', 'web/src/chat/ActivityCard.tsx', 'web/src/chat/ChatPage.tsx', 'web/src/chat/Composer.tsx', 'web/src/flight/AccountPanel.tsx', 'web/src/flight/ApprovalsPanel.tsx', 'web/src/flight/ContractsPanel.tsx', 'web/src/flight/DeckOverview.tsx', 'web/src/flight/EventHistoryPanel.tsx', 'web/src/flight/FleetPanel.tsx', 'web/src/flight/schemas.ts', 'web/src/shared/AccountStatusBanner.tsx', 'web/src/shared/ConnectionStatus.tsx', 'web/src/stores/session-list.ts', 'web/vite.config.ts'] has a corresponding test file with at least one passing test
 - evidence: full suite green (python -m pytest -q) at HEAD; conductor validation digest validation:v1:<sha> recorded in the shipping PR
+
+### Adopt upstream #91: fleet builtin profile ceilings for the new peers
+- id: `rm-167` | track: reliability | priority: 95.0 | status: in_progress
+- acceptance: `_BUILTIN_PROFILES` (operator_fleet.py:58-62) gains upstream #91's entries — macbook-m5 {default, apple, apple-design, apple-dev, apple-qa, apple-release}, mac-mini-m5 {default}, omarchy {default}, gaming-4090 +{media, gpu-dev} — ported fork-minimally with upstream commit bbe7f7ec50965dee7eec9b5e678b987109205f43 (2026-10-11) cited; a regression test asserts each new peer's ceiling so an authority manifest granting their real profiles no longer raises PermissionError at operator_fleet.py:635 (unknown peers currently get a {"default"}-only ceiling at :624); the fork's diverged operator_fleet.py is reconciled so the next upstream adoption does not regress the table again
+- evidence: research ae5d6905880a attempt ccfc0f98 research.md RC-1 (gh api upstream master commits since v0.14.0: exactly #91 unmerged; patch fetched)
 
 ### Refactor 20 high-complexity function(s)
 - id: `rm-001` | track: reliability | priority: 90.0 | status: candidate
@@ -66,10 +76,17 @@
 - acceptance: the WS loop advances its cursor to the returned next_cursor on empty pages too (or an equivalent watermark adoption), preserving rm-080's snapshot-ordering guarantee (a concurrent insert is delivered or rescanned, never skipped); a regression test asserts an idle filtered WS client advances past N non-matching events without rescanning them; the docs/live-events.md cursor-semantics paragraph holds verbatim
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
 
+### Fleet peers config fallback must honor HERMES_HOME (single home-resolution idiom)
+- id: `rm-166` | track: reliability | priority: 85.0 | status: in_progress
+- acceptance: `_load_hermes_config`'s fallback (operator_fleet.py:201) resolves the config via `os.environ.get("HERMES_HOME", Path.home()/".hermes")` — the operator_runners.py:68 idiom — instead of the hardcoded `Path.home()/".hermes"`, and the docstring claim "reads the same default config the CLI would" becomes true under HERMES_HOME (hermes_cli.config resolves via get_hermes_home today); a test pins both resolution paths (HERMES_HOME set/unset) so a configured peer stays visible to standalone Autopilot workers in home-overridden deployments; the fix names the same resolution authority the pending 'Fleet task->agent registry' item (rm-156..164 set, run a8d76146, cite-by-title) mandates for the registry path — one idiom, both sites
+- evidence: code at HEAD 146e4cff56: operator_fleet.py:177-209 (fallback :201 hardcodes home; introduced by #37 5d926938a6 for the UNKNOWN_AGENT loop); hermes_cli.config source resolves via get_hermes_home() honoring HERMES_HOME — divergence verified 2026-10-19
+
 ### Python floor bump 3.10->3.11 plus a 3.13 CI lane (dated deadline)
 - id: `rm-100` | track: reliability | priority: 75.0 | status: candidate
 - acceptance: CI matrix adds a green 3.13 lane (and 3.14 if deps allow); a dated plan lands the 3.11 floor bump with the next fork release (requires-python >=3.11, matrix drops 3.10, tomli conditional removed); CHANGELOG records both
+- acceptance: the dated deadline has ARRIVED — Python 3.10 reached end-of-life 2026-10-01 (endoflife.date, verified 2026-10-19) while requires-python stays ">=3.10" and ci.yml still carries a 3.10 lane (matrix ["3.10","3.11","3.12"]; a lone 3.14 lane exists at :131, no 3.13 lane); the bump decision cites the passed EOL date and lands the floor with the next fork release or records why it rides one release past EOL
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
+- evidence: research ae5d6905880a attempt ccfc0f98 research.md RC-2 (endoflife.date/api/python.json: 3.10 eol 2026-10-01, 3.11 eol 2027-10-31)
 
 ### cron next-fire + timezone preview at arm time
 - id: `rm-132` | track: reliability | priority: 72.0 | status: in_progress
@@ -79,7 +96,9 @@
 ### MCP spec-revision lineage refresh + SDK 2.3.x lane
 - id: `rm-048` | track: reliability | priority: 70.0 | status: in_progress
 - acceptance: docs/mcp-compatibility.md corrected to describe the revision lineage per SDK family instead of claiming one "latest"; the rm-009 revision assertion parameterized per installed SDK pin (still fails loudly on unexpected revisions); a mcp==2.3.x lane added to CI (or pins refreshed per rm-009's cadence rule) with a spec-delta review note for hermes surfaces; MCP-Auth cross-RFC notes (RFC 9728/9700 now Proposed Standard, draft-ietf-oauth-parallel-refresh adopted) reflected in docs/oauth.md where they touch hermes behavior
+- acceptance: the 2.3.x lane is still missing as of 2026-10-19 (ci.yml SDK matrix pins mcp==1.28.1/2.0.0/1.30.0/2.2.0) and the lane's certification pins the three SDK 2.2/2.3 behavior changes touching hermes surfaces: same-origin-only client redirects (#3397), 30-min idle stateful Streamable HTTP session expiry (#3395 — assert a client re-initializes on 404 against the server.py streamable_http_app), and x-mcp-header annotation validation at registration (#3620 — the repo registers none, so assert the full tool registration stays green under 2.3.0)
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
+- evidence: research ae5d6905880a attempt ccfc0f98 research.md RC-3 (modelcontextprotocol/python-sdk releases v2.2.0/v2.3.0 notes; PyPI mcp 2.3.0 2026-10-02)
 
 ### Ship or document a browser-UI build path (web assets absent from wheel/MANIFEST)
 - id: `rm-077` | track: reliability | priority: 70.0 | status: candidate
@@ -191,7 +210,9 @@
 ### Commit a [tool.ruff] rule-set config on ruff 0.16 (extends run-fd2bc85f rm-028)
 - id: `rm-035` | track: reliability | priority: 50.0 | status: candidate
 - acceptance: a committed [tool.ruff] selects the enforced rule set explicitly; dev pin moves to a 0.16.x line; CI lint job green under the pinned ruff; a finding-count table (classic vs adopted set) with per-class disposition lands in the PR
+- acceptance: ruff 0.17.1 is current (PyPI 2026-10-19) while this item targets the 0.16.x line — the config commit lands on 0.17.x instead (or records why it pins 0.16), keeping the lint gate on a current major as the pending 'Dev-dependency major bounds' item requires (cite-by-title, run-a8d76146 pending mint set)
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
+- evidence: research ae5d6905880a attempt ccfc0f98 research.md RC-5
 
 ### Regenerate .gitleaksignore against HEAD-reachable history and prune foreign refs
 - id: `rm-055` | track: reliability | priority: 50.0 | status: candidate
@@ -212,6 +233,11 @@
 - id: `rm-137` | track: reliability | priority: 46.0 | status: candidate
 - acceptance: an OpenAPI 3 document GENERATED from the route table (not hand-maintained prose), served at a read-only discovery endpoint or shipped in docs, with envelope schemas from the existing ok/err normalization; a contract test fails when a route's shape drifts from the document; the document is marked loopback-default/read-only-gates per product invariants.
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
+
+### Runtime dependency headroom lane: exercise the declared ranges' upper end
+- id: `rm-170` | track: reliability | priority: 45.0 | status: candidate
+- acceptance: a periodic (or nightly-equivalent manual) CI lane installs the newest resolvable versions within the DECLARED ranges — starlette <2 (latest 1.9.0; tests currently run 1.3.1), uvicorn <1 (latest 0.54.0; tested 0.41.0), cryptography >=42 (latest 50.0.2; tested 50.0.1) — and runs the focused suite so the wide bounds are exercised before a user hits them; results recorded in a deps-freshness table (tested-vs-latest columns, review dates) linked from docs/README.md; companion to the pending 'Dev-dependency major bounds' item (run-a8d76146 pending mint set, cite-by-title) which bounds the DEV majors — runtime majors are this item's scope
+- evidence: research ae5d6905880a attempt ccfc0f98 research.md RC-6 (pypi JSON 2026-10-19; venv installed versions via importlib.metadata)
 
 ### Fail-fast on empty/invalid code_challenge at issuance
 - id: `rm-018` | track: reliability | priority: 45.0 | status: in_progress
@@ -243,6 +269,11 @@
 - id: `rm-042` | track: reliability | priority: 42.0 | status: in_progress
 - acceptance: candidate roots are verified as hermes-gpt checkouts (pyproject name / package marker / remote URL) with a loud refusal otherwise; regression test using a foreign git-root fixture
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
+
+### Skill-manager import failures must degrade loudly, not silently
+- id: `rm-168` | track: reliability | priority: 40.0 | status: candidate
+- acceptance: `_get_skill_manager` (operator_skills.py:186-195) replaces bare `except Exception: pass`/`return None` with a logged degradation (module + exception recorded once, not per-call spam) surfaced in `hermes_operator_doctor`/snapshot so a broken skill-manager install is operator-visible; a test breaks the import and asserts the log/doctor signal appears while skill ops still fail soft
+- evidence: assess ae5d6905880a attempt d0610511 findings.md N4
 
 ### Single peer_main: dedupe the dead entry point and test the packaged peer CLI
 - id: `rm-037` | track: reliability | priority: 40.0 | status: candidate
@@ -298,6 +329,11 @@
 - id: `rm-140` | track: reliability | priority: 30.0 | status: in_progress
 - acceptance: the check's detail text marks it "in-process only" (or reports the serving-process identity it introspected) and docs/operator-mode.md states the caveat; optional follow-on note names the durable-audit-log alternative if cross-process authority is ever needed.
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
+
+### Mission-ledger k-way event merge: heap instead of per-event min() rescan
+- id: `rm-169` | track: reliability | priority: 30.0 | status: candidate
+- acceptance: `_merge_streams` (operator_mission_ledger.py:443-470) uses a k-way heap (or equivalent single-pass merge) so emitting n events across g cursor groups stops rescanning min(candidates) per event; a characterization test pins current output ordering first, then asserts the heap rewrite is output-identical and O(n log g); documented as perf-only (no behavioral change)
+- evidence: assess ae5d6905880a attempt d0610511 findings.md N5
 
 ### Small reliability bundle: cron zero-interval floor, placement walk reuse, preview parity
 - id: `rm-057` | track: reliability | priority: 25.0 | status: in_progress

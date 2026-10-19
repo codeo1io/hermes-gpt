@@ -811,3 +811,146 @@ def test_fleet_backend_cancel_peer_observation_call_signature(monkeypatch):
     # the observation call must not raise; a live task yields UNSUPPORTED (not UNOBSERVABLE)
     assert result["code"] == "RUNNER_CANCEL_UNSUPPORTED"
     assert calls["kwargs"] == {"agent": "stage3-pilot-peer", "task_id": "a2a-regression123"}
+
+
+# ---------------------------------------------------------------------------
+# rm-166: HERMES_HOME-aware home resolution (config fallback + task registry)
+# ---------------------------------------------------------------------------
+
+def test_config_fallback_honors_hermes_home(tmp_path, monkeypatch):
+    """rm-166 U1: the standalone-worker config fallback resolves HERMES_HOME
+    first, then ~/.hermes — matching hermes_cli's resolution (operator_runners
+    idiom). Previously the fallback hardcoded Path.home()/".hermes", so a
+    configured peer was invisible to home-overridden Autopilot workers."""
+    import sys
+
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", None)  # force the fallback path
+    home = tmp_path / "hermes-home"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "a2a_agents:\n  rza:\n    url: http://127.0.0.1:8765\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HOME", str(tmp_path / "unrelated-home"))  # must NOT win
+    peers = fleet._a2a_peers()
+    assert peers.get("rza", {}).get("url") == "http://127.0.0.1:8765"
+
+
+def test_config_fallback_defaults_to_home_dot_hermes(tmp_path, monkeypatch):
+    """rm-166 U1: without HERMES_HOME the fallback reads ~/.hermes/config.yaml."""
+    import sys
+
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", None)
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    default_home = tmp_path / ".hermes"
+    default_home.mkdir()
+    (default_home / "config.yaml").write_text(
+        "a2a_agents:\n  nous-girl:\n    url: http://127.0.0.1:8766\n", encoding="utf-8"
+    )
+    peers = fleet._a2a_peers()
+    assert peers.get("nous-girl", {}).get("url") == "http://127.0.0.1:8766"
+
+
+def test_config_fallback_absent_config_is_empty_mapping(tmp_path, monkeypatch):
+    """rm-166 U1: a missing config in the resolved root stays best-effort {}."""
+    import sys
+
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", None)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "empty-home"))
+    monkeypatch.setenv("HOME", str(tmp_path / "empty-home"))
+    assert fleet._load_hermes_config() == {}
+
+
+def test_task_agent_registry_round_trip_default_deployment(tmp_path, monkeypatch):
+    """rm-166 U2 (live P1): with HERMES_HOME unset and no explicit root, the
+    task->agent registry resolves ~/.hermes and the round trip works. Before
+    rm-166 the path called operator_policy.default_home(), which does not
+    exist — every write raised AttributeError inside the best-effort swallow,
+    so the registry was NEVER written and fleet cancels degraded to
+    RUNNER_CANCEL_UNOBSERVABLE with the latch held forever."""
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    fleet._record_task_agent("a2a-rm166-1", "rza")
+    registry = tmp_path / ".hermes" / "fleet-task-agents.json"
+    assert registry.is_file(), "registry write must reach ~/.hermes in default deployments"
+    assert fleet._task_agent("a2a-rm166-1") == "rza"
+
+
+def test_task_agent_registry_honors_hermes_home(tmp_path, monkeypatch):
+    """rm-166 U2: the registry root honors HERMES_HOME (same idiom as U1)."""
+    home = tmp_path / "fleet-home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HOME", str(tmp_path / "unrelated-home"))
+    fleet._record_task_agent("a2a-rm166-2", "gaming-4090")
+    assert (home / "fleet-task-agents.json").is_file()
+    assert fleet._task_agent("a2a-rm166-2") == "gaming-4090"
+
+
+def test_task_agent_registry_explicit_root_wins(tmp_path, monkeypatch):
+    """rm-166 U2: an explicit hermes_root argument still takes precedence."""
+    explicit = tmp_path / "explicit-root"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "env-home"))
+    fleet._record_task_agent("a2a-rm166-3", "omarchy", hermes_root=explicit)
+    assert (explicit / "fleet-task-agents.json").is_file()
+    assert fleet._task_agent("a2a-rm166-3", hermes_root=explicit) == "omarchy"
+    assert not (tmp_path / "env-home" / "fleet-task-agents.json").is_file()
+
+
+# ---------------------------------------------------------------------------
+# rm-167: upstream #91 builtin profile ceilings
+# ---------------------------------------------------------------------------
+
+def test_builtin_profiles_cover_upstream_91_peers():
+    """rm-167: the builtin ceilings table carries upstream #91
+    (commit bbe7f7ec) — macbook-m5/mac-mini-m5/omarchy enrolled and
+    gaming-4090 granted media/gpu-dev."""
+    assert fleet._BUILTIN_PROFILES["macbook-m5"] == frozenset(
+        {"default", "apple", "apple-design", "apple-dev", "apple-qa", "apple-release"}
+    )
+    assert fleet._BUILTIN_PROFILES["mac-mini-m5"] == frozenset({"default"})
+    assert fleet._BUILTIN_PROFILES["omarchy"] == frozenset({"default"})
+    assert fleet._BUILTIN_PROFILES["gaming-4090"] == frozenset(
+        {"default", "media", "gpu-dev"}
+    )
+    # pre-existing peers unchanged
+    assert fleet._BUILTIN_PROFILES["nous-girl"] == frozenset({"default"})
+    assert fleet._BUILTIN_PROFILES["rza"] >= frozenset({"default", "gza"})
+
+
+def test_authority_manifest_grants_new_peer_real_profiles(tmp_path):
+    """rm-167: an authority manifest granting macbook-m5 its real profiles is
+    accepted instead of raising PermissionError at the builtin ceiling."""
+    path = tmp_path / "fleet-authority.json"
+    path.write_text(json.dumps({
+        "version": 1,
+        "peers": [
+            {
+                "name": "macbook-m5",
+                "expected_host_role": "apple-laptop",
+                "expected_card_identity": "MacBook M5 Fleet Node",
+                "allowed_profiles": ["default", "apple-dev", "apple-release"],
+                "max_authorization": "read_only",
+                "allow_public_actions": False,
+            },
+            {
+                "name": "omarchy",
+                "expected_host_role": "arch-workstation",
+                "expected_card_identity": "Omarchy Fleet Node",
+                "allowed_profiles": ["default"],
+                "max_authorization": "read_only",
+                "allow_public_actions": False,
+            },
+        ],
+    }), encoding="utf-8")
+    peers = fleet._load_authority(path)
+    assert peers["macbook-m5"].allowed_profiles == ("apple-dev", "apple-release", "default")
+    assert peers["omarchy"].allowed_profiles == ("default",)
+    # ceiling still enforced for the new peers
+    bad = json.loads(path.read_text())
+    bad["peers"][0]["allowed_profiles"] = ["default", "gza"]
+    path.write_text(json.dumps(bad), encoding="utf-8")
+    import pytest
+
+    with pytest.raises(PermissionError):
+        fleet._load_authority(path)

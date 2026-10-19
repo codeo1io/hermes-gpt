@@ -58,7 +58,10 @@ _MAX_ITEMS = 64
 _BUILTIN_PROFILES = {
     "nous-girl": frozenset({"default"}),
     "rza": frozenset({"default", "gza", "masta-killa", "inspectah-deck", "ghostface-killah", "method-man", "raekwon"}),
-    "gaming-4090": frozenset({"default"}),
+    "gaming-4090": frozenset({"default", "media", "gpu-dev"}),
+    "macbook-m5": frozenset({"default", "apple", "apple-design", "apple-dev", "apple-qa", "apple-release"}),
+    "mac-mini-m5": frozenset({"default"}),
+    "omarchy": frozenset({"default"}),
 }
 _PUBLIC_ACTION_RE = re.compile(
     r"\b(?:"
@@ -174,6 +177,17 @@ def _run(argv: list[str], *, timeout: int, runner: Runner | None) -> tuple[int, 
 # Official A2A surface (urllib, stdlib only, no hermes-a2a-bridge dependency)
 # ---------------------------------------------------------------------------
 
+def _default_hermes_root() -> Path:
+    """Hermes data root when no explicit root is given (rm-166).
+
+    Same idiom as ``operator_runners._root``: honor ``HERMES_HOME`` first,
+    then ``~/.hermes``, and strip ``hermes-agent``/``profiles/<name>``
+    suffixes so install roots resolve to the data root.
+    """
+    base = op.normalize_hermes_data_root(Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")))
+    return Path(base or Path.home() / ".hermes")
+
+
 def _load_hermes_config() -> dict[str, Any]:
     """Load Hermes config.yaml, best-effort, without importing heavy internals.
 
@@ -188,7 +202,8 @@ def _load_hermes_config() -> dict[str, Any]:
        empty mapping made every fleet dispatch fail UNKNOWN_AGENT
        (item: the promote-verify lane's reserved/invoking loop, 2026-10-11).
 
-    The fallback reads the same default config the CLI would; profile
+    The fallback reads the same default config the CLI would — resolving
+    ``HERMES_HOME`` first, then ``~/.hermes`` (rm-166) — and profile
     overlays are not applied (the fallback exists so a *configured peer* is
     visible, not to reproduce full profile semantics).
     """
@@ -200,7 +215,7 @@ def _load_hermes_config() -> dict[str, Any]:
     try:
         import yaml
 
-        path = Path.home() / ".hermes" / "config.yaml"
+        path = _default_hermes_root() / "config.yaml"
         if path.is_file():
             data = yaml.safe_load(path.read_text())
             return data if isinstance(data, dict) else {}
@@ -1024,7 +1039,7 @@ def hermes_fleet_dispatch_work_order(agent: str, task_id: str, target_profile: s
 
 
 def _task_agent_registry_path(hermes_root: Path | None) -> Path:
-    root = hermes_root or Path(os.environ.get("HERMES_HOME") or op.default_home())
+    root = hermes_root or _default_hermes_root()
     return root / "fleet-task-agents.json"
 
 
@@ -1035,6 +1050,7 @@ def _record_task_agent(task_id: str, agent: str, hermes_root: Path | None = None
     cancellation degrades to unobservable, never fails dispatch."""
     try:
         path = _task_agent_registry_path(hermes_root)
+        path.parent.mkdir(parents=True, exist_ok=True)  # first-run deployments may not have the root yet (rm-166)
         data: dict[str, str] = {}
         try:
             data = json.loads(path.read_text("utf-8"))

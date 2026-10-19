@@ -27,7 +27,10 @@ def test_load_hermes_config_falls_back_to_yaml_when_cli_unimportable(monkeypatch
     """Standalone workers (Autopilot) lack hermes_cli on sys.path; the config
     loader must fall back to reading ~/.hermes/config.yaml directly so
     a2a_agents never silently resolves to {} (UNKNOWN_AGENT wedge,
-    2026-10-11)."""
+    2026-10-11).
+
+    rm-166: without HERMES_HOME the fallback resolves ~/.hermes (HERMES_HOME
+    precedence is pinned separately in test_operator_fleet.py)."""
 
     fake_home = tmp_path
     cfg_dir = fake_home / ".hermes"
@@ -41,8 +44,7 @@ def test_load_hermes_config_falls_back_to_yaml_when_cli_unimportable(monkeypatch
         encoding="utf-8",
     )
     monkeypatch.setattr(fleet.Path, "home", classmethod(lambda cls: fake_home))
-
-    # Force the hermes_cli import path to fail — the worker reality.
+    monkeypatch.delenv("HERMES_HOME", raising=False)  # pin the no-HERMES_HOME default path
     import builtins
 
     real_import = builtins.__import__
