@@ -590,9 +590,6 @@ def wrap_argv(
     a runtime insists on creating). Paths must be absolute and are resolved
     before binding; neither kind may intersect the workspace.
     """
-    tool = confinement_tool()
-    if tool is None:
-        raise RuntimeError("no OS confinement tool available (install bubblewrap or sandbox-exec)")
     validated_workspace = validate_workspace_boundary(workspace)
 
     def _resolve_extras(raw_paths: list[Path] | None, kind: str) -> list[Path]:
@@ -617,6 +614,9 @@ def wrap_argv(
     overlap = {str(p) for p in resolved_ro} & {str(p) for p in resolved_rw}
     if overlap:
         raise ValueError(f"extra_ro_paths and extra_rw_paths overlap: {sorted(overlap)}")
+    tool = confinement_tool()
+    if tool is None:
+        raise RuntimeError("no OS confinement tool available (install bubblewrap or sandbox-exec)")
     return _wrap_argv_with_tool(
         argv,
         validated_workspace,
