@@ -174,7 +174,7 @@ def compile_campaign(campaign_json: str) -> dict[str, Any]:
     if raw.get("schema") != CAMPAIGN_SCHEMA:
         raise CampaignSpecError(f"campaign schema must be {CAMPAIGN_SCHEMA!r}")
 
-    campaign_id = _clean_id(raw.get("campaign_id"), CAMPAIGN_ID_RE, "campaign_id")
+    _clean_id(raw.get("campaign_id"), CAMPAIGN_ID_RE, "campaign_id")
     mission_id = _clean_id(raw.get("mission_id"), plan_store.MISSION_ID_RE, "mission_id")
     objective = raw.get("objective")
     if objective is not None and not isinstance(objective, str):
