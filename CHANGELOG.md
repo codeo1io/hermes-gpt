@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+Fleet reliability: HERMES_HOME-aware home resolution and the upstream #91 builtin profile ceilings.
+
+- The fleet task→agent registry is actually written in default deployments: `_task_agent_registry_path` called a nonexistent `operator_policy.default_home()`, so every registry write raised inside the best-effort swallow and fleet cancels degraded to `RUNNER_CANCEL_UNOBSERVABLE` with the cancellation latch held forever. The registry root now uses the shared idiom — `HERMES_HOME` first, then `~/.hermes`, with `hermes-agent`/`profiles/<name>` suffixes normalized (rm-166).
+- The standalone-worker config fallback in `_load_hermes_config` resolves `HERMES_HOME` first, then `~/.hermes`, matching the hermes-agent CLI: a configured A2A peer stays visible to home-overridden Autopilot workers (rm-166).
+- The registry write creates its data root on first use, so a fresh deployment without `~/.hermes` yet still records task→agent mappings (rm-166).
+- The builtin fleet profile ceilings carry upstream #91 (`bbe7f7ec`): `macbook-m5`, `mac-mini-m5`, and `omarchy` are enrolled and `gaming-4090` gains `media`/`gpu-dev`, so authority manifests granting those peers their real profiles are accepted instead of raising `PermissionError` at the ceiling (rm-167).
+
 ## 0.14.0 - 2026-10-03
 
 Acceptance and recovery: declare deliverable checks before dispatch and recover from positively observed artifact failures within existing limits.
