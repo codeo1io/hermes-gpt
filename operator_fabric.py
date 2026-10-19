@@ -2812,7 +2812,7 @@ class _PeerHandler(BaseHTTPRequestHandler):
                     "protocolVersion": "1.0",
                     "name": policy.identity,
                     "description": "Hermes GPT managed Fabric peer",
-                    "version": "0.8",
+                    "version": "0.14.0",  # rm-164: keep synced with the package version (env override lives in server.py)
                     "url": self.advertised_url,
                     "capabilities": {},
                     "defaultInputModes": ["application/json"],

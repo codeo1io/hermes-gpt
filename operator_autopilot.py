@@ -504,13 +504,26 @@ def hermes_autopilot_start(
                 if _job is not None:
                     _mapped = _JOB_STATUS_TO_RUN_STATE.get(str(_job.get("status") or ""))
                     if _mapped and _mapped != preview.get("state"):
+                        _prior = preview.get("state")
                         preview = _write_run(mission_id, hermes_root, state=_mapped)
+                        # rm-162: every job-terminal status maps to a TERMINAL
+                        # run state, so after this durable write the run is
+                        # terminal and control falls through to the respawn
+                        # below — the idempotent early-return itself performs
+                        # no write. Audit the write AT the moment it happens
+                        # (changed=True) instead of carrying a changed flag on
+                        # a branch that can no longer execute after the write.
+                        _audit("hermes_autopilot_start", policy, dry_run=effective_dry, success=True, changed=True,
+                               mission_id=mission_id,
+                               extra={"idempotent": True, "zombie_reconciled": True, "prior_state": _prior,
+                                      "state": _mapped, "job_id": _job_id})
             if preview is not None and preview.get("state") not in TERMINAL_STATES:
                 _audit("hermes_autopilot_start", policy, dry_run=effective_dry, success=True, changed=False,
                        mission_id=mission_id, extra={"idempotent": True})
                 return json.dumps({
                     "success": True, "schema_version": SCHEMA_VERSION, "tool": "hermes_autopilot_start",
-                    "dry_run": effective_dry, "mission_id": mission_id, "idempotent": True, "run": preview,
+                    "dry_run": effective_dry, "mission_id": mission_id, "idempotent": True, "changed": False,
+                    "run": preview,
                 })
 
         config = {"max_concurrency": max_concurrency, "max_replans": max_replans,
@@ -969,8 +982,8 @@ def _invocation_possibly_submitted(delegation_id: str, hermes_root: Path | None)
         with deleg._connect(dbp, write=False) as db:
             rows = db.execute(
                 "SELECT created_at FROM delegation_events WHERE delegation_id=? "
-                "AND event_type IN ('delegation.dispatched','delegation.dispatch_ambiguous')",
-                (delegation_id,),
+                f"AND event_type IN ({','.join('?' * len(deleg.SUBMISSION_EVENT_TYPES))})",
+                (delegation_id, *deleg.SUBMISSION_EVENT_TYPES),
             ).fetchall()
     except (sqlite3.Error, OSError):
         return True  # unreadable history: fail closed, hold the node
@@ -1011,7 +1024,11 @@ def _rebuild_dispatch_contract(
         with deleg._connect(dbp, write=False) as db:
             manifest = deleg._manifest_row(db, delegation_id)
             row = deleg._get_row(db, delegation_id)
-    except (sqlite3.Error, OSError, LookupError, KeyError):
+    except (sqlite3.Error, OSError, LookupError, KeyError, ValueError):
+        # rm-158: a corrupt validation manifest (the ValueError raise sites in
+        # _manifest_row) fails THIS node closed — held under
+        # contract_unavailable — instead of propagating to schedule_tick and
+        # wedging every sibling node in the mission as tick_error.
         return None
     if manifest is None or row["task_id"] != task_id:
         return None

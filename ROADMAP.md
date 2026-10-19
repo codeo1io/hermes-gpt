@@ -14,6 +14,11 @@
 
 ## Open items
 
+### Fleet task->agent registry: correct home resolution, scoping, and contract fallback
+- id: `rm-156` | track: reliability | priority: 115.0 | status: in_progress
+- acceptance: `_task_agent_registry_path` resolves the default home WITHOUT `op.default_home` (it does not exist on operator_policy — AttributeError today) using the operator_runners.py:68 idiom; registry is root-scoped with the dispatch path threading hermes_root to the write site (operator_fleet.py:987) and FleetBackend.cancel honoring its own hermes_root; the read-modify-write map is bounded (prune/TTL); the contract's own agent field is the fallback on registry miss so cancel never returns RUNNER_CANCEL_UNOBSERVABLE for a pre-registry or lost-registry row; the `except Exception: pass` in both helpers replaced by loud logging; audit records name the resolved agent id; tests include a HERMES_HOME-unset reproduction and a cancel test that does NOT monkeypatch `_peer_for_task` (the gap that let the AttributeError ship); an evaluation note decides whether A2A v1.0.0 `tasks/{id}` + `tasks/list` becomes the authoritative peer-side observation instead of the local side table
+- evidence: assess a8d76146 attempt 5ba8694e findings.md F1 (hasattr(op,'default_home')==False + AttributeError repro), F4, F5, F12; research 0c63bc25 research.md C3 (A2A v1.0.0 tasks/list, a2aproject/A2A CHANGELOG 2026-03-12)
+
 ### Adopt upstream skill-loader hardening trio (upstream issue #74 full half)
 - id: `rm-081` | track: reliability | priority: 115.0 | status: candidate
 - acceptance: merged tree reconciles fork+upstream halves into a single resolution authority; loader failure is fail-closed with a test proving a required-but-unloadable skill blocks dispatch; probes use preprocess=False with a test asserting inline_shell side effects never run during validation; fork surfaces (plan create/validate/placement) keep enforcement at parity with upstream's breadth (work contracts/swarm); full suite + upstream's new tests green on both SDK lanes
@@ -34,11 +39,21 @@
 - acceptance: both payloads' token-store reads execute off the loop (asyncio.to_thread or the in-file equivalent); regression test holds the token-store path blocked and asserts a concurrent lightweight async handler still completes (a sync TestClient cannot observe this — use the async test pattern rm-076's suite established); payload shapes unchanged; a note lands in docs/ui-security-boundary.md transport-health section that the poll endpoint is off-loop
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
 
+### Autopilot wakeup suite must be deterministic on clean master
+- id: `rm-157` | track: reliability | priority: 105.0 | status: in_progress
+- acceptance: root cause named and fixed for BOTH observed flakes (event-flood woke=0 under -n 4; cursor high-water-mark sequential failure; green/FAIL/green across 3 sequential runs) — either the worker legitimately goes tick-bound under flood (then the test's wake-count band is corrected and the debounce contract documented) or the live-events long-poll misses slice-window events (then `_wait_for_wakeup`'s wait/slice budget is fixed); the file passes 10 consecutive runs sequentially AND under -n 4 in the hermetic env with no skips added
+- evidence: assess a8d76146 attempt 5ba8694e findings.md F2 + pytest-full.log (1911P/5S/1F, woke=0)
+
 ### Add test coverage for 16 untested module(s)
 - id: `rm-002` | track: reliability | priority: 100.0 | status: candidate
 - signals: reliability.no_tests:hermes_state.py, reliability.no_tests:tools/check_package_hygiene.py, reliability.no_tests:web/src/chat/ActivityCard.tsx, reliability.no_tests:web/src/chat/ChatPage.tsx, reliability.no_tests:web/src/chat/Composer.tsx (+11 more)
 - acceptance: Every module in ['hermes_state.py', 'tools/check_package_hygiene.py', 'web/src/chat/ActivityCard.tsx', 'web/src/chat/ChatPage.tsx', 'web/src/chat/Composer.tsx', 'web/src/flight/AccountPanel.tsx', 'web/src/flight/ApprovalsPanel.tsx', 'web/src/flight/ContractsPanel.tsx', 'web/src/flight/DeckOverview.tsx', 'web/src/flight/EventHistoryPanel.tsx', 'web/src/flight/FleetPanel.tsx', 'web/src/flight/schemas.ts', 'web/src/shared/AccountStatusBanner.tsx', 'web/src/shared/ConnectionStatus.tsx', 'web/src/stores/session-list.ts', 'web/vite.config.ts'] has a corresponding test file with at least one passing test
 - evidence: full suite green (python -m pytest -q) at HEAD; conductor validation digest validation:v1:<sha> recorded in the shipping PR
+
+### Corrupt validation manifest must fail closed per-node, not wedge the mission tick
+- id: `rm-158` | track: reliability | priority: 100.0 | status: in_progress
+- acceptance: `_rebuild_dispatch_contract`'s except tuple (or `_manifest_row`'s raise types) extended so corrupt-manifest ValueError (operator_delegations.py:688/:690) lands in the held/contract_unavailable path (return None) instead of propagating to schedule_tick; a corrupt row fails ITS node closed while sibling nodes keep advancing; regression test injects corrupt manifest JSON and metadata-mismatch rows and asserts (a) no tick_error, (b) the affected node held, (c) sibling nodes progressed; the ambiguous_dispatch_grace and contract_unavailable hold paths gain their first direct tests (zero references today)
+- evidence: assess a8d76146 attempt 5ba8694e findings.md F3 (operator_autopilot.py:1012 except tuple vs ValueError), F9
 
 ### Refactor 20 high-complexity function(s)
 - id: `rm-001` | track: reliability | priority: 90.0 | status: candidate
@@ -66,9 +81,15 @@
 - acceptance: the WS loop advances its cursor to the returned next_cursor on empty pages too (or an equivalent watermark adoption), preserving rm-080's snapshot-ordering guarantee (a concurrent insert is delivered or rescanned, never skipped); a regression test asserts an idle filtered WS client advances past N non-matching events without rescanning them; the docs/live-events.md cursor-semantics paragraph holds verbatim
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
 
+### A2A v1.0.x conformance sweep (fleet peers)
+- id: `rm-159` | track: reliability | priority: 78.0 | status: candidate
+- acceptance: the hand-rolled fleet client (operator_fleet.py:271) negotiates per spec for 1.0.x peers — prefers application/a2a+json (v1.0.1) with the application/json fallback documented; a recorded decision covers peer auth against v1.0.0's modernized OAuth (PKCE/device-code; implicit/password removed) for remote a2a_agents, adopted or explicitly deferred with rationale; card consumption pinned by a fixture test against a v1.0.x card (capabilities moves, 'canceled' spelling — tolerated at operator_runners.py:719); hand-rolled client vs official a2a-sdk 1.2.2 decision recorded in docs with the loopback-first invariant intact
+- evidence: research a8d76146 attempt 0c63bc25 research.md C2 (a2aproject/A2A v1.0.0 2026-03-12 + v1.0.1 2026-05-26 changelogs; pypi a2a-sdk 1.2.2, fetched 2026-10-18)
+
 ### Python floor bump 3.10->3.11 plus a 3.13 CI lane (dated deadline)
 - id: `rm-100` | track: reliability | priority: 75.0 | status: candidate
 - acceptance: CI matrix adds a green 3.13 lane (and 3.14 if deps allow); a dated plan lands the 3.11 floor bump with the next fork release (requires-python >=3.11, matrix drops 3.10, tomli conditional removed); CHANGELOG records both
+- acceptance: the decision cites the 2026-10-18 ecosystem evidence — starlette 1.8.0 and hypothesis 6.170.1 require >=3.11, so 3.10 installs resolve to older components (the resolver split is documented whichever way the decision goes); the fleet itself runs 3.13.15 while ci.yml's matrix stops at 3.12
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
 
 ### cron next-fire + timezone preview at arm time
@@ -79,6 +100,7 @@
 ### MCP spec-revision lineage refresh + SDK 2.3.x lane
 - id: `rm-048` | track: reliability | priority: 70.0 | status: in_progress
 - acceptance: docs/mcp-compatibility.md corrected to describe the revision lineage per SDK family instead of claiming one "latest"; the rm-009 revision assertion parameterized per installed SDK pin (still fails loudly on unexpected revisions); a mcp==2.3.x lane added to CI (or pins refreshed per rm-009's cadence rule) with a spec-delta review note for hermes surfaces; MCP-Auth cross-RFC notes (RFC 9728/9700 now Proposed Standard, draft-ietf-oauth-parallel-refresh adopted) reflected in docs/oauth.md where they touch hermes behavior
+- acceptance: the lineage map names BOTH new stable revisions — 2025-11-25 (SEP-991 CIMD, OIDC AS discovery, 403-for-invalid-Origin) and 2026-07-28 (stateless overhaul: initialize/Mcp-Session-Id removal, server/discover MUST, subscriptions/listen, required resultType/MRTR, SSE resumability removal, tasks->io.modelcontextprotocol/tasks extension, SEP-414 trace-context _meta, ttlMs/cacheScope) — with the per-family SDK support stated; SDK 2.3.0 shipped 2026-10-02 so the lane is currently missing, not hypothetical; docs/oauth.md notes the 2026-07-28 client-side RFC 9207 iss validation MUST
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
 
 ### Ship or document a browser-UI build path (web assets absent from wheel/MANIFEST)
@@ -106,6 +128,11 @@
 - acceptance: state-changing (POST) routes reject Sec-Fetch-Site: cross-site requests and Origin headers outside the allowed set (UI origin + chatgpt.com + issuer), and require Content-Type: application/json on JSON-body routes; the ChatGPT-side origin keeps working (it is in the CORS list today); non-browser MCP clients unaffected; any escape-hatch env documented; tests cover allow/deny/cross-site/preflight cases.
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
 
+### CHANGELOG Unreleased + operational-surface docs for the recovery wave
+- id: `rm-164` | track: reliability | priority: 62.0 | status: candidate
+- acceptance: CHANGELOG gains an Unreleased section enumerating the 11 post-0.14.0 behavioral commits (cancellation deadlock fixes, crash-window recovery, zombie terminalization) with upgrade notes where semantics changed; docs/ covers fleet-task-agents.json (location, scoping after rm-156, role in cancel observation) and the cancel-observation semantics; stale literals refreshed or derived (server.py:3075/:3117 '0.20.5' peer fallback vs package 0.14.0; operator_fabric.py:2815 card 'version': '0.8'); AGENTS.md release-discipline review list satisfied
+- evidence: assess a8d76146 attempt 5ba8694e findings.md F10
+
 ### Raise build floor to setuptools>=77 (PEP 639 license string)
 - id: `rm-027` | track: reliability | priority: 62.0 | status: in_progress
 - acceptance: floor raised to >=77 (or license switched to table form) so declared-floor builds work; sdist+wheel build verified in a --no-isolation environment; no behavior change to isolated CI builds
@@ -131,10 +158,20 @@
 - acceptance: usage rows joined/filtered by sessions.started_at >= cutoff with the schema-drift fallback the intent comment describes (missing started_at -> fail loud or explicitly-degraded output, never silently all-time); a new test with a stale pre-cutoff usage row asserted EXCLUDED from _24h sums; the baked test updated to a two-window fixture; full test_operator_mission.py green
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
 
+### Dev-dependency major bounds (pytest 9, twine 7 are current majors)
+- id: `rm-160` | track: reliability | priority: 60.0 | status: candidate
+- acceptance: dev groups bound pytest (<10) and twine (<8) in both [project.optional-dependencies] and [dependency-groups] so a fresh `pip install -e ".[dev]"` cannot resolve to untested majors (PyPI 2026-10-18: pytest 9.1.1, twine 7.0.0 while ruff is hard-pinned <0.16); adoption notes per major mirror rm-035's ruff approach; CI green on the bounded range; the ruff note records that 0.17.1 is current so the rm-035 config lands on a current major
+- evidence: research a8d76146 attempt 0c63bc25 research.md C7 (pypi JSON fetches 2026-10-18) + pyproject.toml dev groups
+
 ### declare the browser-UI agent-runtime cross-project seam
 - id: `rm-136` | track: reliability | priority: 58.0 | status: candidate
 - acceptance: the seam is DECLARED — vendored/stubbed interfaces behind an explicit boundary module, OR a documented contract (which external tree provides them, at what version) + an import-contract test that runs on the clean checkout and fails LOUDLY (never silent IMPORT_UNAVAILABLE) when the declared provider is missing; pyproject/docs name the external requirement; if a degradation path is kept, it is visible in doctor.
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
+
+### Hermetic local validation gate as the default merge check
+- id: `rm-161` | track: reliability | priority: 58.0 | status: candidate
+- acceptance: tools/run_local_gate.sh (or a make target) encodes the hermetic invocation — TMPDIR outside git repos, result-count derivation independent of the xdist summary quirk, build + tools/check_package_hygiene.py + twine check — one command on any checkout; docs name it as the merge-blocking check while GitHub Actions is account-blocked; a cheap pre-merge emptiness check (`git diff HEAD^ --stat`) guards the duplicate-merge debris class (#34 was a zero-delta child of #33); the gate's documented baseline is the 2026-10-18 clean-HEAD result (1911P/5S/1F known-flake rm-157, or green once rm-157 lands)
+- evidence: assess a8d76146 attempt 5ba8694e findings.md F8; fleet constraint — Actions blocked (HTTP 422), 3e12ef4c71 master-red unseen across 11 lanes; research 0c63bc25 research.md C9
 
 ### Branch protection on codeo1io master (extends rm-008 with red-master evidence)
 - id: `rm-038` | track: reliability | priority: 55.0 | status: candidate
@@ -171,6 +208,11 @@
 - acceptance: pyproject declares starlette and anyio with bounds consistent with the resolved floor (e.g. starlette>=0.40,<2; anyio>=4,<5) and a comment naming mcp[cli] as the existing transitive source; CI installs green on the declared range; the declaration introduces no version drift (resolver output unchanged before/after)
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
 
+### Delegation recovery-path truthfulness bundle
+- id: `rm-162` | track: reliability | priority: 52.0 | status: in_progress
+- acceptance: the dead stale_invocation clause is removed or made load-bearing with a characterization test (operator_delegations.py ~:1300); invocation_recovered's from_state reflects the true prior state (reserved+invoking shape-1, not hardcoded 'reconciling', :1419); the idempotent zombie-reconcile early-return audits its durable `_write_run` as changed (or documents the write) at operator_autopilot.py ~:495-510; the cross-module event literals ('delegation.dispatched' :1033, 'delegation.dispatch_ambiguous' :1079) are pinned by a drift test matching `_invocation_possibly_submitted`'s set, and the guard gains its first direct unit test
+- evidence: assess a8d76146 attempt 5ba8694e findings.md F7, F12, F9
+
 ### Document the convergence-shipped OAuth surface and repair the CHANGELOG
 - id: `rm-034` | track: reliability | priority: 52.0 | status: candidate
 - acceptance: docs/oauth.md documents all three knobs (name, default, gates, security posture incl. knob-vs-endpoint semantics); CHANGELOG gains a convergence entry and the :12 run-on is fixed; AGENTS.md docs rules (defaults/gates explicit) satisfied
@@ -186,7 +228,13 @@
 - acceptance: either a recorded occupancy rationale or a semaphore/bound on concurrent job_wait parks; the nonblocking pin test extended to the full offloaded set
 - acceptance: bullet repaired; Unreleased section enumerates the user-visible converged changes; AGENTS.md release-discipline review list satisfied
 - acceptance: study recorded (wire shape, SDK-2-only constraints, 1.28.1 degradation matrix, client-support reality); if adopted: one operator mutation tool returns InputRequiredResult with a dual-SDK test proving graceful refusal on 1.x; docs/mcp-compatibility.md gains a SEP-2322 section
+- acceptance: the adoption-timing decision cites MCP 2025-11-25 SEP-991 (Client ID Metadata Documents now a RECOMMENDED registration mechanism); the client redemption path audits/implements RFC 9207 iss validation per the 2026-07-28 client-side MUST (server metadata already advertises it at oauth_auth.py:1399-1406 per SEP-2468)
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
+
+### Validation-verdict cache signature completeness + epoch edge guards
+- id: `rm-163` | track: reliability | priority: 50.0 | status: candidate
+- acceptance: `_validation_scope_signature` is no longer blind past the 2000-entry walk cutoff (full-enumeration content hash, or an explicit truncation-invalidates policy that cannot reuse a stale verdict) and .git churn is excluded from the signature; ordered_time rejects (or safely floors) ms-precision epochs and calendar-digit integers (operator_delegations.py:622-633) with tests for both producer shapes; a stale-verdict regression test pins the past-cutoff workspace-change case
+- evidence: assess a8d76146 attempt 5ba8694e findings.md F6, F13
 
 ### Commit a [tool.ruff] rule-set config on ruff 0.16 (extends run-fd2bc85f rm-028)
 - id: `rm-035` | track: reliability | priority: 50.0 | status: candidate
@@ -201,6 +249,7 @@
 ### Conformance-check skill resolution against the PUBLISHED MCP Skills extension (extends run-684b9786 rm-028 / PR #20)
 - id: `rm-036` | track: reliability | priority: 48.0 | status: candidate
 - acceptance: conformance note mapping hermes skill surfaces onto the published extension (naming, discovery roots, precedence); PR #20's tests verified against it; upstream #74 outcome recorded when it lands (contract agreed architecture-first per run-684b9786 rm-028)
+- acceptance: the published-extension target is docs/extensions/skills in the MCP monorepo (2026-10-18 snapshot) and the conformance map cites its current text; rm-082's serving surface re-baselines against the same snapshot
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
 
 ### SHA-pin the reusable private-leak-sentinel workflow
@@ -272,6 +321,7 @@
 ### SEP-414 trace-context correlation for cross-agent runs
 - id: `rm-084` | track: reliability | priority: 35.0 | status: candidate
 - acceptance: correlation-only scope — accept and echo incoming traceparent into operator audit records and live events for MCP tool calls and delegation/codex dispatch (no full OTel SDK adoption); tests assert presence and passthrough; docs note the convention
+- acceptance: the implementation note cites the now-normative 2026-07-28 minor-changes text (traceparent/tracestate/baggage `_meta` conventions) as the conformance target instead of the SEP issue thread
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
 
 ### roadmap id-allocation guard (tools/check_roadmap_ids.py)

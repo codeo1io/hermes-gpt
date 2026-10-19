@@ -29,6 +29,14 @@ import operator_runners as runners
 SCHEMA_VERSION = "0.9-delegation.2"
 DELEGATION_SCHEMA = "hermes.delegation/v1"
 
+# rm-162: submission-event literals are a cross-module contract — the
+# autopilot double-execution guard (_invocation_possibly_submitted) reads
+# exactly these event types to decide whether a crash window may have
+# submitted work. Single source of truth here; the guard imports the tuple.
+DISPATCHED_EVENT_TYPE = "delegation.dispatched"
+DISPATCH_AMBIGUOUS_EVENT_TYPE = "delegation.dispatch_ambiguous"
+SUBMISSION_EVENT_TYPES = (DISPATCHED_EVENT_TYPE, DISPATCH_AMBIGUOUS_EVENT_TYPE)
+
 # Refusal codes that provably fire BEFORE any backend submission (registry,
 # authority, policy, and contract-shape gates evaluated ahead of the A2A /
 # runner call). A dispatch failing with one of these never invoked the
@@ -1030,7 +1038,7 @@ def hermes_delegation_dispatch(
                 (state, _bounded(backend_state, 128), json.dumps(_backend_ref(dispatch), sort_keys=True), phase, now, now, delegation_id),
             ).rowcount
             if changed == 1:
-                _event(db, delegation_id, "delegation.dispatched", to_state=state, backend_state=backend_state)
+                _event(db, delegation_id, DISPATCHED_EVENT_TYPE, to_state=state, backend_state=backend_state)
             db.commit()
             row = dict(_get_row(db, delegation_id))
         invocation_claimed = False
@@ -1076,7 +1084,7 @@ def hermes_delegation_dispatch(
                         (_now(), delegation_id),
                     ).rowcount
                     if changed == 1:
-                        _event(db, delegation_id, "delegation.dispatch_ambiguous", from_state="reserved", to_state="reconciling", backend_state="ambiguous")
+                        _event(db, delegation_id, DISPATCH_AMBIGUOUS_EVENT_TYPE, from_state="reserved", to_state="reconciling", backend_state="ambiguous")
                     db.commit()
             except (OSError, sqlite3.Error):
                 pass
@@ -1296,7 +1304,12 @@ def hermes_delegation_reconcile(
             # MIGHT have reached a backend stays reconciling. A row ALREADY at
             # pure reserved (the recovered resting state) keeps it — see the
             # observed-is-None branch above (self-erasing-recovery fix).
-            if not (stale_invocation and observed_desired == "reserved") and observed_desired != "reserved":
+            # rm-162: the previous leading term
+            # ``not (stale_invocation and observed_desired == "reserved")`` was
+            # provably dead (it only mattered when observed_desired ==
+            # "reserved", which the surviving term already excluded); removed
+            # with behavior characterized in test_delegation_recovery_truthfulness.
+            if observed_desired != "reserved":
                 desired = "reconciling"
         # A successful backend with positively observed bad artifacts is a work
         # defect, not an ambiguous submission. Allow a durable 30s delivery grace,
@@ -1416,7 +1429,9 @@ def hermes_delegation_reconcile(
                     (desired, _bounded(backend_state, 128), _bounded(outcome, 128), _bounded(verdict, 64),
                      summary_json, failure_since, 1 if changed else 0, now, terminal_at, delegation_id),
                 )
-                _event(db, delegation_id, "delegation.invocation_recovered", from_state="reconciling", to_state="reserved")
+                # rm-162: record the TRUE prior state — the crash shapes include
+                # reserved+invoking, not just reconciling.
+                _event(db, delegation_id, "delegation.invocation_recovered", from_state=_bounded(str(stored.get("state") or "reserved"), 64), to_state="reserved")
             else:
                 db.execute(
                     "UPDATE delegations SET state=?,backend_state=?,outcome=?,validation_verdict=?,"
@@ -1506,7 +1521,9 @@ def hermes_delegation_cancel(
                         "(dispatch_phase='reserved' AND state='reconciling'))",
                         (_now(), delegation_id),
                     )
-                    _event(db, delegation_id, "delegation.invocation_recovered", from_state="reconciling", to_state="reserved")
+                    # rm-162: record the TRUE prior state (reserved+invoking is a
+                    # legal crash shape here, not just reconciling).
+                    _event(db, delegation_id, "delegation.invocation_recovered", from_state=_bounded(str(stored.get("state") or "reserved"), 64), to_state="reserved")
                     db.commit()
                     with _connect(path, write=False) as rdb:
                         stored = dict(_get_row(rdb, delegation_id))

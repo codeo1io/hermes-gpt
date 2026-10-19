@@ -14,6 +14,7 @@ from __future__ import annotations
 import concurrent.futures
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -200,7 +201,12 @@ def _load_hermes_config() -> dict[str, Any]:
     try:
         import yaml
 
-        path = Path.home() / ".hermes" / "config.yaml"
+        # rm-156/F5: honor HERMES_HOME like the registry resolver and the
+        # runner layer do — the hardcoded Path.home() fallback made
+        # standalone workers with a custom home resolve a2a_agents to {}
+        # (UNKNOWN_AGENT), the exact wedge this fallback exists to prevent.
+        root = op.normalize_hermes_data_root(os.environ.get("HERMES_HOME")) or Path.home() / ".hermes"
+        path = root / "config.yaml"
         if path.is_file():
             data = yaml.safe_load(path.read_text())
             return data if isinstance(data, dict) else {}
@@ -939,7 +945,7 @@ def hermes_fleet_dispatch_work_order(agent: str, task_id: str, target_profile: s
                                      deliverables: list[str], authorization: dict[str, Any] | str,
                                      confirm: bool = False, dry_run: bool = True, timeout: int = 30,
                                      *, runner: Runner | None = None, hermes_bin: str | None = None,
-                                     authority_manifest: Path | None = None) -> str:
+                                     authority_manifest: Path | None = None, hermes_root: Path | None = None) -> str:
     policy = op.OperatorPolicy()
     try:
         policy.require_level("workspace")
@@ -984,7 +990,7 @@ def hermes_fleet_dispatch_work_order(agent: str, task_id: str, target_profile: s
         remote_id = remote.get("id")
         if not isinstance(remote_id, str) or not _TASK_ID_RE.fullmatch(remote_id):
             return _error("FLEET_DISPATCH_ERROR", "A2A submission returned no valid task id", "Check the peer's A2A service.")
-        _record_task_agent(remote_id, peer)
+        _record_task_agent(remote_id, peer, hermes_root, alias_task_id=task_id)
         status = remote.get("status") if isinstance(remote.get("status"), dict) else {}
         op.audit_record(tool="hermes_fleet_dispatch_work_order", level=policy.level, apply_mode=policy.apply_mode, dry_run=False,
                         success=True, changed=True, summary=f"fleet work-order submitted to {peer}", prompt=canonical,
@@ -1023,16 +1029,41 @@ def hermes_fleet_dispatch_work_order(agent: str, task_id: str, target_profile: s
         return _error("FLEET_DISPATCH_ERROR", op.redact_output(str(exc)), "Check local authority, registry, and peer service.")
 
 
+_FLEET_TASK_AGENT_REGISTRY_MAX = 2000
+logger = logging.getLogger(__name__)
+
+
 def _task_agent_registry_path(hermes_root: Path | None) -> Path:
-    root = hermes_root or Path(os.environ.get("HERMES_HOME") or op.default_home())
+    # rm-156: ``op.default_home()`` never existed on operator_policy — the
+    # previous resolver raised AttributeError (silently swallowed by both
+    # helpers) whenever HERMES_HOME was unset, so the registry never worked
+    # in default deployments and every fleet-delegation cancel observed
+    # UNKNOWN_AGENT. Resolve the runner-layer idiom instead: explicit root,
+    # else HERMES_HOME, else the user's default hermes home.
+    root = hermes_root or op.normalize_hermes_data_root(os.environ.get("HERMES_HOME")) or Path.home() / ".hermes"
     return root / "fleet-task-agents.json"
 
 
-def _record_task_agent(task_id: str, agent: str, hermes_root: Path | None = None) -> None:
+def _record_task_agent(
+    task_id: str, agent: str, hermes_root: Path | None = None, alias_task_id: str = "",
+) -> None:
     """Durable task_id -> agent map so backend cancel can observe the peer.
 
     Written only on confirmed dispatch (a remote task id exists); best-effort —
-    cancellation degrades to unobservable, never fails dispatch."""
+    cancellation degrades to unobservable, never fails dispatch. rm-156:
+    root-scoped (hermes_root threaded from the dispatch call site), bounded
+    to the newest _FLEET_TASK_AGENT_REGISTRY_MAX mappings, and registry
+    errors are LOGGED instead of silently passed (silent failure is how the
+    broken resolver shipped unnoticed).
+
+    ``alias_task_id`` records the SAME agent under the caller-facing task id
+    (the Work Contract's task_id) when a peer mints its own A2A task id:
+    ``hermes_delegation_cancel`` resolves peers by the delegation row's
+    task_id, so without the alias the peer-minted key would be unreachable
+    from the cancellation path. Pruning is recency-based (a re-write moves
+    the key to the end) and can never evict the entry just written — a
+    lexicographic trim could drop the very mapping this call exists to make.
+    """
     try:
         path = _task_agent_registry_path(hermes_root)
         data: dict[str, str] = {}
@@ -1040,14 +1071,26 @@ def _record_task_agent(task_id: str, agent: str, hermes_root: Path | None = None
             data = json.loads(path.read_text("utf-8"))
             if not isinstance(data, dict):
                 data = {}
-        except Exception:
+        except (OSError, ValueError) as exc:
+            logger.warning("fleet task-agent registry unreadable at %s (%s); starting fresh", path, exc)
             data = {}
-        data[str(task_id)] = str(agent)
+        keys = [str(task_id)]
+        if alias_task_id and str(alias_task_id) != str(task_id) and _TASK_ID_RE.fullmatch(str(alias_task_id)):
+            keys.append(str(alias_task_id))
+        for key in keys:
+            data.pop(key, None)  # re-write => most recent position
+            data[key] = str(agent)
+        while len(data) > _FLEET_TASK_AGENT_REGISTRY_MAX:
+            del data[next(iter(data))]  # drop the OLDEST mapping, never the just-written one
+        path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, indent=1), "utf-8")
         tmp.replace(path)
-    except Exception:
-        pass
+    except OSError as exc:
+        logger.warning(
+            "fleet task-agent registry write failed at %s (%s); cancellation observation may degrade",
+            _task_agent_registry_path(hermes_root), exc,
+        )
 
 
 def _task_agent(task_id: str, hermes_root: Path | None = None) -> str:
@@ -1057,8 +1100,10 @@ def _task_agent(task_id: str, hermes_root: Path | None = None) -> str:
             agent = data.get(str(task_id))
             if isinstance(agent, str):
                 return agent
-    except Exception:
-        pass
+    except OSError as exc:
+        logger.warning("fleet task-agent registry unreadable (%s); cancel observation falls back to the contract", exc)
+    except ValueError as exc:
+        logger.warning("fleet task-agent registry corrupt (%s); cancel observation falls back to the contract", exc)
     return ""
 
 

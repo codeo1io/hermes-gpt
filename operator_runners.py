@@ -638,6 +638,32 @@ def observed_runs(task_id: str, *, hermes_root: Path | None = None) -> list[dict
     return out
 
 
+def _fleet_contract_agent_for_task(task_id: str, hermes_root: Path | None) -> str:
+    """assigned_agent from the delegation's stored Work Contract (rm-156).
+
+    Registry-miss fallback for fleet cancel observation: the validation
+    manifest carries the canonical contract, whose assigned_agent names the
+    peer the work order was dispatched to. Best-effort — an empty result
+    leaves cancel unobservable, never fails the caller."""
+    try:
+        import operator_delegations as deleg
+
+        dbp = deleg._db_path(hermes_root)
+        if not dbp.is_file():
+            return ""
+        with deleg._connect(dbp, write=False) as db:
+            row = db.execute(
+                "SELECT delegation_id FROM delegations WHERE task_id=?", (str(task_id),)
+            ).fetchone()
+            if row is None:
+                return ""
+            manifest = deleg._manifest_row(db, str(row["delegation_id"]))
+            contract, _sha = deleg.contract_mod._contract_from_validation_manifest(manifest)
+            return str(contract.get("assigned_agent") or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 @dataclass
 class FleetBackend:
     name: str = "fleet"
@@ -676,6 +702,7 @@ class FleetBackend:
             runner=kwargs.get("runner"),
             hermes_bin=kwargs.get("hermes_bin"),
             authority_manifest=kwargs.get("authority_manifest"),
+            hermes_root=hermes_root,
         )
         payload = json.loads(text)
         payload["backend"] = self.name
@@ -707,7 +734,7 @@ class FleetBackend:
         #                                 held until observation establishes
         #                                 authority.
         try:
-            payload = json.loads(op_fleet.hermes_fleet_task(self._peer_for_task(task_id), task_id))
+            payload = json.loads(op_fleet.hermes_fleet_task(self._peer_for_task(task_id, hermes_root=hermes_root), task_id))
         except Exception as exc:  # noqa: BLE001
             return {"success": False, "code": "RUNNER_CANCEL_UNOBSERVABLE", "backend": self.name, "reason": _bounded_text(exc, 200)}
         if not payload.get("success"):
@@ -727,12 +754,17 @@ class FleetBackend:
             return {"success": False, "code": "RUNNER_CANCEL_UNOBSERVABLE", "backend": self.name}
         return {"success": False, "code": "RUNNER_CANCEL_UNSUPPORTED", "backend": self.name}
 
-    def _peer_for_task(self, task_id: str) -> str:
+    def _peer_for_task(self, task_id: str, *, hermes_root: Path | None = None) -> str:
         # Work orders carry the assigned agent in the contract; the runner
-        # layer does not pass it here, so resolve via the dispatch registry
-        # recorded by hermes_fleet_dispatch_work_order.
-        agent = op_fleet._task_agent(task_id)
-        return agent or ""
+        # peer does not pass it here, so resolve via the dispatch registry
+        # recorded by hermes_fleet_dispatch_work_order, falling back to the
+        # delegation's own Work Contract when the registry has no entry
+        # (rm-156: pre-registry and lost-registry rows must still cancel —
+        # UNKNOWN_AGENT latches cancellation forever).
+        agent = op_fleet._task_agent(task_id, hermes_root)
+        if agent:
+            return agent
+        return _fleet_contract_agent_for_task(task_id, hermes_root)
 
 
 class _LocalProcessBackend:
