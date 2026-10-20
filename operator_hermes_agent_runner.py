@@ -49,11 +49,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:  # Protocol only — runtime import would cycle through _register_builtins
-    from operator_runners import RunnerBackend
-
 logger = logging.getLogger(__name__)
 
 #: Default spool root — must match the deployed supervisor unit
