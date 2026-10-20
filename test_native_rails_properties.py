@@ -25,11 +25,10 @@ from __future__ import annotations
 import hashlib
 import json
 import pathlib
-import re
 import sys
 
 import pytest
-from hypothesis import HealthCheck, given, settings
+from hypothesis import given, settings
 from hypothesis import strategies as st
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
