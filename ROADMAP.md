@@ -49,6 +49,7 @@
 - id: `rm-167` | track: reliability | priority: 95.0 | status: in_progress
 - acceptance: `_BUILTIN_PROFILES` (operator_fleet.py:58-62) gains upstream #91's entries — macbook-m5 {default, apple, apple-design, apple-dev, apple-qa, apple-release}, mac-mini-m5 {default}, omarchy {default}, gaming-4090 +{media, gpu-dev} — ported fork-minimally with upstream commit bbe7f7ec50965dee7eec9b5e678b987109205f43 (2026-10-11) cited; a regression test asserts each new peer's ceiling so an authority manifest granting their real profiles no longer raises PermissionError at operator_fleet.py:635 (unknown peers currently get a {"default"}-only ceiling at :624); the fork's diverged operator_fleet.py is reconciled so the next upstream adoption does not regress the table again
 - evidence: research ae5d6905880a attempt ccfc0f98 research.md RC-1 (gh api upstream master commits since v0.14.0: exactly #91 unmerged; patch fetched)
+- evidence: cycle-2 2026-10-20: implemented + validated — targeted impacted-tests 154P/0F, full ephemeral-PR CI GREEN (gh run 39387080814, PR #55, 7 jobs success); landed in salvage commit 37e1d5eb0d; status remains in_progress pending review/landing
 
 ### Refactor 20 high-complexity function(s)
 - id: `rm-001` | track: reliability | priority: 90.0 | status: candidate
@@ -80,6 +81,7 @@
 - id: `rm-166` | track: reliability | priority: 85.0 | status: in_progress
 - acceptance: `_load_hermes_config`'s fallback (operator_fleet.py:201) resolves the config via `os.environ.get("HERMES_HOME", Path.home()/".hermes")` — the operator_runners.py:68 idiom — instead of the hardcoded `Path.home()/".hermes"`, and the docstring claim "reads the same default config the CLI would" becomes true under HERMES_HOME (hermes_cli.config resolves via get_hermes_home today); a test pins both resolution paths (HERMES_HOME set/unset) so a configured peer stays visible to standalone Autopilot workers in home-overridden deployments; the fix names the same resolution authority the pending 'Fleet task->agent registry' item (rm-156..164 set, run a8d76146, cite-by-title) mandates for the registry path — one idiom, both sites
 - evidence: code at HEAD 146e4cff56: operator_fleet.py:177-209 (fallback :201 hardcodes home; introduced by #37 5d926938a6 for the UNKNOWN_AGENT loop); hermes_cli.config source resolves via get_hermes_home() honoring HERMES_HOME — divergence verified 2026-10-19
+- evidence: cycle-2 2026-10-20: implemented + validated — fixed the registry P1 site too (_task_agent_registry_path via the same _default_hermes_root helper + first-run mkdir); targeted impacted-tests 154P/0F incl. one dependent-test contract update (test_operator_fleet_cli_resolution.py HERMES_HOME delenv pin); full ephemeral-PR CI GREEN (gh run 39387080814); landed in salvage commit 37e1d5eb0d; status remains in_progress pending review/landing
 
 ### Python floor bump 3.10->3.11 plus a 3.13 CI lane (dated deadline)
 - id: `rm-100` | track: reliability | priority: 75.0 | status: candidate
@@ -87,6 +89,12 @@
 - acceptance: the dated deadline has ARRIVED — Python 3.10 reached end-of-life 2026-10-01 (endoflife.date, verified 2026-10-19) while requires-python stays ">=3.10" and ci.yml still carries a 3.10 lane (matrix ["3.10","3.11","3.12"]; a lone 3.14 lane exists at :131, no 3.13 lane); the bump decision cites the passed EOL date and lands the floor with the next fork release or records why it rides one release past EOL
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
 - evidence: research ae5d6905880a attempt ccfc0f98 research.md RC-2 (endoflife.date/api/python.json: 3.10 eol 2026-10-01, 3.11 eol 2027-10-31)
+- evidence: cycle-2 correction 2026-10-20: the prioritize-phase CI-blocked deferral premise is STALE — GitHub Actions is live and green (ephemeral-PR validator run 39387080814, 7 jobs success, ~3 min end-to-end); this lane-adding item is UNBLOCKED for the next cycle
+
+### Rename-proof the hermes-agent integration surface
+- id: `rm-171` | track: reliability | priority: 72.0 | status: candidate
+- acceptance: every operator_skill_resolution getattr on hermes-agent internals accepts the current PUBLIC name with a legacy-private fallback, following the _find_all_skills_fn pattern (find_all_skills / _find_all_skills, landed via salvage commit 37e1d5eb0d + staged test); a stub-based contract test exercises the loader against a fake skills_tool exposing ONLY public names, so the next upstream rename fails CI loudly in the fork instead of manifesting as 'Hermes Agent loader missing' in the fleet; the remaining private-name consumers are converted or documented (_is_skill_disabled operator_skill_resolution.py:237, skills-tool discovery imports); the agent-loader CI lane stays on live upstream HEAD — adaptation over pinning (the lane exists to prove real drift)
+- evidence: cycle-2 full-validation 2026-10-20: upstream NousResearch/hermes-agent commit 93fafc4d6fffd10e (2026-10-18) renamed _find_all_skills→find_all_skills and _sort_skills→sort_skills with no private alias; the unpinned agent-loader CI lane then failed deterministically for ANY PR ('AssertionError: Hermes Agent loader missing', run 39266426778), burning a full_tests attempt; in-tree shim (_find_all_skills_fn dual-name resolution, staged operator_skill_resolution.py +42/-2 + test_operator_skill_resolution.py +9/0) turned the lane green (run 39387080814, 7 jobs success)
 
 ### cron next-fire + timezone preview at arm time
 - id: `rm-132` | track: reliability | priority: 72.0 | status: in_progress
@@ -99,6 +107,7 @@
 - acceptance: the 2.3.x lane is still missing as of 2026-10-19 (ci.yml SDK matrix pins mcp==1.28.1/2.0.0/1.30.0/2.2.0) and the lane's certification pins the three SDK 2.2/2.3 behavior changes touching hermes surfaces: same-origin-only client redirects (#3397), 30-min idle stateful Streamable HTTP session expiry (#3395 — assert a client re-initializes on 404 against the server.py streamable_http_app), and x-mcp-header annotation validation at registration (#3620 — the repo registers none, so assert the full tool registration stays green under 2.3.0)
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
 - evidence: research ae5d6905880a attempt ccfc0f98 research.md RC-3 (modelcontextprotocol/python-sdk releases v2.2.0/v2.3.0 notes; PyPI mcp 2.3.0 2026-10-02)
+- evidence: cycle-2 correction 2026-10-20: the prioritize-phase CI-blocked deferral premise is STALE — Actions live and green (ephemeral-PR run 39387080814); the 2.3.x lane is addable next cycle
 
 ### Ship or document a browser-UI build path (web assets absent from wheel/MANIFEST)
 - id: `rm-077` | track: reliability | priority: 70.0 | status: candidate
@@ -238,6 +247,7 @@
 - id: `rm-170` | track: reliability | priority: 45.0 | status: candidate
 - acceptance: a periodic (or nightly-equivalent manual) CI lane installs the newest resolvable versions within the DECLARED ranges — starlette <2 (latest 1.9.0; tests currently run 1.3.1), uvicorn <1 (latest 0.54.0; tested 0.41.0), cryptography >=42 (latest 50.0.2; tested 50.0.1) — and runs the focused suite so the wide bounds are exercised before a user hits them; results recorded in a deps-freshness table (tested-vs-latest columns, review dates) linked from docs/README.md; companion to the pending 'Dev-dependency major bounds' item (run-a8d76146 pending mint set, cite-by-title) which bounds the DEV majors — runtime majors are this item's scope
 - evidence: research ae5d6905880a attempt ccfc0f98 research.md RC-6 (pypi JSON 2026-10-19; venv installed versions via importlib.metadata)
+- evidence: cycle-2 correction 2026-10-20: the prioritize-phase CI-blocked deferral premise is STALE — Actions live and green (ephemeral-PR run 39387080814); the headroom lane is addable next cycle
 
 ### Fail-fast on empty/invalid code_challenge at issuance
 - id: `rm-018` | track: reliability | priority: 45.0 | status: in_progress

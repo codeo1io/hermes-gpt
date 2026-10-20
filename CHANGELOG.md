@@ -8,6 +8,7 @@ Fleet reliability: HERMES_HOME-aware home resolution and the upstream #91 builti
 - The standalone-worker config fallback in `_load_hermes_config` resolves `HERMES_HOME` first, then `~/.hermes`, matching the hermes-agent CLI: a configured A2A peer stays visible to home-overridden Autopilot workers (rm-166).
 - The registry write creates its data root on first use, so a fresh deployment without `~/.hermes` yet still records task→agent mappings (rm-166).
 - The builtin fleet profile ceilings carry upstream #91 (`bbe7f7ec`): `macbook-m5`, `mac-mini-m5`, and `omarchy` are enrolled and `gaming-4090` gains `media`/`gpu-dev`, so authority manifests granting those peers their real profiles are accepted instead of raising `PermissionError` at the ceiling (rm-167).
+- Skill resolution keeps working against current hermes-agent checkouts: upstream renamed the skills tool's private discovery helpers (`_find_all_skills` → `find_all_skills`, 2026-10-18), which broke every fresh-clone loader import with "Hermes Agent loader missing". The fork's loader now resolves either name (rm-171).
 
 ## 0.14.0 - 2026-10-03
 
