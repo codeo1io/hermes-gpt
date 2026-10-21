@@ -71,6 +71,73 @@ def test_dispatch_publishes_conforming_envelope(tmp_path, monkeypatch):
     assert order["phase_prompt"].startswith("Fix the boot-lock")
 
 
+def test_dispatch_declares_typed_turn_budget_never_invocation_timeout(tmp_path, monkeypatch):
+    """Regression (2026-10-21, msn-m3-pi-dev-004 starvation): the published
+    envelope must carry a TYPED turn budget. Pre-fix, ``timeout_seconds`` fell
+    through to the delegation surface's invocation-call timeout (the observe
+    tick default 30s) and ``action_payload`` was omitted entirely — an UNTYPED
+    envelope the spool server's v1.21 EDF ordering ranks at +inf, behind every
+    typed conductor order forever, which starved the first real native mission
+    order 2h+ in pending/ while 86 typed orders flowed past it.
+    """
+    be = _backend(monkeypatch, tmp_path)
+    out = be.dispatch(_contract(tmp_path), confirm=True, dry_run=False, timeout=30)
+    assert out["success"] is True
+    envelope = tmp_path / "spool" / "pending" / "attempt0000000001.json"
+    order = json.loads(envelope.read_text())
+    # The 30s invocation timeout must NEVER become the turn budget:
+    assert order["timeout_seconds"] == 900.0
+    # The declared budget keys the spool server's horizon arithmetic:
+    assert order["action_payload"]["phase_timeout_seconds"] == 900.0
+    assert order["action_payload"]["phase_timeout_seconds"] == order["timeout_seconds"]
+
+
+def test_dispatch_respects_pinned_turn_budget_with_bounds(tmp_path, monkeypatch):
+    be = _backend(monkeypatch, tmp_path)
+    contract = _contract(tmp_path)
+    contract["execution"]["options"]["timeout"] = 3600
+    be.dispatch(contract, confirm=True, dry_run=False, timeout=30)
+    order = json.loads((tmp_path / "spool" / "pending" / "attempt0000000001.json").read_text())
+    assert order["timeout_seconds"] == 3600.0
+    assert order["action_payload"]["phase_timeout_seconds"] == 3600.0
+
+    # A mistyped/non-numeric pin fails safe to the floor, never to the
+    # invocation timeout, and never above the cap.
+    contract2 = _contract(tmp_path)
+    contract2["task_id"] = "attempt0000000002"
+    contract2["execution"]["options"]["timeout"] = "not-a-number"
+    be.dispatch(contract2, confirm=True, dry_run=False, timeout=30)
+    order2 = json.loads((tmp_path / "spool" / "pending" / "attempt0000000002.json").read_text())
+    assert order2["timeout_seconds"] == 900.0
+
+    contract3 = _contract(tmp_path)
+    contract3["task_id"] = "attempt0000000003"
+    contract3["execution"]["options"]["timeout"] = 10**9
+    be.dispatch(contract3, confirm=True, dry_run=False, timeout=30)
+    order3 = json.loads((tmp_path / "spool" / "pending" / "attempt0000000003.json").read_text())
+    assert order3["timeout_seconds"] == 14400.0
+
+
+def test_dispatch_carries_instruction_when_context_pinned(tmp_path, monkeypatch):
+    be = _backend(monkeypatch, tmp_path)
+    contract = _contract(tmp_path)
+    contract["execution"]["options"]["context"] = "Implement the guarded probe fast path."
+    be.dispatch(contract, confirm=True, dry_run=False, timeout=30)
+    order = json.loads((tmp_path / "spool" / "pending" / "attempt0000000001.json").read_text())
+    assert order["action_payload"]["instruction"] == "Implement the guarded probe fast path."
+
+
+def test_bounded_turn_budget_never_leaks_invocation_timeout():
+    assert hab._bounded_turn_budget(None, 30) == 900.0
+    assert hab._bounded_turn_budget("", 30) == 900.0
+    assert hab._bounded_turn_budget(3600, 30) == 3600.0
+    assert hab._bounded_turn_budget("7200", 30) == 7200.0
+    assert hab._bounded_turn_budget(-5, 30) == 900.0
+    assert hab._bounded_turn_budget(float("nan"), 30) == 900.0
+    assert hab._bounded_turn_budget(10**12, 30) == 14400.0
+
+
+
 def test_dispatch_dry_run_never_touches_spool(tmp_path, monkeypatch):
     be = _backend(monkeypatch, tmp_path)
     out = be.dispatch(_contract(tmp_path), confirm=True, dry_run=True, timeout=900)
