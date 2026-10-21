@@ -194,11 +194,47 @@ class HermesAgentBackend:
 
         workspaces = contract.get("allowed_scope", {}).get("workspaces") or []
         workspace = str(workspaces[0]) if workspaces else ""
+        def _refusal(code: str, message: str) -> dict[str, Any]:
+            return {
+                "success": False,
+                "ok": False,
+                "code": code,
+                "safe_message": message,
+                "changed": False,  # deterministic pre-backend refusal
+                "backend": self.name,
+            }
+
         if not workspace:
-            raise ValueError(f"{self.name} contracts require allowed_scope.workspaces[0]")
+            return _refusal(
+                "HERMES_AGENT_WORKSPACE_REQUIRED",
+                f"{self.name} contracts require allowed_scope.workspaces[0]",
+            )
         workspace_path = Path(workspace).expanduser()
         if not workspace_path.is_dir():
-            raise ValueError(f"authorized workspace does not exist: {workspace}")
+            # The autopilot's _build_contract derives the workspace from
+            # hermes_root/missions/artifacts/<attempt-key>/ — hermes-gpt's
+            # OWN delegated workspace. Unlike the fleet rail (whose peer
+            # materializes the dir when it starts work), nothing on this
+            # host creates it before dispatch, so the first dispatch of
+            # every mission failed 'authorized workspace does not exist'
+            # (msn-m3-pi-dev-004, 2026-10-21). Creating the authorized
+            # workspace here is within the contract's own grant — the
+            # contract AUTHORIZES writes under this path; a workspace
+            # outside hermes-gpt's data root is never created.
+            data_root = _spool_root(hermes_root).parent
+            try:
+                resolved = workspace_path.resolve()
+                under_root = str(resolved).startswith(str(data_root.resolve()))
+                if under_root:
+                    workspace_path.mkdir(parents=True, exist_ok=True, mode=0o770)
+            except (OSError, RuntimeError):
+                under_root = False
+            if not under_root:
+                return _refusal(
+                    "HERMES_AGENT_WORKSPACE_UNAVAILABLE",
+                    f"authorized workspace does not exist and could not be "
+                    f"created: {workspace}",
+                )
 
         task_id = str(contract.get("task_id") or "")
         if not _ATTEMPT_ID_RE.fullmatch(task_id):
@@ -230,6 +266,16 @@ class HermesAgentBackend:
             # Duplicate dispatch after a crash: the terminal envelope is
             # already on disk; fold it instead of re-queueing the work.
             observed = self._envelope_to_observation(task_id, result_path)
+            if observed is None:
+                # Corrupt or foreign terminal file (malformed JSON,
+                # non-terminal status, or a different attempt_id inside):
+                # fail closed — the transport is untrustworthy for this
+                # attempt, and silently re-queueing over it could
+                # double-execute the work order.
+                raise RuntimeError(
+                    f"terminal result envelope for {task_id} is non-conforming; "
+                    "refusing to fold or re-queue (transport corruption)"
+                )
             return {
                 "success": True,
                 "changed": False,
@@ -274,6 +320,36 @@ class HermesAgentBackend:
             raise ValueError(
                 f"work order for {task_id} exceeds {_MAX_PAYLOAD_BYTES} bytes"
             )
+        if envelope_path.exists():
+            # First-publish authority (mirrors conductor DelegateSessionSpool.send):
+            # a pending envelope for this attempt is the in-flight work order.
+            # Never rewrite it — its mtime is the first-publish timestamp the
+            # consumer's ordering and recovery depend on. Identical payload →
+            # idempotent re-dispatch (queued, unchanged); divergent payload →
+            # the attempt id is being reused for different work: refuse.
+            try:
+                existing = envelope_path.read_bytes()
+            except OSError as exc:
+                raise RuntimeError(
+                    f"could not read existing pending envelope for {task_id}: {exc}"
+                ) from exc
+            if existing != body:
+                raise RuntimeError(
+                    f"pending envelope for {task_id} exists with different content; "
+                    "attempt ids are single-use (first publish is authority)"
+                )
+            return {
+                "success": True,
+                "changed": False,
+                "dry_run": False,
+                "backend": self.name,
+                "task_id": task_id,
+                "state": "queued",
+                "delegate_backend": native_backend,
+                "workspace": str(workspace_path),
+                "transport": _ARCH_TAG,
+                "detail": "pending envelope already present; first publish is authority",
+            }
         _atomic_write_json(envelope_path, payload)
         return {
             "success": True,
