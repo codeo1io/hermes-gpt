@@ -54,7 +54,7 @@ def test_rebuild_reproduces_stored_lineage_for_execution_pinned_nodes(env):
     summary = _tick(root, mid=MID)
     assert summary["dispatched"] == ["n1"], summary
 
-    row = _delegation_row(root, MID, "n1")
+    _delegation_row(root, MID, "n1")  # asserts the delegation exists
     review = _j(__import__("operator_mission_plan").hermes_plan_review(MID, hermes_root=root))
     node = next(n for n in review["nodes"] if n["node_id"] == "n1")
     rebuilt = autopilot._rebuild_dispatch_contract(MID, node, autopilot.dispatch_key(
