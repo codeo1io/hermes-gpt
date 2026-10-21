@@ -736,6 +736,7 @@ class FleetBackend:
             runner=kwargs.get("runner"),
             hermes_bin=kwargs.get("hermes_bin"),
             authority_manifest=kwargs.get("authority_manifest"),
+            hermes_root=hermes_root,
         )
         payload = json.loads(text)
         payload["backend"] = self.name
@@ -767,7 +768,7 @@ class FleetBackend:
         #                                 held until observation establishes
         #                                 authority.
         try:
-            payload = json.loads(op_fleet.hermes_fleet_task(self._peer_for_task(task_id), task_id))
+            payload = json.loads(op_fleet.hermes_fleet_task(self._peer_for_task(task_id, hermes_root=hermes_root), task_id))
         except Exception as exc:  # noqa: BLE001
             return {"success": False, "code": "RUNNER_CANCEL_UNOBSERVABLE", "backend": self.name, "reason": _bounded_text(exc, 200)}
         if not payload.get("success"):
@@ -787,12 +788,26 @@ class FleetBackend:
             return {"success": False, "code": "RUNNER_CANCEL_UNOBSERVABLE", "backend": self.name}
         return {"success": False, "code": "RUNNER_CANCEL_UNSUPPORTED", "backend": self.name}
 
-    def _peer_for_task(self, task_id: str) -> str:
+    def _peer_for_task(self, task_id: str, hermes_root: Path | None = None) -> str:
         # Work orders carry the assigned agent in the contract; the runner
         # layer does not pass it here, so resolve via the dispatch registry
-        # recorded by hermes_fleet_dispatch_work_order.
-        agent = op_fleet._task_agent(task_id)
-        return agent or ""
+        # recorded by hermes_fleet_dispatch_work_order. A registry miss is
+        # NOT terminal (rm-156): the durable dispatch audit record names the
+        # same agent (task_id + agent fields, written at dispatch and at the
+        # timeout ambiguity window), so cancellation falls back to it before
+        # ever answering UNKNOWN_AGENT -> RUNNER_CANCEL_UNOBSERVABLE with the
+        # provisional latch held forever.
+        agent = op_fleet._task_agent(task_id, hermes_root=hermes_root)
+        if agent:
+            return agent
+        try:
+            for record in op.iter_audit_for_task(task_id):
+                audited = str(record.get("agent") or "")
+                if audited:
+                    return audited
+        except Exception:  # noqa: BLE001 - audit is best-effort fallback evidence
+            pass
+        return ""
 
 
 class _LocalProcessBackend:

@@ -14,6 +14,7 @@ from __future__ import annotations
 import concurrent.futures
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -75,6 +76,8 @@ _PUBLIC_ACTION_RE = re.compile(
     re.I,
 )
 _NEGATED_ACTION_RE = re.compile(r"\b(?:do\s+not|don't|never|must\s+not|should\s+not|without)\s+(?:\w+\s+){0,3}$", re.I)
+logger = logging.getLogger(__name__)
+
 _COMMAND_PREFIX_RE = re.compile(
     r"(?:^|[.!?;:]\s*|(?:\b(?:and|then)\b)\s+)"
     r"(?:please\s+|(?:can|could|would|will)\s+you\s+|you\s+(?:must|should|need\s+to)\s+)?$",
@@ -203,7 +206,7 @@ def _load_hermes_config() -> dict[str, Any]:
     try:
         import yaml
 
-        path = Path.home() / ".hermes" / "config.yaml"
+        path = _hermes_home() / "config.yaml"
         if path.is_file():
             data = yaml.safe_load(path.read_text())
             return data if isinstance(data, dict) else {}
@@ -915,7 +918,8 @@ def hermes_fleet_dispatch(agent: str, message: str, confirm: bool = False, dry_r
         if not isinstance(task_id, str) or not _TASK_ID_RE.fullmatch(task_id):
             return _error("FLEET_DISPATCH_ERROR", "A2A task submission returned no valid task id", "Check the peer's A2A service logs.")
         op.audit_record(tool="hermes_fleet_dispatch", level=policy.level, apply_mode=policy.apply_mode, dry_run=False, success=True,
-                        changed=True, summary=f"fleet task submitted to {peer}", prompt=message, job_id=task_id, extra={"agent": peer, "state": status.get("state")})
+                        changed=True, summary=f"fleet task submitted to {peer}", prompt=message, job_id=task_id,
+                        extra={"agent": peer, "state": status.get("state"), "task_id": task_id})
         return json.dumps({"success": True, "changed": True, "agent": peer, "task_id": task_id, "state": status.get("state")}, indent=2)
     except FleetDispatchTimeout as exc:
         op.audit_record(
@@ -924,7 +928,7 @@ def hermes_fleet_dispatch(agent: str, message: str, confirm: bool = False, dry_r
             summary=f"fleet dispatch timed out after submission to {agent}",
             error="peer reply timed out; remote task state unknown",
             prompt=message, job_id=exc.task_id,
-            extra={"agent": agent, "submission_may_have_succeeded": True},
+            extra={"agent": agent, "submission_may_have_succeeded": True, "task_id": exc.task_id},
         )
         return _dispatch_timeout_error(agent, exc.task_id)
     except LookupError:
@@ -942,7 +946,8 @@ def hermes_fleet_dispatch_work_order(agent: str, task_id: str, target_profile: s
                                      deliverables: list[str], authorization: dict[str, Any] | str,
                                      confirm: bool = False, dry_run: bool = True, timeout: int = 30,
                                      *, runner: Runner | None = None, hermes_bin: str | None = None,
-                                     authority_manifest: Path | None = None) -> str:
+                                     authority_manifest: Path | None = None,
+                                     hermes_root: Path | None = None) -> str:
     policy = op.OperatorPolicy()
     try:
         policy.require_level("workspace")
@@ -987,11 +992,11 @@ def hermes_fleet_dispatch_work_order(agent: str, task_id: str, target_profile: s
         remote_id = remote.get("id")
         if not isinstance(remote_id, str) or not _TASK_ID_RE.fullmatch(remote_id):
             return _error("FLEET_DISPATCH_ERROR", "A2A submission returned no valid task id", "Check the peer's A2A service.")
-        _record_task_agent(remote_id, peer)
+        _record_task_agent(remote_id, peer, hermes_root=hermes_root)
         status = remote.get("status") if isinstance(remote.get("status"), dict) else {}
         op.audit_record(tool="hermes_fleet_dispatch_work_order", level=policy.level, apply_mode=policy.apply_mode, dry_run=False,
                         success=True, changed=True, summary=f"fleet work-order submitted to {peer}", prompt=canonical,
-                        job_id=remote_id, extra={"agent": peer, "profile": target_profile})
+                        job_id=remote_id, extra={"agent": peer, "profile": target_profile, "task_id": remote_id})
         return json.dumps({"success": True, "changed": True, "agent": peer, "task_id": remote_id,
                            "requested_task_id": task_id, "state": status.get("state"), "live_peer_verified": True,
                            "prompt_sha256": digest}, indent=2)
@@ -1007,6 +1012,7 @@ def hermes_fleet_dispatch_work_order(agent: str, task_id: str, target_profile: s
                 "profile": target_profile,
                 "requested_task_id": task_id,
                 "submission_may_have_succeeded": True,
+                "task_id": exc.task_id,
             },
         )
         return _dispatch_timeout_error(agent, exc.task_id)
@@ -1026,31 +1032,56 @@ def hermes_fleet_dispatch_work_order(agent: str, task_id: str, target_profile: s
         return _error("FLEET_DISPATCH_ERROR", op.redact_output(str(exc)), "Check local authority, registry, and peer service.")
 
 
+def _hermes_home(hermes_root: Path | None = None) -> Path:
+    """Resolve the hermes data root for fleet-side state (rm-156/rm-166).
+
+    Same resolution authority as ``operator_runners._root``: an explicit root
+    wins, then ``HERMES_HOME``, then the conventional home. Never touches
+    ``op.default_home`` — that attribute does not exist, and resolving through
+    it previously made every default-deployment registry access raise
+    AttributeError inside a silent ``except``.
+    """
+    base = op.normalize_hermes_data_root(hermes_root or Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))))
+    return Path(base or Path.home() / ".hermes")
+
+
 def _task_agent_registry_path(hermes_root: Path | None) -> Path:
-    root = hermes_root or Path(os.environ.get("HERMES_HOME") or op.default_home())
-    return root / "fleet-task-agents.json"
+    return _hermes_home(hermes_root) / "fleet-task-agents.json"
+
+
+_TASK_AGENT_REGISTRY_MAX = 512
 
 
 def _record_task_agent(task_id: str, agent: str, hermes_root: Path | None = None) -> None:
     """Durable task_id -> agent map so backend cancel can observe the peer.
 
     Written only on confirmed dispatch (a remote task id exists); best-effort —
-    cancellation degrades to unobservable, never fails dispatch."""
+    cancellation degrades to unobservable, never fails dispatch. The map is
+    root-scoped (explicit ``hermes_root`` wins) and bounded: at most
+    ``_TASK_AGENT_REGISTRY_MAX`` newest entries survive (insertion-ordered,
+    oldest dropped), so the registry file cannot grow without bound. Write
+    failures log loudly instead of vanishing (rm-156)."""
     try:
         path = _task_agent_registry_path(hermes_root)
+        path.parent.mkdir(parents=True, exist_ok=True)
         data: dict[str, str] = {}
         try:
             data = json.loads(path.read_text("utf-8"))
             if not isinstance(data, dict):
                 data = {}
+        except FileNotFoundError:
+            data = {}
         except Exception:
+            logger.warning("fleet task-agent registry unreadable at %s; rewriting", path)
             data = {}
         data[str(task_id)] = str(agent)
+        while len(data) > _TASK_AGENT_REGISTRY_MAX:
+            data.pop(next(iter(data)))
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, indent=1), "utf-8")
         tmp.replace(path)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("fleet task-agent registry write failed for %s: %s", task_id, exc)
 
 
 def _task_agent(task_id: str, hermes_root: Path | None = None) -> str:
@@ -1060,8 +1091,12 @@ def _task_agent(task_id: str, hermes_root: Path | None = None) -> str:
             agent = data.get(str(task_id))
             if isinstance(agent, str):
                 return agent
+            return ""
+        logger.warning("fleet task-agent registry has unexpected shape; ignoring")
+    except FileNotFoundError:
+        pass  # No dispatch recorded yet on this host — expected.
     except Exception:
-        pass
+        logger.warning("fleet task-agent registry unreadable; peer observation falls back to the dispatch audit record")
     return ""
 
 

@@ -806,8 +806,120 @@ def test_fleet_backend_cancel_peer_observation_call_signature(monkeypatch):
         return json.dumps({"success": True, "agent": agent, "task_id": task_id, "state": "working"})
 
     monkeypatch.setattr(fleet, "hermes_fleet_task", fake_task)
-    monkeypatch.setattr(backend, "_peer_for_task", lambda task_id: "stage3-pilot-peer")
+    monkeypatch.setattr(backend, "_peer_for_task", lambda task_id, hermes_root=None: "stage3-pilot-peer")
     result = backend.cancel("a2a-regression123", hermes_root=None)
     # the observation call must not raise; a live task yields UNSUPPORTED (not UNOBSERVABLE)
     assert result["code"] == "RUNNER_CANCEL_UNSUPPORTED"
     assert calls["kwargs"] == {"agent": "stage3-pilot-peer", "task_id": "a2a-regression123"}
+
+
+def test_task_agent_registry_resolves_and_roundtrips_without_hermes_home(monkeypatch, tmp_path):
+    """Regression (rm-156): _task_agent_registry_path resolved through
+    op.default_home(), which does not exist — with HERMES_HOME unset every
+    registry read/write raised AttributeError inside a silent ``except``, so
+    default deployments never wrote or read the registry and cancel stayed
+    RUNNER_CANCEL_UNOBSERVABLE with the cancellation latch held forever."""
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    path = fleet._task_agent_registry_path(None)
+    assert path == tmp_path / ".hermes" / "fleet-task-agents.json"
+    fleet._record_task_agent("task-nohome-1", "rza")
+    assert fleet._task_agent("task-nohome-1") == "rza"
+    assert fleet._task_agent("task-nohome-2") == ""
+    # explicit hermes_root wins over both env and home (root-scoping)
+    scoped = tmp_path / "root2"
+    fleet._record_task_agent("task-scoped-1", "nous-girl", hermes_root=scoped)
+    assert fleet._task_agent("task-scoped-1", hermes_root=scoped) == "nous-girl"
+    assert fleet._task_agent("task-scoped-1") == ""
+
+
+def test_task_agent_registry_is_bounded_to_newest_entries(tmp_path):
+    """rm-156: the registry read-modify-write is bounded — at most
+    _TASK_AGENT_REGISTRY_MAX newest entries survive, oldest dropped first."""
+    root = tmp_path / "hermes"
+    for i in range(fleet._TASK_AGENT_REGISTRY_MAX + 40):
+        fleet._record_task_agent(f"task-{i:04d}", "rza", hermes_root=root)
+    data = json.loads((root / "fleet-task-agents.json").read_text("utf-8"))
+    assert len(data) == fleet._TASK_AGENT_REGISTRY_MAX
+    assert "task-0000" not in data
+    assert f"task-{fleet._TASK_AGENT_REGISTRY_MAX + 39:04d}" in data
+
+
+def test_task_agent_registry_corruption_logs_and_heals(tmp_path, caplog):
+    """rm-156: registry read/write failures log loudly instead of being
+    swallowed; a corrupt file yields an empty lookup, and the next confirmed
+    dispatch rewrite heals it."""
+    root = tmp_path / "hermes"
+    root.mkdir(parents=True)
+    (root / "fleet-task-agents.json").write_text("{not json", "utf-8")
+    with caplog.at_level("WARNING", logger="operator_fleet"):
+        assert fleet._task_agent("task-x", hermes_root=root) == ""
+    assert any("registry" in record.message for record in caplog.records)
+    fleet._record_task_agent("task-y", "rza", hermes_root=root)
+    assert fleet._task_agent("task-y", hermes_root=root) == "rza"
+
+
+def test_load_hermes_config_fallback_honors_hermes_home(monkeypatch, tmp_path):
+    """rm-166: the standalone-worker config fallback reads the resolved
+    hermes data root (HERMES_HOME, then the conventional home) — one idiom
+    shared with the task-agent registry — instead of hardcoding
+    Path.home()/.hermes. Set and unset HERMES_HOME must both resolve."""
+    import sys
+
+    root = tmp_path / "hroot"
+    root.mkdir(parents=True)
+    (root / "config.yaml").write_text(
+        "a2a_agents:\n  rza:\n    url: http://rza.example:8765\n", "utf-8"
+    )
+    # force the standalone-worker branch: the hermes-agent CLI package is
+    # not importable in this interpreter
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", None)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    assert "rza" in fleet._a2a_peers()
+    # unset -> conventional home under HOME (parity with the set case)
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "empty-home"))
+    assert fleet._a2a_peers() == {}
+
+
+def test_fleet_backend_cancel_observes_agent_from_dispatch_audit(monkeypatch, tmp_path):
+    """rm-156 fallback: with the task-agent registry absent (default
+    deployments before the fix, or a wiped registry), FleetBackend.cancel
+    resolves the agent from the durable dispatch audit record — the same
+    record hermes_fleet_dispatch_work_order writes at confirmed dispatch —
+    before ever answering UNKNOWN_AGENT. Exercises the real _peer_for_task
+    (NOT monkeypatched, which is how the original AttributeError shipped)."""
+    import operator_runners as runners
+
+    audit = tmp_path / "audit.jsonl"
+    op.set_audit_log_override(audit)
+    try:
+        op.audit_record(
+            tool="hermes_fleet_dispatch_work_order", level="info", apply_mode="direct",
+            dry_run=False, success=True, changed=True, summary="fleet work-order submitted to rza",
+            prompt="work order", job_id="a2a-audit-1",
+            extra={"agent": "rza", "task_id": "a2a-audit-1"},
+        )
+        backend = runners.FleetBackend()
+        seen: dict[str, str] = {}
+
+        def fake_task(agent, task_id, timeout=15, *, runner=None, hermes_bin=None):
+            seen["agent"] = agent
+            if not agent:
+                return json.dumps({"success": False, "code": "UNKNOWN_AGENT"})
+            return json.dumps(
+                {"success": True, "agent": agent, "task_id": task_id, "state": "completed"}
+            )
+
+        monkeypatch.setattr(fleet, "hermes_fleet_task", fake_task)
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.setenv("HOME", str(tmp_path / "no-registry-home"))
+        result = backend.cancel("a2a-audit-1", hermes_root=None)
+        assert seen["agent"] == "rza"  # resolved via the audit fallback
+        assert result.get("proven_terminal") is True and result.get("state") == "completed"
+        # negative control: no registry entry AND no audit record -> the
+        # honest unknown, exactly as before
+        result = backend.cancel("a2a-never-dispatched", hermes_root=None)
+        assert result["code"] == "RUNNER_CANCEL_UNOBSERVABLE"
+    finally:
+        op.set_audit_log_override(None)

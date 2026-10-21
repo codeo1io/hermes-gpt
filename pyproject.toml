@@ -60,6 +60,7 @@ dev = [
 [project.scripts]
 hermes-gpt = "server:main"
 hermes-gpt-fabric-peer = "operator_fabric_g4c:peer_main"
+hermes-gpt-campaign-lane = "operator_campaign_lane:main"
 
 [tool.setuptools]
 include-package-data = true
@@ -70,6 +71,10 @@ py-modules = [
   "operator_cron",
   "operator_skills",
   "operator_skill_resolution",
+  "operator_campaign_compiler",
+  "operator_campaign_controller",
+  "operator_campaign_lane",
+  "operator_work_class",
   "operator_profile_scope",
   "operator_config",
   "operator_workspace",

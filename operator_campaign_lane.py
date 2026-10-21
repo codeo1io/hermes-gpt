@@ -1,5 +1,7 @@
 """Durable adoption lane for maintenance campaigns (AUTO-03).
 
+Current operational contract: docs/campaign.md.
+
 AUTO-02 (``operator_campaign_controller``) reconciles ONE campaign per tick
 from its manifest. Real operations run SEVERAL campaigns and must survive
 restarts without re-adopting by hand, so this module adds the thin, additive
@@ -32,7 +34,7 @@ else:
   the backlog. A missing, delayed or erroring event store degrades to the
   timer and still honors the full wait — no stall, no busy spin.
 - Bounds: ``max_ticks`` (passes), ``max_runtime`` (seconds) and ``mode=once``
-  for systemd timer cadence (SCHED-02 "one trigger per family": the lane
+  for systemd timer cadence (docs/campaign.md "one trigger per family": the lane
   timer is THE single trigger). Every restart re-reads the registry and the
   controller re-derives every phase from truth, so a restart can never mint
   a duplicate mission.

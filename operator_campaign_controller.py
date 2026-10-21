@@ -1,10 +1,12 @@
 """Persistent campaign controller for maintenance campaigns (AUTO-02).
 
+Current operational contract: docs/campaign.md.
+
 AUTO-01 (``operator_campaign_compiler``) compiles ONE campaign document into
 ONE MissionPlan. Real campaigns are bigger than one Mission and must survive
 restarts, so this module adds the thin, additive controller that drives a
 campaign as a sequence of FINITE Missions — "finite Missions driven by a
-persistent campaign controller (not one immortal Mission)" (PLAN.md AUTO-02):
+persistent campaign controller (not one immortal Mission)" (docs/campaign.md):
 
 - A **campaign manifest** (``hermes.campaign-manifest/v1``) declares ordered
   segments; each segment carries its own ``hermes.campaign/v1`` document
