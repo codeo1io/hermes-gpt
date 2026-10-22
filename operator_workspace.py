@@ -41,6 +41,9 @@ from typing import Any
 import operator_policy as op
 
 
+OPERATOR_FILE_BACKUPS_ENV = "HERMES_GPT_OPERATOR_FILE_BACKUPS"
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -66,8 +69,6 @@ def _atomic_write_text(path: Path, content: str) -> None:
         tmp.unlink(missing_ok=True)
         raise
 
-
-OPERATOR_FILE_BACKUPS_ENV = "HERMES_GPT_OPERATOR_FILE_BACKUPS"
 
 _FILE_BACKUP_FORCE_ON = frozenset({"1", "true", "yes", "on", "enabled"})
 _FILE_BACKUP_DISABLE = frozenset({"0", "false", "no", "off", "disabled", ""})
@@ -110,6 +111,14 @@ def _file_backup_warning(raw: str | None = None) -> str | None:
         "0/false/no/off/disabled to disable, or 1/true/yes/on/enabled to "
         "force on."
     )
+
+
+# NOTE: upstream v0.16 ships its own weaker `_file_backups_enabled` (empty
+# string keeps backups ON, no typo warning). The fork's fail-closed parse
+# above — which honors an explicitly empty value and emits
+# `_file_backup_warning` for unrecognized values — is the surviving
+# implementation (fork doctrine: PR #85 semantics, rm-141/2026.10.43).
+# Upstream's duplicate was dropped in the v0.16.1 adoption merge.
 
 
 def _backup_file(path: Path) -> Path | None:
