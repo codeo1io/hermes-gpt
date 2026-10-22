@@ -182,6 +182,89 @@ def test_workspace_patch_direct_writes(workspace_tree, clean_env, audit_override
     assert len(backups) == 1
 
 
+def test_workspace_patch_can_disable_file_backups(workspace_tree, clean_env, audit_override, monkeypatch):
+    monkeypatch.setenv(op.OPERATOR_ENABLED_ENV, "1")
+    monkeypatch.setenv(op.OPERATOR_LEVEL_ENV, "workspace")
+    monkeypatch.setenv(op.OPERATOR_APPLY_MODE_ENV, "direct")
+    monkeypatch.setenv(op.OPERATOR_ALLOWED_PATHS_ENV, str(workspace_tree))
+    monkeypatch.setenv(ows.OPERATOR_FILE_BACKUPS_ENV, "0")
+    target = workspace_tree / "README.md"
+    out = ows.hermes_workspace_patch(
+        path=str(target), old_string="# Project", new_string="# No Backup",
+        dry_run=False,
+    )
+    parsed = json.loads(out)
+    assert parsed["success"] is True
+    assert parsed["backup"] is None
+    assert "# No Backup" in target.read_text(encoding="utf-8")
+    assert list(workspace_tree.glob("README.md.bak.*")) == []
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",  # fork doctrine (PR #85): an explicitly empty value disables
+        "   ",  # whitespace-only is treated as explicitly empty: disables
+        "flase",  # unrecognized: fail-closed, backups stay ON
+        "nope",
+        "on-ish",
+    ],
+)
+def test_workspace_patch_backup_switch_semantics(
+    workspace_tree, clean_env, audit_override, monkeypatch, value
+):
+    """Fork-adapted from upstream v0.16 ``keeps_backups_for_empty_or_unrecognized``.
+
+    Upstream keeps backups ON for empty/whitespace; the fork's fail-closed
+    contract (PR #85, docs/operator-mode.md, test_file_backups_empty_string_
+    disables) treats an EXPLICIT empty/whitespace value as a deliberate
+    disable, while unrecognized junk keeps backups on. This test pins the
+    fork contract; the deliberate-disable intent of an empty string is
+    exactly what ``_file_backup_warning``-style typos cannot forge.
+    """
+    monkeypatch.setenv(op.OPERATOR_ENABLED_ENV, "1")
+    monkeypatch.setenv(op.OPERATOR_LEVEL_ENV, "workspace")
+    monkeypatch.setenv(op.OPERATOR_APPLY_MODE_ENV, "direct")
+    monkeypatch.setenv(op.OPERATOR_ALLOWED_PATHS_ENV, str(workspace_tree))
+    monkeypatch.setenv(ows.OPERATOR_FILE_BACKUPS_ENV, value)
+    target = workspace_tree / "README.md"
+    out = ows.hermes_workspace_patch(
+        path=str(target), old_string="# Project", new_string="# Backup Switch",
+        dry_run=False,
+    )
+    parsed = json.loads(out)
+    assert parsed["success"] is True
+    if value.strip() == "":
+        # Explicit empty (incl. whitespace-only): deliberate disable.
+        assert parsed["backup"] is None
+        assert list(workspace_tree.glob("README.md.bak.*")) == []
+    else:
+        # Unrecognized: fail-closed, backup stays on, warning present.
+        assert parsed["backup"] is not None
+        assert len(list(workspace_tree.glob("README.md.bak.*"))) == 1
+        assert parsed.get("backup_warning")
+
+
+@pytest.mark.parametrize("value", ["0", "false", "no", "off", "disabled", " OFF ", "False"])
+def test_workspace_patch_recognized_false_values_disable_backups(
+    workspace_tree, clean_env, audit_override, monkeypatch, value
+):
+    monkeypatch.setenv(op.OPERATOR_ENABLED_ENV, "1")
+    monkeypatch.setenv(op.OPERATOR_LEVEL_ENV, "workspace")
+    monkeypatch.setenv(op.OPERATOR_APPLY_MODE_ENV, "direct")
+    monkeypatch.setenv(op.OPERATOR_ALLOWED_PATHS_ENV, str(workspace_tree))
+    monkeypatch.setenv(ows.OPERATOR_FILE_BACKUPS_ENV, value)
+    target = workspace_tree / "README.md"
+    out = ows.hermes_workspace_patch(
+        path=str(target), old_string="# Project", new_string="# Explicit Off",
+        dry_run=False,
+    )
+    parsed = json.loads(out)
+    assert parsed["success"] is True
+    assert parsed["backup"] is None
+    assert list(workspace_tree.glob("README.md.bak.*")) == []
+
+
 def test_workspace_write_file_direct_writes(workspace_tree, clean_env, audit_override, monkeypatch):
     monkeypatch.setenv(op.OPERATOR_ENABLED_ENV, "1")
     monkeypatch.setenv(op.OPERATOR_LEVEL_ENV, "workspace")
@@ -613,6 +696,20 @@ def test_owner_patch_direct_writes_normal_path(workspace_tree, clean_env, audit_
     parsed = json.loads(out)
     assert parsed["success"] is True
     assert "# Owner Edit" in target.read_text(encoding="utf-8")
+
+
+def test_owner_write_file_can_disable_file_backups(workspace_tree, clean_env, audit_override, monkeypatch):
+    _enable_owner(monkeypatch)
+    monkeypatch.setenv(ows.OPERATOR_FILE_BACKUPS_ENV, "off")
+    target = workspace_tree / "README.md"
+    out = ows.hermes_owner_write_file(
+        path=str(target), content="# Owner No Backup\n", dry_run=False,
+    )
+    parsed = json.loads(out)
+    assert parsed["success"] is True
+    assert parsed["backup"] is None
+    assert target.read_text(encoding="utf-8") == "# Owner No Backup\n"
+    assert list(workspace_tree.glob("README.md.bak.*")) == []
 
 
 def test_owner_run_command_in_apply_mode_dry_run_returns_dry_run_plan(workspace_tree, clean_env, audit_override, monkeypatch):

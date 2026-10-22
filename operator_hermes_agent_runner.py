@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -72,6 +73,34 @@ _ATTEMPT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 #: Bounded work-order size (same bound the spool layout enforces at send).
 _MAX_PAYLOAD_BYTES = 256 * 1024
+
+#: Turn-budget bounds for published work orders (2026-10-21). The floor matches
+#: the pre-fix fallback (900s); the cap keeps a mistyped pin from minting an
+#: envelope the spool server would order as effectively-unbounded, and matches
+#: the delegation surface's own 3600s invocation clamp shape.
+_MIN_TURN_BUDGET_SECONDS = 900.0
+_MAX_TURN_BUDGET_SECONDS = 14400.0
+
+
+def _bounded_turn_budget(pinned: Any, invocation_timeout: Any) -> float:
+    """Resolve the delegated TURN budget, never the invocation timeout.
+
+    Pre-fix bug (msn-m3-pi-dev-004): ``options.get("timeout") or timeout or 900``
+    fell through to the caller's invocation-call timeout (the delegation
+    surface's observe-tick default of 30s) whenever the plan node did not pin
+    an explicit turn budget — publishing ``timeout_seconds: 30.0`` work orders.
+    """
+    value: Any = pinned
+    if value is None or value == "":
+        value = _MIN_TURN_BUDGET_SECONDS
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        seconds = _MIN_TURN_BUDGET_SECONDS
+    if seconds <= 0 or math.isnan(seconds):
+        seconds = _MIN_TURN_BUDGET_SECONDS
+    return max(_MIN_TURN_BUDGET_SECONDS, min(seconds, _MAX_TURN_BUDGET_SECONDS))
+
 
 #: Coding backends the Hermes Agent runtime understands for one delegation.
 #: The session binding is keyed by backend; a binding served on a different
@@ -285,7 +314,19 @@ class HermesAgentBackend:
                 "detail": "terminal envelope already present; folded, not re-queued",
             }
 
-        payload_timeout = float(options.get("timeout") or timeout or 900)
+        # Turn budget (2026-10-21, msn-m3-pi-dev-004 starvation): the caller's
+        # ``timeout`` is the INVOCATION-call timeout (the delegation surface's
+        # observe-tick default, 30s), never the delegated turn's budget —
+        # leaking it produced ``timeout_seconds: 30.0`` work orders. The turn
+        # budget comes from execution.options.timeout when pinned, else the
+        # 900s floor. The SAME value must also reach
+        # action_payload.phase_timeout_seconds: the spool server's v1.21 EDF
+        # ordering ranks untyped envelopes (no declared budget) at +inf —
+        # behind every typed conductor order, forever, under a continuous
+        # fleet firehose — which starved the first real native mission order
+        # 2h+ in pending while 86 typed orders flowed past it.
+        payload_timeout = _bounded_turn_budget(options.get("timeout"), timeout)
+        instruction = str(options.get("context") or "")
         payload = {
             "schema": 1,
             "interface": "delegate_session",
@@ -311,9 +352,10 @@ class HermesAgentBackend:
             },
             "spool_path": str(root),
         }
-        context_block = str(options.get("context") or "")
-        if context_block:
-            payload["action_payload"] = {"instruction": context_block}
+        action_payload: dict[str, Any] = {"phase_timeout_seconds": payload_timeout}
+        if instruction:
+            action_payload["instruction"] = instruction
+        payload["action_payload"] = action_payload
 
         body = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
         if len(body) > _MAX_PAYLOAD_BYTES:

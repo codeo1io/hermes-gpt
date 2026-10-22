@@ -3,7 +3,7 @@
 [![PyPI version](https://img.shields.io/pypi/v/hermes-gpt.svg)](https://pypi.org/project/hermes-gpt/)
 [![PyPI downloads](https://img.shields.io/pypi/dm/hermes-gpt.svg)](https://pypi.org/project/hermes-gpt/)
 
-![Hermes GPT v0.14.0 — Acceptance and bounded recovery](assets/hermes-gpt-v0.14.0-readme-hero.jpg)
+![Hermes GPT v0.14.0 — Acceptance and bounded recovery](https://raw.githubusercontent.com/asimons81/hermes-gpt/master/assets/hermes-gpt-v0.14.0-readme-hero.jpg)
 
 `hermes-gpt` is a local-first MCP sidecar for Hermes Agent. It exposes selected Hermes capabilities to trusted MCP clients without modifying Hermes Agent source files.
 
@@ -11,18 +11,42 @@
 
 ## Current status
 
-- **Repository version:** 0.14.0
-- **Published GitHub release:** [v0.14.0](https://github.com/asimons81/hermes-gpt/releases/tag/v0.14.0)
-- **Verified PyPI release:** [0.14.0](https://pypi.org/project/hermes-gpt/0.14.0/); check the badge for later updates
+- **Repository version:** 0.16.0
+- **Published GitHub release:** [v0.16.0](https://github.com/asimons81/hermes-gpt/releases/tag/v0.16.0)
+- **Verified PyPI release:** [0.16.0](https://pypi.org/project/hermes-gpt/0.16.0/); check the badge for later updates
 - **Python requirement:** 3.10+
 - **MCP SDK (current source):** 1.28.1+ or 2.x; see [compatibility](docs/mcp-compatibility.md).
 - **Deployment posture:** local-dev / trusted-machine only
 - **Remote public hosting:** unsupported without a real authenticated private boundary
 
 > [!IMPORTANT]
-> GitHub releases and PyPI can temporarily be on different versions. The PyPI badge above is the source of truth for what `pip install hermes-gpt` installs. Declared artifact acceptance and recovery require 0.14.0 or newer. Autopilot requires 0.13.0 or newer and `HERMES_GPT_AUTOPILOT=1`.
+> GitHub releases and PyPI can temporarily be on different versions. The PyPI badge above is the source of truth for what `pip install hermes-gpt` installs. The notification relay, Owner inbox acknowledgements and Flight Deck inbox actions, the one-call Mission launch, and `hermes-gpt update --version` require 0.16.0 or newer. The owner inbox, review assist, and connector tool profiles require 0.15.0 or newer. Declared artifact acceptance and recovery require 0.14.0 or newer. Autopilot requires 0.13.0 or newer and `HERMES_GPT_AUTOPILOT=1`.
 
 For the current documentation map and source-of-truth rules, start with [docs/README.md](docs/README.md). Agents working in this repository should also read [AGENTS.md](AGENTS.md).
+
+## What v0.16.0 adds
+
+**Close the loop** makes what waits on the Owner reach them and lets them resolve it in one place, with no new authority. Every mutating path keeps its existing gates.
+
+1. **Notifications (default off)** - `hermes-gpt-attention-relay` sends new Owner inbox items to Hermes targets through `hermes send`, which reuses the platforms configured in Hermes Agent, or to iMessage through `imsg rpc`. Messages are notifications only: they never carry approvals or commands, and replies do nothing. Dedupe, digests, and per-target backoff are built in. See [attention delivery](docs/attention-delivery.md) and the [setup quick start](docs/release-notes-v0.16.0.md#setting-up-notifications).
+2. **A complete Owner inbox** - Work Contracts that still need review acceptance appear as `contract_review_pending`. Items carry stable ids, and `hermes_owner_inbox_ack` hides handled items without changing any Mission, plan, contract, or delegation. See [owner inbox](docs/owner-inbox.md).
+3. **Act from Flight Deck** - approve a Mission, approve or reject an approval-frontier node, stop Autopilot, or acknowledge an item, through the same gated tools. Browser node transitions require Owner Mode. Cross-site requests to the action route are refused. See [Flight Deck actions](docs/owner-inbox.md#flight-deck-actions).
+4. **One-call Mission launch (Autopilot-gated)** - `hermes_mission_launch` creates the Mission, derives its plan, optionally sets a budget, and starts Autopilot. It is dry run by default, stops at the first refusal, and never approves a Mission. See [one-call launch](docs/autopilot.md#one-call-launch-v016).
+5. **Safe package upgrade** - `hermes-gpt update --apply --version 0.16.0 --venv ... --rollback-dir ...` upgrades one virtual environment after a digest check and an import check, with a rollback snapshot. See [updating](docs/updating.md#upgrade-a-package-installed-service-safely).
+
+Also fixed: contract review reads the whole review-acceptance store, so a late acceptance counts. With every optional gate unset the main server registers **138 tools**, and **139** with `HERMES_GPT_ENABLE_FINANCE=1`, the connector acceptance surface. `HERMES_GPT_AUTOPILOT=1` adds 4, `HERMES_GPT_ATTENTION_DELIVERY=1` adds 1, `HERMES_GPT_ENABLE_JEV=1` adds 3, and `hermes_review_assess` adds 1 more when both Jev and review-assist gates are set. See [v0.16.0 release notes](docs/release-notes-v0.16.0.md) and the [CHANGELOG](CHANGELOG.md).
+
+## What v0.15.0 adds
+
+**Owner Loop** makes Owner decisions faster without adding authority: one read-only list of what is waiting, an advisory review score that never counts as evidence, smaller chat tool surfaces, and safer file-backup configuration. Every mutating path keeps its existing gates.
+
+1. **Owner inbox (read-only)** - `hermes_owner_inbox` is always registered. It lists Missions awaiting approval, Autopilot runs waiting for the Owner, and controller attention, with source health (`complete`). It approves, advances, and writes nothing; each item names the existing gated tool to use. See [docs/owner-inbox.md](docs/owner-inbox.md).
+2. **Advisory review assist (default off)** - `hermes_review_assess` asks the pinned Jev adapter for an advisory score of a dispatched Work Contract. It needs both `HERMES_GPT_ENABLE_JEV=1` and `HERMES_GPT_REVIEW_ASSIST=1`, is never review acceptance or Work Contract evidence, and is audited without a `task_id`. See [docs/review-assist.md](docs/review-assist.md).
+3. **Jev decision bridge (default off)** - three typed judgments (`hermes_jev_yes_no`, `hermes_jev_choose`, `hermes_jev_score`) reuse the pinned community `jev-mcp` adapter over local stdio, with no gateway change and no new authority. Owner key provisioning is a separate setup step. See [docs/jev.md](docs/jev.md).
+4. **Connector tool profiles** - `HERMES_GPT_TOOL_PROFILE` selects `full` (default), `operator` (without raw host primitives), or `chat-lean` (30 status, oversight, and owner-decision tools with every gate off). Profiles only remove tools and never bypass a gate. See [MCP compatibility](docs/mcp-compatibility.md#connector-tool-profiles).
+5. **Safer file backups** - `HERMES_GPT_OPERATOR_FILE_BACKUPS` disables backups only for an explicit `0`, `false`, `no`, `off`, or `disabled`; unset, empty, or unrecognized values keep them on. Thanks to @brunocasado for #85. See [Operator mode](docs/operator-mode.md#optional-file-backups).
+
+The v0.15.0 connector surface was **138 tools** (137 in v0.14.0, plus `hermes_owner_inbox`). See [v0.15.0 release notes](docs/release-notes-v0.15.0.md) and the [CHANGELOG](CHANGELOG.md) for that release's counts and gates.
 
 ## Development on master (unreleased)
 
@@ -89,7 +113,7 @@ v0.10.0 is the vNext slice-1 release: additive, decision-only derived mission vi
 5. **Semantic failure classification + recovery matrix** - `hermes_failure_classify`, `hermes_failure_taxonomy`, `hermes_recovery_matrix`, `hermes_controller_plan_list`: the Ops 8-class taxonomy and deterministic smallest-first recovery matrix; decision output only (`would_execute` always `False`).
 6. **Supervised mission controller — shadow/observe reconciler loop** - `hermes_controller_reconcile/status/lease_list/trigger`: a T1-T5 trigger model, per-mission pass lease, and a single shadow reconcile pass that emits the smallest recovery action as a proposal only. `controller_telemetry` reports deterministic GREEN / YELLOW / RED health.
 
-See [CHANGELOG.md](CHANGELOG.md) for the complete v0.10 change list; the vNext design notes are in [docs/design/](docs/design/) and the manifest/ledger guide is [docs/vnext-capability-manifest-and-mission-ledger.md](docs/vnext-capability-manifest-and-mission-ledger.md).
+See [CHANGELOG.md](CHANGELOG.md) for the complete v0.10 change list; the vNext design notes are in [docs/design/](https://github.com/asimons81/hermes-gpt/tree/master/docs/design) and the manifest/ledger guide is [docs/vnext-capability-manifest-and-mission-ledger.md](docs/vnext-capability-manifest-and-mission-ledger.md).
 
 ## What v0.9.0 adds
 
@@ -151,6 +175,12 @@ See the [v0.6.0 release notes](docs/release-notes-v0.6.0.md) and [retention poli
 | Use ChatGPT or another trusted client to operate Hermes | [Operator Mode](docs/operator-mode.md) |
 | Group and approve a larger objective under one lifecycle | [Missions (v0.9)](docs/missions.md) |
 | Understand unified delegation lineage across runners | [Delegations (v0.9)](docs/delegations.md) |
+| See what is waiting on the Owner, read-only | [Owner inbox (v0.15)](docs/owner-inbox.md) |
+| Get an advisory Jev review score for a Work Contract (default off) | [Advisory review assist (v0.15)](docs/review-assist.md) |
+| Send Owner inbox items as notifications (default off) | [Attention delivery (v0.16)](docs/attention-delivery.md) |
+| Start a Mission and its Autopilot in one call (Autopilot-gated, dry run first) | [One-call launch (v0.16)](docs/autopilot.md#one-call-launch-v016) |
+| Upgrade a package-installed service to 0.16.0 safely | [Safe package upgrade (v0.16)](docs/updating.md#upgrade-a-package-installed-service-safely) |
+| Shrink the connector tool surface for a small-budget chat client | [Connector tool profiles](docs/mcp-compatibility.md#connector-tool-profiles) |
 | Consume durable live events / wake-up stream | [Live events (v0.9)](docs/live-events.md) |
 | Send bounded financial evidence to the local Finance profile | [Finance bridge](docs/finance.md) |
 | Understand cross-machine Fabric execution and its release boundary | [v0.8.0 Fabric release notes](docs/release-notes-v0.8.0.md) |
@@ -174,21 +204,38 @@ Check the PyPI badge before relying on version-specific features.
 ```bash
 git clone https://github.com/asimons81/hermes-gpt.git
 cd hermes-gpt
+python -m venv .venv
+# Windows PowerShell: .venv\Scripts\Activate.ps1
+source .venv/bin/activate
 python -m pip install .
 hermes-gpt
 ```
 
-The v0.14.0 wheel and sdist are also attached to the [GitHub v0.14.0 release](https://github.com/asimons81/hermes-gpt/releases/tag/v0.14.0). See [v0.14 release notes](docs/release-notes-v0.14.0.md) for acceptance and recovery, and [Autopilot](docs/autopilot.md) for setup and limits. The v0.11.0 release notes cover the opt-in Gemini Spark client profile, MCP Python SDK 2.x support, and profile-aware Bot Chat; the v0.10.0 release notes cover the vNext slice-1 surfaces (MissionPlan DAG, derived capability-manifest and mission-ledger views, budget envelope, placement scoring, failure semantics, and the shadow controller); the v0.8.0 release notes cover the Fabric surfaces (`hermes-gpt-fabric-peer`, capability-aware routing, remote evidence admission, reconciliation); the v0.9 surfaces (Missions `hermes_mission_*`, delegations `hermes_delegation_*`, live events `hermes_live_events_*`, `hermes_job_status/wait`) are documented in [docs/missions.md](docs/missions.md), [docs/delegations.md](docs/delegations.md), and [docs/live-events.md](docs/live-events.md). Operator diagnostics and recovery tools (`hermes_operator_doctor`, `hermes_operator_snapshot`, `hermes_release_doctor`, `hermes_operator_recover`) are documented in [docs/operator-mode.md](docs/operator-mode.md).
+The source install above supports the MCP server. To include the optional browser UI in a source-built wheel, build its assets **before** installing/building the Python package:
+
+```bash
+cd web
+npm ci
+npm run build
+cd ..
+python -m pip install .
+```
+
+The locked UI build requires Node `^20.19.0 || >=22.12.0` (Node 24 works); it is also required separately when enabling the [Jev bridge](docs/jev.md). Installing a package does not install Hermes Agent or activate optional gates. Release wheels include built UI assets; an unbuilt source checkout can serve MCP while `/ui` reports missing assets. See [UI configuration](docs/ui-security-boundary.md).
+
+The v0.16.0 wheel and sdist are attached to the [GitHub v0.16.0 release](https://github.com/asimons81/hermes-gpt/releases/tag/v0.16.0), with `SHA256SUMS`; see [v0.16.0 release notes](docs/release-notes-v0.16.0.md) for Close the Loop. The v0.15.0 wheel and sdist are attached to the [GitHub v0.15.0 release](https://github.com/asimons81/hermes-gpt/releases/tag/v0.15.0), with `SHA256SUMS`; see [v0.15.0 release notes](docs/release-notes-v0.15.0.md) for the Owner loop. The v0.14.0 wheel and sdist are also attached to the [GitHub v0.14.0 release](https://github.com/asimons81/hermes-gpt/releases/tag/v0.14.0). See [v0.14 release notes](docs/release-notes-v0.14.0.md) for acceptance and recovery, and [Autopilot](docs/autopilot.md) for setup and limits. The v0.11.0 release notes cover the opt-in Gemini Spark client profile, MCP Python SDK 2.x support, and profile-aware Bot Chat; the v0.10.0 release notes cover the vNext slice-1 surfaces (MissionPlan DAG, derived capability-manifest and mission-ledger views, budget envelope, placement scoring, failure semantics, and the shadow controller); the v0.8.0 release notes cover the Fabric surfaces (`hermes-gpt-fabric-peer`, capability-aware routing, remote evidence admission, reconciliation); the v0.9 surfaces (Missions `hermes_mission_*`, delegations `hermes_delegation_*`, live events `hermes_live_events_*`, `hermes_job_status/wait`) are documented in [docs/missions.md](docs/missions.md), [docs/delegations.md](docs/delegations.md), and [docs/live-events.md](docs/live-events.md). Operator diagnostics and recovery tools (`hermes_operator_doctor`, `hermes_operator_snapshot`, `hermes_release_doctor`, `hermes_operator_recover`) are documented in [docs/operator-mode.md](docs/operator-mode.md).
 
 ## Default local MCP surface
 
-With no optional feature gates enabled, the server exposes a small read-oriented surface:
+With every optional feature gate unset, the main server registers **139 tools**. Setting `HERMES_GPT_ENABLE_FINANCE=1` (the connector acceptance surface) registers **140**. The five core read-oriented tools are:
 
 - `hermes_read_file(path, offset=1, limit=500)`
 - `hermes_search_files(pattern, target="content", path=".", file_glob=None, limit=50)`
 - `hermes_memory(action="search", target="memory", content=None, old_text=None)`
 - `hermes_skill_list()`
 - `hermes_skill_view(name)`
+
+Operator, Mission, contract, budget, controller and other policy-gated tools are also registered so callers can discover them and receive explicit refusals when authority is missing. Registration does not authorize mutation; the default policy remains read-only. See [Operator Mode](#operator-mode). Optional gates add to this inventory, so counts depend on the selected surface and configuration.
 
 Optional legacy feature gates remain available for compatibility:
 
@@ -204,11 +251,13 @@ Optional legacy feature gates remain available for compatibility:
 
 For new automation and maintenance work, prefer Operator Mode instead of enabling broad legacy write gates.
 
+To shrink the advertised tool list for chat clients, set `HERMES_GPT_TOOL_PROFILE` to `operator` or `chat-lean`. The default is `full` (unset or empty); profiles only remove tools and never add authority. See [connector tool profiles](docs/mcp-compatibility.md#connector-tool-profiles).
+
 ## Session history and control
 
 Session history and session control are independent, opt-in surfaces.
 
-With `HERMES_GPT_ENABLE_SESSION_SEARCH=1`, Hermes GPT exposes four bounded read-only history tools: `hermes_session_search`, `hermes_session_list`, `hermes_session_read`, and `hermes_session_export`. The default transcript roles are `user` and `assistant`; `system`, `tool`, and `function` content additionally requires `HERMES_GPT_ENABLE_SESSION_INTERNAL_CONTENT=1`. Export stays in memory, is size/message bounded, creates no files or paths, and lineage export fails closed.
+With `HERMES_GPT_ENABLE_SESSION_SEARCH=1`, Hermes GPT exposes four bounded read-only history tools: `hermes_session_search`, `hermes_session_list`, `hermes_session_read`, and `hermes_session_export`, plus `hermes_bot_chat_get` for canonical Bot Chat resolution. The default transcript roles are `user` and `assistant`; `system`, `tool`, and `function` content additionally requires `HERMES_GPT_ENABLE_SESSION_INTERNAL_CONTENT=1`. Export stays in memory, is size/message bounded, creates no files or paths, and lineage export fails closed.
 
 With `HERMES_GPT_ENABLE_SESSION_CONTROL=1`, Hermes GPT exposes `hermes_session_continue`, `hermes_session_send`, `hermes_session_job_status`, and `hermes_session_job_result`. Control jobs are bounded, use fixed argv with `shell=False`, allow only one active job per session, persist prompt length/hash rather than raw prompts, and return bounded redacted results. A server restart fails closed by marking unowned running jobs orphaned rather than signaling a persisted PID.
 
@@ -285,6 +334,8 @@ Owner Mode additionally requires:
 HERMES_GPT_OWNER_ACTIVE=1
 HERMES_GPT_OWNER_ACK=I_UNDERSTAND_THIS_CAN_MUTATE_MY_MACHINE
 ```
+
+Workspace/Owner file patch and overwrite tools create a timestamped `.bak.*` copy by default. Set `HERMES_GPT_OPERATOR_FILE_BACKUPS=0` to disable those copies when the workspace already has its own version-control/rollback strategy; atomic replace writes remain enabled.
 
 `hermes_export_file(path)` is a workspace-authorized, read-only transfer surface for existing local binary files. It requires a non-empty `HERMES_GPT_OPERATOR_ALLOWED_PATHS`, preserves denied secret paths, defaults to a 4 MiB limit with a 16 MiB hard ceiling, and returns bytes as an MCP embedded resource rather than base64 text. See [Binary file export](docs/file-export.md) for the complete limits and client-rendering contract.
 
@@ -401,12 +452,14 @@ Git checkout updates require a clean checkout on the default branch and use fast
 Current operational documentation:
 
 - [Documentation map and source-of-truth rules](docs/README.md)
-- [Runtime checkout pin (which checkout is live)](docs/runtime-checkout.md)
+- [Runtime provenance and update verification](docs/runtime-checkout.md)
 - [Reuse / do-not-rebuild boundary](BOUNDARY.md)
 - [OpenAI Secure MCP Tunnel](docs/openai-secure-mcp-tunnel.md)
 - [OAuth and bearer authentication](docs/oauth.md)
 - [Gemini Spark custom app](docs/gemini-spark.md)
 - [Operator Mode](docs/operator-mode.md)
+- [Owner inbox (v0.15, acknowledgements and actions in v0.16)](docs/owner-inbox.md)
+- [Attention delivery (v0.16, default off)](docs/attention-delivery.md)
 - [Missions (v0.9)](docs/missions.md)
 - [Delegations (v0.9)](docs/delegations.md)
 - [Live events (v0.9)](docs/live-events.md)
@@ -414,6 +467,7 @@ Current operational documentation:
 - [Windows ChatGPT -> Codex deployment](docs/windows-chatgpt-codex.md)
 - [Updating](docs/updating.md)
 - [Retention policy](docs/retention-policy.md)
+- [v0.16.0 release notes](docs/release-notes-v0.16.0.md)
 - [v0.6.0 release notes](docs/release-notes-v0.6.0.md)
 - [Changelog](CHANGELOG.md)
 

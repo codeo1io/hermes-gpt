@@ -1025,6 +1025,21 @@ def _rebuild_dispatch_contract(
     contract["objective"] = (
         f"autopilot dispatch: mission={mission_id} node={node_id} attempt={attempt}"
     )
+    # The validation manifest intentionally excludes objective, inputs,
+    # constraints, and backend options (prompt-free subset, INV-9). The
+    # original builder emits ``inputs=[]`` and ``constraints=[]`` for every
+    # autopilot dispatch, and — since the execution-selector fix — the node's
+    # normalized ``execution`` selector verbatim. Rebuild those exactly as
+    # ``_build_contract`` derived them from the same plan node, or the
+    # canonical digest never reproduces the stored lineage sha and every
+    # never-invoked retry fails closed as ``contract_unavailable`` (the
+    # msn-m3-pi-dev-004 wedge, 2026-10-21: manifest carried
+    # execution={backend:hermes_agent,options:{}} while the stored sha only
+    # reproduced with the node's {delegate:pi,sandbox:workspace-write}).
+    contract["inputs"] = []
+    contract["constraints"] = []
+    if node.get("execution") is not None:
+        contract["execution"] = op_runners.normalize_execution(node.get("execution"))
     try:
         canonical, parsed = deleg.contract_mod._canonical_contract(contract)
     except (ValueError, PermissionError, TypeError):
@@ -1768,7 +1783,8 @@ def _frontier_view(review: dict[str, Any], mission_status: str) -> dict[str, Any
     independent branches keep running. ``waiting`` is True only when the
     frontier is active and Autopilot has nothing else it could do, which is what
     ``waiting_for_owner`` means. Resolution stays exactly the existing owner
-    tools (``hermes_mission_approve`` / the owner's own node transitions).
+    tools (``hermes_mission_approve``, ``hermes_plan_approve_gate`` to approve a
+    gated node, or ``hermes_plan_node_transition`` to reject it).
     """
     nodes = review.get("nodes", [])
     ready = set(review.get("ready_nodes", []))

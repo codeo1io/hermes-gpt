@@ -46,6 +46,11 @@ _EXPECTED_SKIPIF_COUNTS = {
     # integration hosts (this machine) but not in hermes-gpt CI — the lane
     # must not give CI a conductor dependency, so it skips there.
     "test_spool_integration_cross_repo.py": 1,
+    # v0.16.1 adoption: upstream's attention-delivery real-process tests are
+    # POSIX-only (shebang scripts, flock, execute bits; relay child backends
+    # imsg/hermes-send are POSIX in practice) — platform condition, upstream
+    # test_operator_attention_delivery.py:51.
+    "test_operator_attention_delivery.py": 1,
 }
 
 _SKIP_PATTERN = re.compile(r"\bskipif\b")

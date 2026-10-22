@@ -12,8 +12,19 @@ interface GatedActionButtonProps {
   /** Required level tag shown next to the label (e.g. "owner"). */
   levelTag?: string;
   disabled?: boolean;
+  /**
+   * Put `confirm: true` inside args on the second gesture. Existing operator
+   * tools with a `confirm` argument use the default. A tool without one (for
+   * example hermes_owner_inbox_ack) sets this false; the server would refuse
+   * an unknown argument.
+   */
+  confirmArg?: boolean;
   onResult?: (result: unknown) => void;
+  /** Called only after a real (non-dry-run) call succeeds, so the parent can refetch. */
+  onApplied?: (result: unknown) => void;
   onError?: (message: string) => void;
+  /** Characters of the plan JSON shown in the dry-run preview (default 400). */
+  previewChars?: number;
 }
 
 interface PlanState {
@@ -21,8 +32,19 @@ interface PlanState {
   dryRun: boolean;
 }
 
-export function GatedActionButton({ tool, args, label, levelTag, disabled = false, onResult, onError }: GatedActionButtonProps) {
-  const [stage, setStage] = useState<'idle' | 'dryrun' | 'confirm' | 'busy'>('idle');
+export function GatedActionButton({
+  tool,
+  args,
+  label,
+  levelTag,
+  disabled = false,
+  confirmArg = true,
+  onResult,
+  onApplied,
+  onError,
+  previewChars = 400,
+}: GatedActionButtonProps) {
+  const [stage, setStage] = useState<'idle' | 'dryrun' | 'confirm' | 'busy' | 'done'>('idle');
   const [plan, setPlan] = useState<PlanState | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -56,11 +78,17 @@ export function GatedActionButton({ tool, args, label, levelTag, disabled = fals
         // `confirm` is an existing operator-tool argument, not an adapter
         // bypass.  Keep it inside args so the server's per-tool allowlist
         // and gate path receive exactly the same shape as the MCP tool.
-        { tool, args: { ...args, confirm: true }, dry_run: false },
+        { tool, args: confirmArg ? { ...args, confirm: true } : { ...args }, dry_run: false },
       );
       setPlan({ plan: (body.result ?? {}) as Record<string, unknown>, dryRun: false });
-      setStage('dryrun');
       onResult?.(body.result);
+      if (body.dry_run === false) {
+        // The write happened: no second confirm for the same plan.
+        setStage('done');
+        onApplied?.(body.result);
+      } else {
+        setStage('dryrun');
+      }
     } catch (err) {
       const message = err instanceof ApiError ? `${err.code}: ${err.message}` : 'action failed';
       setError(message);
@@ -81,7 +109,7 @@ export function GatedActionButton({ tool, args, label, levelTag, disabled = fals
       {stage === 'dryrun' || stage === 'busy' ? (
         <div className="fd-gated-plan">
           {plan ? (
-            <pre className="fd-pre">{JSON.stringify(plan.plan, null, 2).slice(0, 400)}</pre>
+            <pre className="fd-pre">{JSON.stringify(plan.plan, null, 2).slice(0, previewChars)}</pre>
           ) : (
             <span className="fd-hint">Preparing plan…</span>
           )}
@@ -99,10 +127,16 @@ export function GatedActionButton({ tool, args, label, levelTag, disabled = fals
         </div>
       ) : null}
 
+      {stage === 'done' ? (
+        <div className="fd-gated-actions">
+          <span className="fd-chip fd-chip--ok">APPLIED</span>
+        </div>
+      ) : null}
+
       {stage === 'confirm' && plan ? (
         <div className="fd-gated-actions">
           <span className="fd-chip fd-chip--warn">CONFIRM REQUIRED</span>
-          <pre className="fd-pre">{JSON.stringify(plan.plan, null, 2).slice(0, 400)}</pre>
+          <pre className="fd-pre">{JSON.stringify(plan.plan, null, 2).slice(0, previewChars)}</pre>
           <button type="button" className="fd-btn fd-btn--ghost" onClick={() => setStage('idle')}>
             Cancel
           </button>
