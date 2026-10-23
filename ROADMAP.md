@@ -35,8 +35,8 @@
 
 ### Add test coverage for 16 untested module(s)
 - id: `rm-002` | track: reliability | priority: 100.0 | status: candidate
-- signals: reliability.no_tests:hermes_state.py, reliability.no_tests:tools/check_package_hygiene.py, reliability.no_tests:web/src/chat/ActivityCard.tsx, reliability.no_tests:web/src/chat/ChatPage.tsx, reliability.no_tests:web/src/chat/Composer.tsx (+11 more)
-- acceptance: Every module in ['hermes_state.py', 'tools/check_package_hygiene.py', 'web/src/chat/ActivityCard.tsx', 'web/src/chat/ChatPage.tsx', 'web/src/chat/Composer.tsx', 'web/src/flight/AccountPanel.tsx', 'web/src/flight/ApprovalsPanel.tsx', 'web/src/flight/ContractsPanel.tsx', 'web/src/flight/DeckOverview.tsx', 'web/src/flight/EventHistoryPanel.tsx', 'web/src/flight/FleetPanel.tsx', 'web/src/flight/schemas.ts', 'web/src/shared/AccountStatusBanner.tsx', 'web/src/shared/ConnectionStatus.tsx', 'web/src/stores/session-list.ts', 'web/vite.config.ts'] has a corresponding test file with at least one passing test
+- signals: reliability.no_tests:hermes_state.py, reliability.no_tests:tool_registry.py, reliability.no_tests:tools/check_package_hygiene.py, reliability.no_tests:web/src/chat/ActivityCard.tsx, reliability.no_tests:web/src/chat/ChatPage.tsx (+11 more)
+- acceptance: Every module in ['hermes_state.py', 'tool_registry.py', 'tools/check_package_hygiene.py', 'web/src/chat/ActivityCard.tsx', 'web/src/chat/ChatPage.tsx', 'web/src/chat/Composer.tsx', 'web/src/flight/AccountPanel.tsx', 'web/src/flight/ApprovalsPanel.tsx', 'web/src/flight/ContractsPanel.tsx', 'web/src/flight/DeckOverview.tsx', 'web/src/flight/EventHistoryPanel.tsx', 'web/src/flight/FleetPanel.tsx', 'web/src/shared/AccountStatusBanner.tsx', 'web/src/shared/ConnectionStatus.tsx', 'web/src/stores/session-list.ts', 'web/vite.config.ts'] has a corresponding test file with at least one passing test
 - evidence: full suite green (python -m pytest -q) at HEAD; conductor validation digest validation:v1:<sha> recorded in the shipping PR
 
 ### Refactor 20 high-complexity function(s)
@@ -48,6 +48,11 @@
 ### Isolate the mission-events long-poll from the shared anyio threadpool
 - id: `rm-096` | track: reliability | priority: 90.0 | status: in_progress
 - acceptance: long-poll waits no longer occupy shared threadpool tokens — a dedicated anyio.CapacityLimiter (anyio.to_thread.run_sync(limiter=...) verified in .venv) for wait-bearing endpoints, or an asyncio-native wait bridge; a regression test saturates the shared limiter with 40 holders and asserts a mission-events request still completes; existing mission-events behavior (25s max wait, event delivery, cursor semantics) unchanged
+- evidence: campaign-recorded in hermes-gpt ROADMAP.md
+
+### ui_ops cron-dispatch semaphore leaks on resolve failure
+- id: `rm-131` | track: reliability | priority: 90.0 | status: in_progress
+- acceptance: dispatch-path ordering fixed — resolve root (and any other raising validation) BEFORE acquiring the semaphore, or try/finally the acquire→dispatch span so every exit releases the token; regression test injects a `_resolve_root` failure and asserts (a) a clean error response, (b) semaphore capacity unchanged — a subsequent dispatch is NOT 429-capped — repeated > `_CRON_DISPATCH_LIMIT` times.
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
 
 ### Registry and bound for fire-and-forget cron dispatch, with completion audit
@@ -100,6 +105,11 @@
 - acceptance: state-changing (POST) routes reject Sec-Fetch-Site: cross-site requests and Origin headers outside the allowed set (UI origin + chatgpt.com + issuer), and require Content-Type: application/json on JSON-body routes; the ChatGPT-side origin keeps working (it is in the CORS list today); non-browser MCP clients unaffected; any escape-hatch env documented; tests cover allow/deny/cross-site/preflight cases.
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
 
+### Raise build floor to setuptools>=77 (PEP 639 license string)
+- id: `rm-027` | track: reliability | priority: 62.0 | status: in_progress
+- acceptance: floor raised to >=77 (or license switched to table form) so declared-floor builds work; sdist+wheel build verified in a --no-isolation environment; no behavior change to isolated CI builds
+- evidence: campaign-recorded in hermes-gpt ROADMAP.md
+
 ### Ship-or-de-reference README-referenced docs; add a shipped-docs guard test
 - id: `rm-046` | track: reliability | priority: 60.0 | status: in_progress
 - acceptance: both docs either added to data-files or de-referenced from README/docs map; NEW guard test asserts every docs/*.md link target in README.md and docs/README.md is in data-files (explicit allowlist for intentionally-unshipped historical docs); runtime-checkout.md refreshed or re-labeled as historical; `python -m build` + `twine check dist/*` + tools/check_package_hygiene.py dist/* run with the two docs present
@@ -115,6 +125,11 @@
 - acceptance: provenance-capture doctor check (or deploy-time record) captures the serving process's self-reported version + working-tree state (commit, dirty flag, branch) into a durable operator-visible record; a release/ops rule BLOCKS promoting a build whose live checkout carries uncommitted deltas (or forces an explicit override with the delta recorded); docs/runtime-checkout.md refreshed or re-labeled per AGENTS.md rules as part of the fix.
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
 
+### Correct hermes_mission_usage _24h keys — they previously reported all-time totals
+- id: `rm-152` | track: reliability | priority: 60.0 | status: in_progress
+- acceptance: usage rows joined/filtered by sessions.started_at >= cutoff with the schema-drift fallback the intent comment describes (missing started_at -> fail loud or explicitly-degraded output, never silently all-time); a new test with a stale pre-cutoff usage row asserted EXCLUDED from _24h sums; the baked test updated to a two-window fixture; full test_operator_mission.py green
+- evidence: campaign-recorded in hermes-gpt ROADMAP.md
+
 ### declare the browser-UI agent-runtime cross-project seam
 - id: `rm-136` | track: reliability | priority: 58.0 | status: candidate
 - acceptance: the seam is DECLARED — vendored/stubbed interfaces behind an explicit boundary module, OR a documented contract (which external tree provides them, at what version) + an import-contract test that runs on the clean checkout and fails LOUDLY (never silent IMPORT_UNAVAILABLE) when the declared provider is missing; pyproject/docs name the external requirement; if a degradation path is kept, it is visible in doctor.
@@ -123,6 +138,11 @@
 ### Branch protection on codeo1io master (extends rm-008 with red-master evidence)
 - id: `rm-038` | track: reliability | priority: 55.0 | status: candidate
 - acceptance: master branch protection requires the CI test+lint jobs with linear history; direct pushes restricted to admins; a red push/PR is observed to be rejected once
+- evidence: campaign-recorded in hermes-gpt ROADMAP.md
+
+### Bound pyyaml (the last bare runtime dependency)
+- id: `rm-040` | track: reliability | priority: 55.0 | status: in_progress
+- acceptance: pyproject pins `pyyaml>=6,<7`; CI installs the bounded range green; cap moves become deliberate changelog events (rm-023 policy)
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
 
 ### Stop .gitignore '*.ps1' from swallowing new example scripts
@@ -143,6 +163,11 @@
 ### Serve the curated skill set via the official MCP Skills extension (read-only)
 - id: `rm-082` | track: reliability | priority: 55.0 | status: candidate
 - acceptance: gated on an SDK support probe passing on both SDK families (same gate pattern as rm-011); additive read-only surface exposing only allowlisted skills via skills/list + skills/get with skill:// resources; hermes_* skill tools remain canonical; safety tests prove no raw skill bodies or side effects leak beyond the existing read-only boundary; a deterministic tools/list ordering assertion (2026-07-28 spec SHOULD) rides this surface's tests
+- evidence: campaign-recorded in hermes-gpt ROADMAP.md
+
+### Declare starlette and anyio as direct dependencies
+- id: `rm-099` | track: reliability | priority: 55.0 | status: in_progress
+- acceptance: pyproject declares starlette and anyio with bounds consistent with the resolved floor (e.g. starlette>=0.40,<2; anyio>=4,<5) and a comment naming mcp[cli] as the existing transitive source; CI installs green on the declared range; the declaration introduces no version drift (resolver output unchanged before/after)
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
 
 ### Document the convergence-shipped OAuth surface and repair the CHANGELOG
@@ -202,11 +227,10 @@
 - acceptance: every staged secret file created with restrictive mode AT creation under a unique-adjacent name (in-repo precedent operator_cron.py / operator_workspace.py / operator_job_supervisor.py) or O_EXCL; secrets dirs mkdir with explicit 0o700; fsync of key material before the atomic replace; a umask-0 test asserting final file AND dir modes are 0600/0700; a two-writer test asserting no interleaved or lost staging writes; the token DB reaches 0600 with no observable window (or documents why it cannot)
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
 
-### Refresh stale top-level documentation
-- id: `rm-155` | track: reliability | priority: 43.0 | status: candidate
-- signals: reliability.stale_doc:README.md
-- acceptance: Docs regenerated/updated; staleness detector reports 0 signals
-- evidence: inference.stale_docs returns [] for the repo
+### cron NL-grammar edges: plural weekdays + property-based invariant lane
+- id: `rm-138` | track: reliability | priority: 44.0 | status: in_progress
+- acceptance: plural weekday names accepted (or a targeted error naming the singular form); a hypothesis property-based lane in the dev group (declaration comment naming the transitive source per the rm-099 rule) pins the four invariants with a fixed seed for deterministic CI; zero-minute floor coverage rides rm-057.
+- evidence: campaign-recorded in hermes-gpt ROADMAP.md
 
 ### Updater must verify it found a hermes-gpt checkout before fast-forwarding
 - id: `rm-042` | track: reliability | priority: 42.0 | status: in_progress
@@ -300,7 +324,6 @@
 
 ## Closed items
 
-- `rm-007` Skip-instead-of-fail for distribution-metadata test — done
 - `rm-011` Speak the official MCP Tasks extension for long-running work (read-only mapping) — superseded
 - `rm-012` MRTR (input_required) as the standardized approval handshake — superseded
 - `rm-013` Split server.py registration into per-subsystem modules — superseded
@@ -314,17 +337,12 @@
 - `rm-024` Python 3.13/3.14 CI lanes; plan the 3.10 EOL floor bump — superseded
 - `rm-025` Finish the v0.10 controller slice: D3 hard-block + shadow-to-live — superseded
 - `rm-026` Land upstream v0.11.0 (dual SDK support, Gemini Spark profile, security remediation bundle) — superseded
-- `rm-027` Raise build floor to setuptools>=77 (PEP 639 license string) — done
 - `rm-028` Re-baseline the repo-wide lint gate for ruff 0.15 default rules — superseded
 - `rm-029` Resolve the 12 unresolved gitlink entries — superseded
 - `rm-030` Account-status banner is dead code on auth-configured deployments — superseded
 - `rm-031` Repo-wide compile check; drift-guard the manual registries — superseded
 - `rm-032` MCP 2026-07-28 minor-spec adoption and SDK-3.0 proofing — superseded
 - `rm-033` Bound pyyaml (last bare runtime dependency) — superseded
-- `rm-040` Bound pyyaml (the last bare runtime dependency) — done
-- `rm-099` Declare starlette and anyio as direct dependencies — done
-- `rm-131` ui_ops cron-dispatch semaphore leaks on resolve failure — done
-- `rm-138` cron NL-grammar edges: plural weekdays + property-based invariant lane — done
-- `rm-152` Correct hermes_mission_usage _24h keys — they previously reported all-time totals — done
+- `rm-155` Refresh stale top-level documentation — done
 
 <!-- managed by hermes-roadmap render; do not edit by hand -->
