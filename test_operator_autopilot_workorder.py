@@ -49,6 +49,10 @@ def test_authorized_workorder_objective_and_scope_reach_contract(tmp_path, monke
     assert str(root / "missions" / "artifacts" / built["task_id"]) in built["allowed_scope"]["workspaces"]
     # Same immutable work order can be reconstructed on crash recovery.
     assert ap._verified_workorder(mission_id, node, root)[0] == objective
+    # Dispatch still obeys the canonical Work Contract validator.
+    canonical, parsed = ap.contract_mod._canonical_contract(built)
+    assert parsed["objective"] == objective and canonical
+
 
 
 def test_workorder_tamper_and_plan_hash_mismatch_fail_closed(tmp_path, monkeypatch):
