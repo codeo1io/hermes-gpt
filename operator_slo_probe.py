@@ -692,11 +692,14 @@ def probe_continuity(state_db: Path, *, max_age_s: float = 900.0) -> SloRecord:
 
 
 def probe_disk_free(
-    path: str = "/home/agent", *, min_free_pct: float = SLO_DISK_FREE_MIN_PCT
+    path: str | None = None, *, min_free_pct: float = SLO_DISK_FREE_MIN_PCT
 ) -> SloRecord:
     """Disk headroom on the filesystem hosting the campaign stores.
-    statvfs-backed (shutil.disk_usage); no df parsing.
+    statvfs-backed (shutil.disk_usage); no df parsing. Default path is the
+    resolved Hermes root (the shared campaign filesystem).
     """
+    if path is None:
+        path = str(default_hermes_root())
     rec = SloRecord(
         slo_id="disk_free",
         target=f">={min_free_pct}% free on the campaign filesystem",
