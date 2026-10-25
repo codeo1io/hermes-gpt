@@ -120,6 +120,7 @@ py-modules = [
   "token_store",
   "operator_swarm",
   "operator_swarm_workflows",
+  "operator_slo_probe",
   "operator_recovery",
   "operator_finance",
   "finance_worker",
