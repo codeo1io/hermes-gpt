@@ -55,6 +55,24 @@ def test_authorized_workorder_objective_and_scope_reach_contract(tmp_path, monke
 
 
 
+def test_replan_clone_inherits_verified_workorder(tmp_path, monkeypatch):
+    """Autopilot -rN recovery node inherits immutable parent workorder."""
+    root, repo, path, mission_id, node, objective = _setup(tmp_path, monkeypatch)
+    node["node_id"] = "native-dev-r1"
+    assert ap._verified_workorder(mission_id, node, root)[0] == objective
+    contract = ap._build_contract(
+        mission_id, node, requirement=node["capability_req"], agent="default",
+        key="b" * 64, attempt=0, hermes_root=root,
+    )
+    assert contract["objective"] == objective
+    assert str(repo) in contract["allowed_scope"]["workspaces"]
+
+    for invalid in ("native-dev-r0", "native-dev-r1-other", "other-r1"):
+        node["node_id"] = invalid
+        with pytest.raises(ValueError, match="mismatched"):
+            ap._verified_workorder(mission_id, node, root)
+
+
 def test_workorder_tamper_and_plan_hash_mismatch_fail_closed(tmp_path, monkeypatch):
     root, repo, path, mission_id, node, objective = _setup(tmp_path, monkeypatch)
     path.write_text(json.dumps({"objective": "Changed job", "workspaces": [str(repo)]}))
