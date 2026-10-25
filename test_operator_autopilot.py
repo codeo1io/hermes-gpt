@@ -117,6 +117,37 @@ def _wait_for_worker_running(root: Path, mid: str, *, timeout: float = 5.0) -> d
 # ---------------------------------------------------------------------------
 
 
+def test_restart_preserves_recovery_lineage_and_attempt_budget(hermes_root):
+    """Recovery clone already dispatched before a stop must stay superseding.
+
+    Restarting Autopilot may replace the job/worker, never the immutable
+    PlanNode graph or its persisted replan lineage.
+    """
+    mid = "msn-ap-resume-lineage"
+    recovery = {
+        "nodes": {},
+        "pending_supersede": {"native-dev-r1": "dlg-old"},
+        "superseded_nodes": {"native-dev": "native-dev-r1"},
+        "replan_pending": {},
+        "placements": {"native-dev-r1": "loopback-verifier"},
+    }
+    autopilot._write_run(
+        mid, hermes_root, state="stopped", attempt=1,
+        recovery=recovery, replans_used=1, dispatch_failures={"1:native-dev": 2},
+    )
+    previous, claimed = autopilot._claim_run(
+        mid, hermes_root, max_concurrency=1, max_replans=1,
+        config_sha256="a" * 64, max_attempts_per_node=2,
+        max_runtime_seconds=14400,
+    )
+    assert previous is None
+    assert claimed["attempt"] == 2
+    assert claimed["recovery"] == recovery
+    assert claimed["replans_used"] == 1
+    assert claimed["dispatch_failures"] == {"1:native-dev": 2}
+    assert claimed["job_id"] != "autopilot:msn-ap-resume-lineage:1"
+
+
 def test_start_dry_run_previews_without_writing(hermes_root):
     _make_mission(hermes_root, "msn-ap-dry")
     _make_plan(hermes_root, "msn-ap-dry")

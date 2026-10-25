@@ -346,6 +346,14 @@ def _claim_run(
             return existing, None
         attempt = int(existing.get("attempt", 0)) + 1 if existing else 1
         claimed = _new_run_record(mission_id, attempt=attempt)
+        if existing is not None:
+            # A stopped/failed scheduler attempt is not a new MissionPlan.
+            # Replan clone lineage, supersession intent and attempt budgets
+            # must survive the worker restart or the failed predecessor stays
+            # active forever and may be retried beyond the permitted limit.
+            for key in ("recovery", "replans_used", "dispatch_failures"):
+                if key in existing:
+                    claimed[key] = existing[key]
         claimed.update({
             "state": "starting",
             "job_id": job_id_for(mission_id, attempt),
