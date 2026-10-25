@@ -1005,13 +1005,19 @@ def _verified_workorder(
     if not ref.startswith("workorder:"):
         return None  # existing hashed-only/legacy plans retain their contract
     match = _WORKORDER_REF_RE.fullmatch(ref)
-    if not match or (match.group(1), match.group(2)) != (
-        mission_id, node["node_id"]
-    ):
+    if not match or match.group(1) != mission_id:
+        raise ValueError("invalid or mismatched mission workorder reference")
+    workorder_node = match.group(2)
+    actual_node = str(node["node_id"])
+    # Autopilot recovery nodes use an -rN suffix but preserve the exact
+    # authorized objective SHA and digest-pinned private workorder reference.
+    # Look up the original immutable document, never a new authority.
+    recovery_node = re.fullmatch(re.escape(workorder_node) + r"-r[1-9][0-9]*", actual_node)
+    if actual_node != workorder_node and recovery_node is None:
         raise ValueError("invalid or mismatched mission workorder reference")
     root = _data_root(hermes_root) / "missions" / "workorders"
     directory = root / mission_id
-    path = directory / (node["node_id"] + ".json")
+    path = directory / (workorder_node + ".json")
     if root.is_symlink() or directory.is_symlink() or path.is_symlink():
         raise PermissionError("mission workorder symlink is forbidden")
     if not path.is_file() or path.stat().st_size > 16_384:
