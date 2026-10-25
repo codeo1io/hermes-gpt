@@ -49,6 +49,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import secrets
 import sqlite3
 import subprocess
@@ -986,6 +987,63 @@ def _invocation_possibly_submitted(delegation_id: str, hermes_root: Path | None)
     return age < AMBIGUOUS_GRACE_SECONDS
 
 
+_WORKORDER_REF_RE = re.compile(
+    r"^workorder:([A-Za-z0-9_-]+)/([A-Za-z0-9_-]+)@([a-f0-9]{64})$"
+)
+
+
+def _verified_workorder(
+    mission_id: str, node: dict[str, Any], hermes_root: Path | None
+) -> tuple[str, list[str]] | None:
+    """Resolve an owner-supplied private work order without storing raw PlanNode text.
+
+    A MissionPlan persists only objective_sha256 (INV-9). A private work order
+    is independently pinned to the PlanNode's objective hash and to the exact
+    content digest in contract_ref; changing either fails closed.
+    """
+    ref = str(node.get("contract_ref") or "")
+    if not ref.startswith("workorder:"):
+        return None  # existing hashed-only/legacy plans retain their contract
+    match = _WORKORDER_REF_RE.fullmatch(ref)
+    if not match or (match.group(1), match.group(2)) != (
+        mission_id, node["node_id"]
+    ):
+        raise ValueError("invalid or mismatched mission workorder reference")
+    root = _data_root(hermes_root) / "missions" / "workorders"
+    directory = root / mission_id
+    path = directory / (node["node_id"] + ".json")
+    if root.is_symlink() or directory.is_symlink() or path.is_symlink():
+        raise PermissionError("mission workorder symlink is forbidden")
+    if not path.is_file() or path.stat().st_size > 16_384:
+        raise ValueError("mission workorder missing or exceeds 16KiB")
+    payload = path.read_bytes()
+    if hashlib.sha256(payload).hexdigest() != match.group(3):
+        raise ValueError("mission workorder digest mismatch")
+    parsed = json.loads(payload)
+    if not isinstance(parsed, dict) or set(parsed) != {"objective", "workspaces"}:
+        raise ValueError("mission workorder has an invalid schema")
+    objective = parsed["objective"]
+    workspaces = parsed["workspaces"]
+    if not isinstance(objective, str) or not objective.strip() or len(objective) > 8000:
+        raise ValueError("mission workorder objective is invalid")
+    if hashlib.sha256(objective.encode("utf-8")).hexdigest() != node.get(
+        "objective_sha256"
+    ):
+        raise ValueError("mission workorder objective does not match PlanNode")
+    if not isinstance(workspaces, list) or not 1 <= len(workspaces) <= 4:
+        raise ValueError("mission workorder workspaces must be 1..4 paths")
+    policy = op.OperatorPolicy()
+    result: list[str] = []
+    for workspace in workspaces:
+        if not isinstance(workspace, str) or not Path(workspace).is_absolute():
+            raise ValueError("mission workorder workspace must be an absolute path")
+        policy.require_workspace_path(workspace)
+        resolved = str(Path(workspace).resolve())
+        if resolved not in result:
+            result.append(resolved)
+    return objective, result
+
+
 def _rebuild_dispatch_contract(
     mission_id: str, node: dict[str, Any], key: str, hermes_root: Path | None,
     recovery: dict[str, Any] | None = None,
@@ -1022,8 +1080,10 @@ def _rebuild_dispatch_contract(
         return None
     contract = dict(ctx)
     contract["schema"] = deleg.contract_mod.CONTRACT_SCHEMA
+    workorder = _verified_workorder(mission_id, node, hermes_root)
     contract["objective"] = (
-        f"autopilot dispatch: mission={mission_id} node={node_id} attempt={attempt}"
+        workorder[0] if workorder is not None
+        else f"autopilot dispatch: mission={mission_id} node={node_id} attempt={attempt}"
     )
     # The validation manifest intentionally excludes objective, inputs,
     # constraints, and backend options (prompt-free subset, INV-9). The
@@ -1105,6 +1165,14 @@ def _build_contract(
             "approval_reference": f"mission:{mission_id}",
         },
     }
+    # Resolve a separately stored, digest-pinned owner work order. The
+    # MissionPlan itself retains only the objective SHA, never raw text.
+    workorder = _verified_workorder(mission_id, node, hermes_root)
+    if workorder is not None:
+        contract["objective"] = workorder[0]
+        for workspace in workorder[1]:
+            if workspace not in contract["allowed_scope"]["workspaces"]:
+                contract["allowed_scope"]["workspaces"].append(workspace)
     # Runner selection (item: autopilot dropped the node's execution selector):
     # when the plan node pins an execution backend (e.g. pi_rpc for real dev
     # campaigns), it MUST reach the work contract — otherwise the default
