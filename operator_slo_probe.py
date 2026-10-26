@@ -55,6 +55,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+import operator_mission_runtime as oprt
+
 # ---------------------------------------------------------------------------
 # SLO target constants (founding directive; single source of truth for tests)
 # ---------------------------------------------------------------------------
@@ -671,6 +673,13 @@ def probe_routine_completion(missions_db: Path) -> SloRecord:
     their chance and are excluded; failed nodes count against completion
     (an honest failure is still an unfinished routine outcome the rails
     own). Routine classes mirror operator_work_class.ROUTINE_AUTH_CLASSES.
+
+    Discharged failures: a failed node carrying a verified supersede marker
+    (operator_mission_runtime.supersede_mission_node — digest-anchored,
+    successor-must-be-completed, node-must-still-be-failed) counts as
+    completed in the numerator and is excluded from the denominator; the
+    discharge is reported in notes with per-node receipts so the residual
+    FAIL list is exactly the live debt.
     """
     rec = SloRecord(
         slo_id="routine_completion",
@@ -688,6 +697,7 @@ def probe_routine_completion(missions_db: Path) -> SloRecord:
     except (FileNotFoundError, sqlite3.Error) as exc:
         rec.notes.append(f"source unreadable: {exc}")
         return rec
+    discharged_by: dict[str, str] = {}
     try:
         terminal = conn.execute(
             f"SELECT COUNT(*) FROM plan_nodes WHERE "
@@ -701,23 +711,56 @@ def probe_routine_completion(missions_db: Path) -> SloRecord:
             f"IN ({ph}) AND state='completed'",
             ROUTINE_AUTH_CLASSES,
         ).fetchone()[0]
+        failed_nodes = conn.execute(
+            f"SELECT mission_id, node_id FROM plan_nodes WHERE "
+            f"json_extract(capability_req, '$.authorization_class') "
+            f"IN ({ph}) AND state='failed' ORDER BY mission_id, node_id",
+            ROUTINE_AUTH_CLASSES,
+        ).fetchall()
+        for mission_id, node_id in failed_nodes:
+            try:
+                discharger = oprt._is_discharged_node(conn, str(mission_id), str(node_id))
+            except sqlite3.Error:
+                # a store without the marker/event tables has no discharges
+                discharger = ""
+            if discharger:
+                discharged_by[f"{mission_id}/{node_id}"] = discharger
     except sqlite3.Error as exc:
         rec.notes.append(f"plan_nodes query failed: {exc}")
         return rec
     finally:
         conn.close()
-    rec.numerator = completed
+    discharged = len(discharged_by)
+    if discharged_by:
+        rec.notes.append(
+            "discharged failures (verified supersede markers, count as "
+            "completed): " + ", ".join(
+                f"{k}->{v}" for k, v in sorted(discharged_by.items())
+            )
+        )
+    live_failed = len(failed_nodes) - discharged
+    rec.numerator = completed + discharged
     rec.denominator = terminal
-    rec.value = (
-        round((completed / terminal) * 100.0, 2) if terminal else None
+    ratio = (
+        (float(rec.numerator) / float(terminal)) * 100.0 if terminal else None
     )
-    rec.verdict = _verdict_for_ratio(
-        completed, terminal, at_least=SLO_ROUTINE_COMPLETION_MIN_PCT
+    rec.value = round(ratio, 2) if ratio is not None else None
+    rec.verdict = (
+        _verdict_for_ratio(
+            float(rec.numerator), float(terminal),
+            at_least=SLO_ROUTINE_COMPLETION_MIN_PCT,
+        )
+        if terminal else UNKNOWN
     )
     rec.notes.append(
         "denominator = routine nodes in terminal state (completed+failed); "
         "in-flight nodes excluded (not yet terminal)"
     )
+    if live_failed:
+        rec.notes.append(
+            f"{live_failed} failed node(s) remain LIVE debt (no verified "
+            "discharge) — repair via the campaign-retry lane, not markers"
+        )
     return rec
 
 

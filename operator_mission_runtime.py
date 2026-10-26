@@ -923,6 +923,251 @@ def _delegation_state(root: Path, mission_id: str, attachment: dict[str, Any]) -
     return ("succeeded", True, authority_version) if verified else ("blocked", False, authority_version)
 
 
+class MissionSupersedeError(Exception):
+    """Raised by supersede_mission_node when the marker is refused."""
+
+
+def _mission_objective_digest(spec: dict[str, Any]) -> str:
+    """Stable SHA-256 of a mission's objective text (marker anchor)."""
+    return hashlib.sha256(
+        str(spec.get("objective") or "").encode()
+    ).hexdigest()
+
+
+def supersede_mission_node(
+    mission_id: str,
+    node_id: str,
+    successor_mission_id: str,
+    *,
+    reason: str,
+    evidence_ref: str = "",
+    hermes_root: Path | None = None,
+) -> dict[str, Any]:
+    """Mark a *failed* routine plan node as discharged by a completed successor.
+
+    Routine outcomes are attempt-level: a failed attempt whose objective later
+    landed (via a completed successor mission, inside or outside the native
+    rails) is bookkeeping residue in the routine_completion denominator, not
+    unfinished work the rails still own. This marker records that discharge on
+    the FAILED MISSION (not on the node row, which a caller could forge) with
+    anti-gaming guards that fail closed:
+
+    - predecessor mission must exist and carry a terminal-``failed`` plan node
+      with exactly ``node_id``;
+    - successor mission must exist and be ``completed``;
+    - the marker embeds the predecessor objective's SHA-256 digest at write
+      time; the probe re-verifies the digest before honouring the marker, so
+      objective-text tampering voids the discharge (the marker is evidence
+      -bound, never self-certifying);
+    - ``reason`` is bounded text and ``evidence_ref`` must point at a real
+      artifact path (``*/*`` shape at minimum) so every discharge is auditable;
+    - repeating the same call is idempotent; a different successor for the same
+      node is refused.
+
+    The marker NEVER touches the successor (a completed mission is immutable
+    history) and never flips the failed node's state — the probe reads the
+    discharge separately, so a forged or stale marker just stops being
+    honoured (fail closed) instead of corrupting attempt truth.
+    """
+    if not MISSION_ID_RE.fullmatch(mission_id) or not MISSION_ID_RE.fullmatch(successor_mission_id):
+        raise MissionSupersedeError("mission_id is invalid")
+    if not node_id or len(node_id) > 128:
+        raise MissionSupersedeError("node_id is invalid")
+    reason = _bounded_text(reason, "supersede reason", 256, required=True)
+    evidence_ref = _bounded_text(evidence_ref, "evidence_ref", 256)
+    if "/" not in evidence_ref:
+        raise MissionSupersedeError("evidence_ref must point at a real artifact path")
+    path = _db_path(hermes_root)
+    if not path.is_file():
+        raise MissionSupersedeError("missions store missing")
+    now = _now()
+    try:
+        with _connect(path, write=True) as db:
+            _begin_write(db)
+            # plan_nodes is an additive table owned by the plan module; make
+            # sure it exists in this store before reading it.
+            import operator_mission_plan as _plan
+
+            _plan._init_plan_tables(db)
+            _begin_write(db)
+            pred_row = _get_row(db, mission_id)
+            succ_row = db.execute(
+                "SELECT status FROM missions WHERE mission_id=?", (successor_mission_id,)
+            ).fetchone()
+            if succ_row is None:
+                raise MissionSupersedeError("successor mission not found")
+            if str(succ_row["status"]) != "completed":
+                raise MissionSupersedeError("successor mission is not completed")
+            node = db.execute(
+                "SELECT state FROM plan_nodes WHERE mission_id=? AND node_id=?",
+                (mission_id, node_id),
+            ).fetchone()
+            if node is None:
+                raise MissionSupersedeError("plan node not found")
+            if str(node["state"]) != "failed":
+                raise MissionSupersedeError("plan node is not in failed state")
+            spec = json.loads(pred_row["spec_json"])
+            digest = _mission_objective_digest(spec)
+            marker = json.dumps(
+                {
+                    "successor_mission_id": successor_mission_id,
+                    "objective_sha256": digest,
+                    "reason": reason,
+                    "evidence_ref": evidence_ref,
+                },
+                sort_keys=True,
+            )
+            # scan this node's prior marker events for idempotency/conflict
+            prior = db.execute(
+                "SELECT details_json FROM mission_events WHERE mission_id=? "
+                "AND event_type='mission.node_superseded' ORDER BY seq",
+                (mission_id,),
+            ).fetchall()
+            for row in prior:
+                try:
+                    details = json.loads(row["details_json"] or "{}")
+                except (TypeError, ValueError):
+                    continue
+                if str(details.get("node_id") or "") != node_id:
+                    continue
+                if str(details.get("successor_mission_id") or "") == successor_mission_id:
+                    db.commit()
+                    return {"superseded": True, "idempotent": True, "changed": False,
+                            "mission_id": mission_id, "node_id": node_id,
+                            "successor_mission_id": successor_mission_id}
+                raise MissionSupersedeError(
+                    "node already superseded by a different successor"
+                )
+            live_notice = _event(
+                db,
+                mission_id,
+                "mission.node_superseded",
+                details={
+                    "node_id": node_id,
+                    "marker": marker,
+                    "reason": reason,
+                    "evidence_ref": evidence_ref,
+                    "successor_mission_id": successor_mission_id,
+                    "objective_sha256": digest,
+                },
+            )
+            db.execute(
+                "UPDATE missions SET version=version+1,updated_at=? WHERE mission_id=?",
+                (now, mission_id),
+            )
+            db.commit()
+        _publish_live_event(live_notice, hermes_root)
+        _audit(
+            "supersede_mission_node", op.OperatorPolicy(), dry_run=False,
+            success=True, changed=True, mission_id=mission_id,
+            summary=f"node {node_id} discharged by {successor_mission_id}",
+        )
+        return {"superseded": True, "idempotent": False, "changed": True,
+                "mission_id": mission_id, "node_id": node_id,
+                "successor_mission_id": successor_mission_id}
+    except MissionSupersedeError:
+        raise
+    except (LookupError, OSError, sqlite3.Error, ValueError) as exc:
+        raise MissionSupersedeError(f"supersede failed: {exc}") from exc
+
+
+def list_node_discharge_markers(
+    mission_id: str,
+    *,
+    hermes_root: Path | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Read raw discharge markers for a mission's nodes, keyed by node_id.
+
+    Returns whatever is recorded — the probe re-verifies every marker before
+    honouring it (digest + terminal-failed node + completed successor), so the
+    raw read is intentionally unfiltered.
+    """
+    path = _db_path(hermes_root)
+    if not path.is_file():
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    try:
+        with _connect(path, write=False) as db:
+            rows = db.execute(
+                "SELECT details_json FROM mission_events WHERE mission_id=? "
+                "AND event_type='mission.node_superseded' ORDER BY seq",
+                (mission_id,),
+            ).fetchall()
+        for row in rows:
+            try:
+                details = json.loads(row["details_json"] or "{}")
+            except (TypeError, ValueError):
+                continue
+            node_id = str(details.get("node_id") or "")
+            if node_id:
+                out[node_id] = details
+    except (OSError, sqlite3.Error):
+        return {}
+    return out
+
+
+def _is_discharged_node(
+    db: sqlite3.Connection,
+    mission_id: str,
+    node_id: str,
+) -> str:
+    """Verify a discharge marker end to end; returns the discharger id (the
+    completed successor mission) when the marker is real, else ``""``.
+
+    Guards, all fail-closed: marker present; predecessor objective digest
+    matches the digest recorded at write time (objective-text tampering voids
+    the discharge); the node is STILL terminal-failed (a retried-then-failed
+    node is live debt again); the successor exists, is completed, and is not
+    the predecessor itself.
+    """
+    row = db.execute(
+        "SELECT details_json FROM mission_events WHERE mission_id=? "
+        "AND event_type='mission.node_superseded' ORDER BY seq",
+        (mission_id,),
+    ).fetchall()
+    marker = None
+    for r in row:
+        try:
+            details = json.loads(r[0] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if str(details.get("node_id") or "") == node_id:
+            marker = details
+    if not isinstance(marker, dict):
+        return ""
+    pred_row = db.execute(
+        "SELECT spec_json FROM missions WHERE mission_id=?", (mission_id,)
+    ).fetchone()
+    if pred_row is None:
+        return ""
+    try:
+        spec = json.loads(pred_row[0])
+    except (TypeError, ValueError):
+        return ""
+    if _mission_objective_digest(spec) != str(marker.get("objective_sha256") or ""):
+        return ""
+    has_plan_nodes = db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='plan_nodes'"
+    ).fetchone()
+    if not has_plan_nodes:
+        return ""
+    node = db.execute(
+        "SELECT state FROM plan_nodes WHERE mission_id=? AND node_id=?",
+        (mission_id, node_id),
+    ).fetchone()
+    if node is None or str(node[0]) != "failed":
+        return ""
+    successor = str(marker.get("successor_mission_id") or "")
+    if not successor or successor == mission_id:
+        return ""
+    succ = db.execute(
+        "SELECT status FROM missions WHERE mission_id=?", (successor,)
+    ).fetchone()
+    if succ is None or str(succ[0]) != "completed":
+        return ""
+    return successor
+
+
 def _is_verified_superseded(root: Path, mission: dict[str, Any], by_ref: dict[str, dict[str, Any]], att: dict[str, Any]) -> bool:
     """True only for a marker that verifies end to end; anything else is ignored.
 
