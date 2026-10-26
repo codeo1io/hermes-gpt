@@ -121,6 +121,7 @@ py-modules = [
   "operator_swarm",
   "operator_swarm_workflows",
   "operator_slo_probe",
+  "operator_soak_orchestrator",
   "operator_recovery",
   "operator_finance",
   "finance_worker",
