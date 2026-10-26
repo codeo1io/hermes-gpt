@@ -355,6 +355,117 @@ class TestStallDetection:
         rec = slo.probe_stall_detection(["not a watchdog line"])
         assert rec.verdict == slo.UNKNOWN
 
+    # --- productive-deferral classification (2026-10-26 SLO-debt repair) ---
+
+    def test_productive_deferral_not_a_stall(self) -> None:
+        """Semantic-unhealthy ticks under a healthy bounded execution step
+        (the deployed watchdog's KTD4 excuse — visible per tick as an active
+        execution_state + execution_healthy true) are NOT stall episodes:
+        working through the backlog is the handling; a restart would kill
+        productive work. They are reported, not erased."""
+        lines = [
+            watchdog_line(ts_at(0), {"semantic_healthy": True}),
+            watchdog_line(
+                ts_at(60),
+                {
+                    "semantic_healthy": False,
+                    "execution_state": "RECONCILING",
+                    "execution_healthy": True,
+                },
+            ),
+            watchdog_line(
+                ts_at(600),
+                {
+                    "semantic_healthy": False,
+                    "execution_state": "CYCLING",
+                    "execution_healthy": True,
+                },
+            ),
+            watchdog_line(ts_at(1200), {"semantic_healthy": True}),
+        ]
+        rec = slo.probe_stall_detection(lines)
+        assert rec.verdict == slo.UNKNOWN
+        assert rec.value["episodes"] == 0
+        assert rec.value["excused_productive_ticks"] == 2
+
+    def test_wedged_active_step_is_a_stall(self) -> None:
+        """An active execution step beyond its dwell bound
+        (execution_healthy false) is NOT excused — the watchdog's own model
+        says it must be handled, so the tick counts toward a stall
+        episode."""
+        lines = [
+            watchdog_line(
+                ts_at(0),
+                {
+                    "semantic_healthy": False,
+                    "execution_state": "WORKING",
+                    "execution_healthy": False,
+                },
+            ),
+            watchdog_line(
+                ts_at(120),
+                {
+                    "semantic_healthy": False,
+                    "execution_state": "WORKING",
+                    "execution_healthy": False,
+                    "restarted": True,
+                },
+            ),
+            watchdog_line(ts_at(240), {"semantic_healthy": True}),
+        ]
+        rec = slo.probe_stall_detection(lines)
+        assert rec.verdict == slo.PASS
+        assert rec.value["persistent_episodes"] == 1
+        assert rec.value["within_5m"] == 1
+        assert rec.value["worst_latency_s"] == 120.0
+
+    def test_supervisor_object_shape_supported(self) -> None:
+        """The raw journal nests the fields inside ``supervisor`` — the
+        excuse must engage identically in that shape."""
+        lines = [
+            watchdog_line(
+                ts_at(0),
+                {
+                    "supervisor": {
+                        "semantic_healthy": False,
+                        "execution_state": "RECONCILING",
+                        "execution_healthy": True,
+                    }
+                },
+            ),
+            watchdog_line(
+                ts_at(120),
+                {
+                    "supervisor": {
+                        "semantic_healthy": False,
+                        "execution_state": "RECONCILING",
+                        "execution_healthy": True,
+                    }
+                },
+            ),
+            watchdog_line(ts_at(240), {"semantic_healthy": True}),
+        ]
+        rec = slo.probe_stall_detection(lines)
+        assert rec.verdict == slo.UNKNOWN
+        assert rec.value["excused_productive_ticks"] == 2
+
+    def test_idle_semantic_stall_is_not_excused(self) -> None:
+        """No active execution step + semantic-unhealthy = genuine stall —
+        the excuse must not swallow real misses (the anti-gaming bound)."""
+        lines = [
+            watchdog_line(
+                ts_at(0), {"semantic_healthy": False}
+            ),
+            watchdog_line(
+                ts_at(60), {"semantic_healthy": False}
+            ),
+            watchdog_line(ts_at(120), {"semantic_healthy": True}),
+        ]
+        rec = slo.probe_stall_detection(lines)
+        assert rec.verdict == slo.FAIL
+        assert rec.value["undetected"] == 1
+        assert rec.value.get("excused_productive_ticks", 0) == 0
+
 
 # ---------------------------------------------------------------------------
 # SLO-4 auto recovery
