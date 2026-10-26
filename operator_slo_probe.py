@@ -356,6 +356,42 @@ def parse_watchdog_journal(lines: list[str]) -> list[dict[str, Any]]:
     return ticks
 
 
+_ACTIVE_EXECUTION_STATES = frozenset(
+    {
+        "STARTING",
+        "WORKING",
+        "ACTING",
+        "CYCLING",
+        "AUDITING",
+        "RECONCILING",
+    }
+)
+
+
+def _execution_state(tick: dict[str, Any]) -> str | None:
+    """The supervisor's execution state, top-level or inside ``supervisor``."""
+    for holder in (tick, tick.get("supervisor")):
+        if isinstance(holder, dict):
+            state = holder.get("execution_state")
+            if isinstance(state, str) and state:
+                return state
+    return None
+
+
+def _execution_healthy(tick: dict[str, Any]) -> bool:
+    """Whether the in-flight execution step is within its dwell bound.
+
+    The deployed watchdog computes ``execution_healthy`` from
+    ``execution_state_dwell_seconds`` vs the 600 s execution lease: a wedged
+    active step reports ``false``. Accept the flag top-level or inside
+    ``supervisor``; a missing flag is not evidence of health.
+    """
+    for holder in (tick, tick.get("supervisor")):
+        if isinstance(holder, dict) and holder.get("execution_healthy") is True:
+            return True
+    return False
+
+
 def _semantic_unhealthy(tick: dict[str, Any]) -> bool:
     """semantic_healthy lives inside the ``supervisor`` object in the raw
     watchdog journal (the SUP-05 parsed extracts flattened it to top level;
@@ -364,6 +400,29 @@ def _semantic_unhealthy(tick: dict[str, Any]) -> bool:
     if isinstance(sup, dict) and "semantic_healthy" in sup:
         return sup["semantic_healthy"] is False
     return tick.get("semantic_healthy") is False
+
+
+def _stall_tick(tick: dict[str, Any]) -> bool:
+    """A tick that counts toward a STALL episode for the detection SLO.
+
+    The deployed watchdog's own health model (maestro ``watchdog.py``,
+    ``shealthy``) excuses semantic staleness while a bounded execution step
+    is healthily in flight — working through the backlog IS the handling, and
+    a restart there would kill productive work (KTD4). A semantic-unhealthy
+    tick therefore represents a stall the system must ACT on only when the
+    watchdog's own model would agree: no active execution step, or the
+    active step is beyond its dwell bound (``execution_healthy`` false).
+
+    Ticks excluded by this rule are surfaced separately in the probe value
+    (``excused_productive_ticks``) — excluded, never erased.
+    """
+    if not _semantic_unhealthy(tick):
+        return False
+    excused = (
+        _execution_state(tick) in _ACTIVE_EXECUTION_STATES
+        and _execution_healthy(tick)
+    )
+    return not excused
 
 
 def _did_restart(tick: dict[str, Any]) -> bool:
@@ -378,14 +437,18 @@ def _did_restart(tick: dict[str, Any]) -> bool:
 
 def _stall_episodes(
     ticks: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Maximal runs of consecutive semantically-unhealthy ticks.
+) -> tuple[list[dict[str, Any]], int]:
+    """Maximal runs of consecutive stall ticks (see :func:`_stall_tick`).
 
     Each episode dict: ``start`` (first unhealthy tick ts), ``latency_s``
     (first action tick minus start; None when no action ever fired in the
     episode — undetected, counted against the target), ``ticks`` (run
     length; 1 = transient blip the deployed hysteresis deliberately
     ignores).
+
+    Returns ``(episodes, excused_productive_ticks)`` where the int counts
+    semantic-unhealthy ticks excused by the deployed health model (bounded
+    execution step healthily in flight).
     """
     episodes: list[dict[str, Any]] = []
     cur: list[dict[str, Any]] = []
@@ -407,15 +470,22 @@ def _stall_episodes(
             }
         )
 
+    excused = 0
     for tick in ticks:
-        if _semantic_unhealthy(tick):
+        if _stall_tick(tick):
             cur.append(tick)
-        elif cur:
-            close(cur)
-            cur = []
+        else:
+            if _semantic_unhealthy(tick):
+                # semantic-unhealthy but excused by the deployed health model
+                # (bounded execution step healthily in flight) — reported, not
+                # a stall episode.
+                excused += 1
+            if cur:
+                close(cur)
+                cur = []
     if cur:
         close(cur)
-    return episodes
+    return episodes, excused
 
 
 # ---------------------------------------------------------------------------
@@ -450,11 +520,14 @@ def probe_stall_detection(
     if not ticks:
         rec.notes.append("no parseable watchdog ticks in window")
         return rec
-    episodes = _stall_episodes(ticks)
+    episodes, excused_productive = _stall_episodes(ticks)
     if not episodes:
         rec.numerator = 0
         rec.denominator = 0
-        rec.value = {"episodes": 0}
+        rec.value = {
+            "episodes": 0,
+            "excused_productive_ticks": excused_productive,
+        }
         rec.verdict = UNKNOWN
         rec.notes.append("no stall episodes in window (nothing to measure)")
         return rec
@@ -485,6 +558,7 @@ def probe_stall_detection(
         "transient_episodes": transient,
         "within_5m": within5,
         "undetected": undetected,
+        "excused_productive_ticks": excused_productive,
         "worst_latency_s": worst,
         "worst_latency_min": (
             round(worst / 60.0, 2) if worst is not None else None
@@ -505,7 +579,11 @@ def probe_stall_detection(
     )
     rec.notes.append(
         "persistent = multi-tick semantic-unhealthy runs; single-tick "
-        "self-resolving blips counted separately (hysteresis by design)"
+        "self-resolving blips counted separately (hysteresis by design); "
+        "excused_productive_ticks = semantic-unhealthy ticks excused by the "
+        "deployed watchdog's own health model (bounded execution step "
+        "healthily in flight — KTD4: restart suppressed), reported but not "
+        "counted as stalls"
     )
     return rec
 
