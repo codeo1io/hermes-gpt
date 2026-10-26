@@ -26,7 +26,7 @@ import pytest
 
 import operator_mission_runtime as mission
 import operator_slo_probe as slo
-from test_operator_autopilot_scheduler import _j, _mk, _node, make_env
+from test_operator_autopilot_scheduler import _j, make_env
 
 MID = "msn-discharge-pred"
 SUCCESSOR = "msn-discharge-succ"
@@ -214,7 +214,6 @@ class TestSupersedeMissionNode:
         _mk_plan(root, MID, "n1", state="failed")
         _set_status(root, SUCCESSOR, "completed")
         # marker written behind the API's back but with a WRONG digest
-        import hashlib
         with sqlite3.connect(mission._db_path(root)) as db:
             db.execute(
                 "INSERT INTO mission_events(mission_id,event_type,from_status,"
