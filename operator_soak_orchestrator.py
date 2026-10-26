@@ -644,7 +644,7 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         state = store.load_state()
         prev = state.get("stage") if state else None
-        fresh = store.start_soak(window_s=args.stage_window_s, actor=args.actor)
+        store.start_soak(window_s=args.stage_window_s, actor=args.actor)
         store.record_event(
             {
                 "event": "soak_reset",
