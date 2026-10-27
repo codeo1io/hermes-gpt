@@ -353,6 +353,24 @@ class HermesAgentBackend:
             "spool_path": str(root),
         }
         action_payload: dict[str, Any] = {"phase_timeout_seconds": payload_timeout}
+        # Native mission-node transport must know the immutable deliverable
+        # basenames. A preamble-only idle is not completion; the spool server
+        # can continue the SAME session only while these files are absent.
+        # The Work Contract still validates bytes/digests/semantics after
+        # transport. Do not alter the shape of artifact-free legacy orders.
+        declared = contract.get("expected_artifacts") or []
+        if declared:
+            if not isinstance(declared, list):
+                raise ValueError("expected_artifacts must be a list")
+            names: list[str] = []
+            for item in declared:
+                name = item.get("path") if isinstance(item, dict) else None
+                if not isinstance(name, str) or not name or Path(name).name != name:
+                    raise ValueError("expected_artifacts must use safe basenames")
+                if name in names:
+                    raise ValueError("duplicate expected artifact basename")
+                names.append(name)
+            action_payload["expected_artifacts"] = names
         if instruction:
             action_payload["instruction"] = instruction
         payload["action_payload"] = action_payload

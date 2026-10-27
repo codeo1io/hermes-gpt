@@ -71,6 +71,32 @@ def test_dispatch_publishes_conforming_envelope(tmp_path, monkeypatch):
     assert order["phase_prompt"].startswith("Fix the boot-lock")
 
 
+def test_native_dispatch_carries_exact_expected_artifact_basenames(tmp_path, monkeypatch):
+    be = _backend(monkeypatch, tmp_path)
+    contract = _contract(tmp_path)
+    contract["expected_artifacts"] = [
+        {"path": "m5-pi-recovery-proof.json", "must_exist": True, "min_bytes": 100},
+        {"path": "receipt.md", "must_exist": True, "min_bytes": 1},
+    ]
+    out = be.dispatch(contract, confirm=True, dry_run=False, timeout=30)
+    assert out["success"] is True
+    order = json.loads(
+        (tmp_path / "spool" / "pending" / "attempt0000000001.json").read_text()
+    )
+    assert order["action_payload"]["expected_artifacts"] == [
+        "m5-pi-recovery-proof.json", "receipt.md"
+    ]
+
+
+def test_native_dispatch_rejects_unsafe_artifact_names(tmp_path, monkeypatch):
+    be = _backend(monkeypatch, tmp_path)
+    contract = _contract(tmp_path)
+    contract["expected_artifacts"] = [{"path": "../escape.json"}]
+    with pytest.raises(ValueError, match="safe basenames"):
+        be.dispatch(contract, confirm=True, dry_run=False, timeout=30)
+    assert not (tmp_path / "spool" / "pending" / "attempt0000000001.json").exists()
+
+
 def test_dispatch_declares_typed_turn_budget_never_invocation_timeout(tmp_path, monkeypatch):
     """Regression (2026-10-21, msn-m3-pi-dev-004 starvation): the published
     envelope must carry a TYPED turn budget. Pre-fix, ``timeout_seconds`` fell
