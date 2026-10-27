@@ -449,6 +449,40 @@ class TestStallDetection:
         assert rec.verdict == slo.UNKNOWN
         assert rec.value["excused_productive_ticks"] == 2
 
+    def test_explicit_live_idle_pacing_is_reported_not_a_stall(self) -> None:
+        """A healthy idle pacing interval must carry an explicit watchdog
+        exemption receipt; semantic staleness alone cannot imply pacing."""
+        paced = {"semantic_healthy": False, "execution_state": "IDLE",
+                 "execution_healthy": True, "healthy": True,
+                 "pacing_exempted": True, "operator_lane_stalled": None}
+        lines = [
+            watchdog_line(ts_at(0), {"supervisor": paced}),
+            watchdog_line(ts_at(60), {"supervisor": paced}),
+            watchdog_line(ts_at(120), {"semantic_healthy": True}),
+        ]
+        rec = slo.probe_stall_detection(lines)
+        assert rec.verdict == slo.UNKNOWN
+        assert rec.value["episodes"] == 0
+        assert rec.value["excused_pacing_ticks"] == 2
+        assert rec.value["excused_productive_ticks"] == 0
+
+    def test_pacing_receipt_cannot_hide_unhealthy_or_wedged_idle(self) -> None:
+        """A forged or stale exemption must not hide an undetected stall."""
+        for bad in ({"healthy": False}, {"execution_healthy": False},
+                    {"pacing_exempted": False}, {"operator_lane_stalled": {"id": "x"}}):
+            tick = {"semantic_healthy": False, "execution_state": "IDLE",
+                    "execution_healthy": True, "healthy": True,
+                    "pacing_exempted": True, "operator_lane_stalled": None}
+            tick.update(bad)
+            lines = [
+                watchdog_line(ts_at(0), {"supervisor": tick}),
+                watchdog_line(ts_at(60), {"supervisor": tick}),
+                watchdog_line(ts_at(120), {"semantic_healthy": True}),
+            ]
+            rec = slo.probe_stall_detection(lines)
+            assert rec.verdict == slo.FAIL
+            assert rec.value["undetected"] == 1
+
     def test_idle_semantic_stall_is_not_excused(self) -> None:
         """No active execution step + semantic-unhealthy = genuine stall —
         the excuse must not swallow real misses (the anti-gaming bound)."""
