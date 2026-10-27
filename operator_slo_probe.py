@@ -404,6 +404,25 @@ def _semantic_unhealthy(tick: dict[str, Any]) -> bool:
     return tick.get("semantic_healthy") is False
 
 
+def _pacing_exempted(tick: dict[str, Any]) -> bool:
+    """Only an explicit, live watchdog pacing receipt excuses an idle tick.
+
+    Do not infer pacing from a healthy flag alone: the SLO must still detect
+    genuine idle stalls and stale/dead supervisor executions.
+    """
+    for holder in (tick.get("supervisor"), tick):
+        if not isinstance(holder, dict):
+            continue
+        if holder.get("pacing_exempted") is not True:
+            continue
+        return (
+            holder.get("healthy") is True
+            and holder.get("execution_healthy") is True
+            and holder.get("operator_lane_stalled") is None
+        )
+    return False
+
+
 def _stall_tick(tick: dict[str, Any]) -> bool:
     """A tick that counts toward a STALL episode for the detection SLO.
 
@@ -424,7 +443,7 @@ def _stall_tick(tick: dict[str, Any]) -> bool:
         _execution_state(tick) in _ACTIVE_EXECUTION_STATES
         and _execution_healthy(tick)
     )
-    return not excused
+    return not (excused or _pacing_exempted(tick))
 
 
 def _did_restart(tick: dict[str, Any]) -> bool:
@@ -439,7 +458,7 @@ def _did_restart(tick: dict[str, Any]) -> bool:
 
 def _stall_episodes(
     ticks: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], int]:
+) -> tuple[list[dict[str, Any]], int, int]:
     """Maximal runs of consecutive stall ticks (see :func:`_stall_tick`).
 
     Each episode dict: ``start`` (first unhealthy tick ts), ``latency_s``
@@ -448,9 +467,8 @@ def _stall_episodes(
     length; 1 = transient blip the deployed hysteresis deliberately
     ignores).
 
-    Returns ``(episodes, excused_productive_ticks)`` where the int counts
-    semantic-unhealthy ticks excused by the deployed health model (bounded
-    execution step healthily in flight).
+    Returns (episodes, productive_exemptions, explicit_pacing_exemptions).
+    Every excluded semantic-unhealthy tick is reported separately.
     """
     episodes: list[dict[str, Any]] = []
     cur: list[dict[str, Any]] = []
@@ -473,21 +491,23 @@ def _stall_episodes(
         )
 
     excused = 0
+    pacing_excused = 0
     for tick in ticks:
         if _stall_tick(tick):
             cur.append(tick)
         else:
             if _semantic_unhealthy(tick):
-                # semantic-unhealthy but excused by the deployed health model
-                # (bounded execution step healthily in flight) — reported, not
-                # a stall episode.
-                excused += 1
+                if _pacing_exempted(tick):
+                    pacing_excused += 1
+                else:
+                    # Bounded execution step healthily in flight.
+                    excused += 1
             if cur:
                 close(cur)
                 cur = []
     if cur:
         close(cur)
-    return episodes, excused
+    return episodes, excused, pacing_excused
 
 
 # ---------------------------------------------------------------------------
@@ -522,13 +542,14 @@ def probe_stall_detection(
     if not ticks:
         rec.notes.append("no parseable watchdog ticks in window")
         return rec
-    episodes, excused_productive = _stall_episodes(ticks)
+    episodes, excused_productive, excused_pacing = _stall_episodes(ticks)
     if not episodes:
         rec.numerator = 0
         rec.denominator = 0
         rec.value = {
             "episodes": 0,
             "excused_productive_ticks": excused_productive,
+            "excused_pacing_ticks": excused_pacing,
         }
         rec.verdict = UNKNOWN
         rec.notes.append("no stall episodes in window (nothing to measure)")
@@ -561,6 +582,7 @@ def probe_stall_detection(
         "within_5m": within5,
         "undetected": undetected,
         "excused_productive_ticks": excused_productive,
+        "excused_pacing_ticks": excused_pacing,
         "worst_latency_s": worst,
         "worst_latency_min": (
             round(worst / 60.0, 2) if worst is not None else None
@@ -585,7 +607,8 @@ def probe_stall_detection(
         "excused_productive_ticks = semantic-unhealthy ticks excused by the "
         "deployed watchdog's own health model (bounded execution step "
         "healthily in flight — KTD4: restart suppressed), reported but not "
-        "counted as stalls"
+        "counted as stalls; excused_pacing_ticks require an explicit "
+        "watchdog pacing_exempted receipt with live healthy execution"
     )
     return rec
 
