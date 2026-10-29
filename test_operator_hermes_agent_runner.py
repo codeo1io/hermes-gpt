@@ -88,6 +88,36 @@ def test_native_dispatch_carries_exact_expected_artifact_basenames(tmp_path, mon
     ]
 
 
+def test_native_source_directory_separate_from_artifact_acceptance(tmp_path, monkeypatch):
+    """Owner-authorized repository work occurs outside isolated receipt root."""
+    be = _backend(monkeypatch, tmp_path)
+    contract = _contract(tmp_path, delegate="opencode")
+    artifact_dir = tmp_path / "workspace"
+    source_dir = tmp_path / "source-repo"
+    source_dir.mkdir()
+    (source_dir / "AGENTS.md").write_text("safe work instructions")
+    contract["allowed_scope"]["workspaces"].append(str(source_dir))
+    contract["expected_artifacts"] = [{"path": "proof.json", "must_exist": True}]
+    out = be.dispatch(contract, confirm=True, dry_run=False, timeout=900)
+    assert out["success"] is True
+    order = json.loads((tmp_path / "spool" / "pending" / "attempt0000000001.json").read_text())
+    assert order["workspace_path"] == str(artifact_dir)
+    assert order["action_payload"]["execution_cwd"] == str(source_dir.resolve())
+    assert order["action_payload"]["expected_artifacts"] == ["proof.json"]
+    assert order["backend_hint"] == "opencode"
+
+
+def test_native_source_directory_invalid_fails_before_dispatch(tmp_path, monkeypatch):
+    """A disappeared authorized repository is not silently replaced by artifacts."""
+    be = _backend(monkeypatch, tmp_path)
+    contract = _contract(tmp_path)
+    contract["allowed_scope"]["workspaces"].append(str(tmp_path / "missing-repo"))
+    out = be.dispatch(contract, confirm=True, dry_run=False, timeout=900)
+    assert out["success"] is False
+    assert out["code"] == "HERMES_AGENT_EXECUTION_WORKSPACE_INVALID"
+    assert not list((tmp_path / "spool" / "pending").iterdir())
+
+
 def test_native_dispatch_rejects_unsafe_artifact_names(tmp_path, monkeypatch):
     be = _backend(monkeypatch, tmp_path)
     contract = _contract(tmp_path)
