@@ -373,6 +373,20 @@ class HermesAgentBackend:
             action_payload["expected_artifacts"] = names
         if instruction:
             action_payload["instruction"] = instruction
+        # The first Work Contract workspace is the isolated artifact receipt
+        # directory. Owner-signed work orders append authorized source trees;
+        # keep the receipt root unchanged, but execute in that source tree.
+        # Never silently fall back to the empty artifact root when the
+        # separately authorized execution directory is missing or invalid.
+        if payload["intent"] == "mission_node" and len(workspaces) > 1:
+            execution_dir = Path(str(workspaces[1])).expanduser()
+            if (not execution_dir.is_absolute() or execution_dir.is_symlink()
+                    or not execution_dir.is_dir()):
+                return _refusal(
+                    "HERMES_AGENT_EXECUTION_WORKSPACE_INVALID",
+                    "authorized native execution directory is unavailable",
+                )
+            action_payload["execution_cwd"] = str(execution_dir.resolve())
         payload["action_payload"] = action_payload
 
         body = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
