@@ -2,7 +2,6 @@
 import hashlib
 import json
 from datetime import datetime, timedelta, timezone
-from itertools import cycle
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -298,12 +297,13 @@ def test_windows_hash_accepts_stable_file_with_different_stat_and_fstat_ctime(tm
     result = contracts._check_artifacts(contract, "a" * 64, tmp_path)
     assert result["status"] == "FAIL" and result["failure_codes"] == ["artifact_hash_mismatch"]
     # A change observed through the same handle still invalidates the digest.
-    changed = SimpleNamespace(**{**fields, "st_ctime_ns": initial.st_ctime_ns + 2000},
-                              st_birthtime_ns=birthtime)
-    calls = cycle((fd_stat, changed))
-    monkeypatch.setattr(contracts.os, "fstat", lambda fd: next(calls))
-    with pytest.raises(OSError, match="changed"):
-        contracts._artifact_hash(artifact)
+    calls = iter([fd_stat, SimpleNamespace(**{**fields, "st_ctime_ns": initial.st_ctime_ns + 2000},
+                                          st_birthtime_ns=birthtime)])
+    # Restore the finite mock before pytest/capture teardown calls os.fstat.
+    with monkeypatch.context() as scoped:
+        scoped.setattr(contracts.os, "fstat", lambda fd: next(calls))
+        with pytest.raises(OSError, match="changed"):
+            contracts._artifact_hash(artifact)
 
 
 def test_hash_accepts_stable_rewritten_file(tmp_path):

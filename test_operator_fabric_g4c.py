@@ -578,12 +578,16 @@ def test_slow_launch_does_not_hold_peer_lock_for_unrelated_conflict_domain(
 
     unrelated_thread = threading.Thread(target=run_unrelated_operations)
     unrelated_thread.start()
-    assert unrelated_finished.wait(_THREAD_BUDGET), "slow external launch held the peer-wide lock"
-    assert claim_for(svc, "workspace:unrelated")["state"] == "ACTIVE"
-
-    launch_resume.set()
-    accept_thread.join(_THREAD_BUDGET)
-    unrelated_thread.join(_THREAD_BUDGET)
+    try:
+        assert unrelated_finished.wait(_THREAD_BUDGET), "slow external launch held the peer-wide lock"
+        assert claim_for(svc, "workspace:unrelated")["state"] == "ACTIVE"
+        # The unrelated operations must finish BEFORE the blocked launch is
+        # released. This detects lock retention without requiring a fast VM.
+        assert not launch_resume.is_set() and accept_thread.is_alive()
+    finally:
+        launch_resume.set()
+        accept_thread.join(_THREAD_BUDGET)
+        unrelated_thread.join(_THREAD_BUDGET)
     assert not accept_thread.is_alive()
     assert not unrelated_thread.is_alive()
     assert errors == []

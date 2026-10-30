@@ -1,6 +1,20 @@
 # Changelog
 
-## Unreleased
+## 0.17.0 — Daily Operations
+
+- Add optional stable `request_id` to Mission launch. Commit durable intent before effects, checkpoint completed steps, reject changed payloads, and return the original receipt on replay without redispatch.
+- Add Flight Deck New Mission with bounded defaults, explicit budget omission, preview/confirm, and receipt-only recovery after disconnect.
+- Link pending contract reviews from the Owner inbox to exact contract/task/delegation evidence. Refuse stale bindings and executing reviewers; retain Owner authorization and separate reconciliation/final approval.
+- Add read-only delivery health with masked targets, pending counts, backoff, and `SENT_UNVERIFIED` disclosure. Agent compatibility is explicitly not probed by this page.
+- Preserve default tool counts and gates. Launch's additive schema change requires client action/schema refresh. Receipt retention is capped at 10,000 with no automatic expiry.
+
+## 0.16.2 - 2026-10-29
+
+- Session continuation uses a finite, non-auto-approving stream-json CLI turn. Completion requires a matching terminal result and zero exit code. Durable reservations prevent duplicate submission after ambiguous outcomes; bounded parsing excludes tool event bodies from persisted results. Unsupported CLIs are refused before submission. Live Desktop acceptance is not yet certified.
+- Publish the exact wheel and sdist validated by CI instead of rebuilding during upload. Tag/version mismatch refuses publication.
+- Correct current release documentation and tool counts.
+
+- Autopilot records why a run ended (`max_runtime_exceeded`, or the crash reason) before it terminalizes the job. A status read in between could reconcile the run to `failed` with no `last_error`; this was an intermittent CI failure in `test_real_worker_ends_a_run_that_is_out_of_time_with_nothing_in_flight`.
 
 Everything in this section lives on repository master only. The published package has not moved: `pip install hermes-gpt` still resolves 0.14.0 and contains none of the modules or fixes below. Check the PyPI badge in the root README before relying on any of them from an installed package; run from a repository checkout to use them.
 
