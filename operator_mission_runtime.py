@@ -927,6 +927,10 @@ class MissionSupersedeError(Exception):
     """Raised by supersede_mission_node when the marker is refused."""
 
 
+class OperatorCompletionError(Exception):
+    """Raised by record_operator_completion when the receipt is refused."""
+
+
 def _mission_objective_digest(spec: dict[str, Any]) -> str:
     """Stable SHA-256 of a mission's objective text (marker anchor)."""
     return hashlib.sha256(
@@ -1069,6 +1073,223 @@ def supersede_mission_node(
         raise
     except (LookupError, OSError, sqlite3.Error, ValueError) as exc:
         raise MissionSupersedeError(f"supersede failed: {exc}") from exc
+
+
+def record_operator_completion(
+    mission_id: str,
+    node_id: str,
+    *,
+    reason: str,
+    evidence_ref: str,
+    anchor_url: str = "",
+    hermes_root: Path | None = None,
+) -> dict[str, Any]:
+    """Record an operator-anchored completion receipt on a failed node.
+
+    The sanctioned second discharge escape (backfill_routine_discharge census:
+    "live debt until a native retry mission completes or the rails record an
+    operator-anchored completion"): a failed routine attempt whose objective
+    verifiably landed OUTSIDE the native rails — typically a merged upstream
+    PR or an in-mission retry whose receipts exist as artifacts — is
+    bookkeeping residue, not unfinished work the rails own.
+
+    Anti-gaming guards, all fail-closed (the supersede shape, minus the
+    successor-mission requirement, plus a network-verifiable anchor):
+
+    - the node exists and is terminal-``failed``;
+    - ``anchor_url`` MUST be an https URL naming an immutable, publicly
+      verifiable receipt (a merged PR, commit, or release). The caller is
+      expected to have verified the anchor; the probe re-checks the digest;
+    - the receipt embeds the predecessor objective's SHA-256 digest at write
+      time, so objective-text tampering voids it (evidence-bound, never
+      self-certifying);
+    - ``reason`` is bounded text; ``evidence_ref`` must point at a real
+      artifact path (``*/*`` shape at minimum);
+    - repeat calls are idempotent; a different anchor for the same node is
+      refused;
+    - the marker NEVER flips the failed node's state — the probe reads the
+      receipt separately, so a forged or stale receipt just stops being
+      honoured (fail closed) instead of corrupting attempt truth.
+    """
+    if not MISSION_ID_RE.fullmatch(mission_id):
+        raise OperatorCompletionError("mission_id is invalid")
+    if not node_id or len(node_id) > 128:
+        raise OperatorCompletionError("node_id is invalid")
+    reason = _bounded_text(reason, "operator completion reason", 256, required=True)
+    evidence_ref = _bounded_text(evidence_ref, "evidence_ref", 256)
+    anchor_url = _bounded_text(anchor_url, "anchor_url", 256)
+    if "/" not in evidence_ref:
+        raise OperatorCompletionError("evidence_ref must point at a real artifact path")
+    if not anchor_url.startswith("https://"):
+        raise OperatorCompletionError(
+            "anchor_url is required and must be an https URL"
+        )
+    path = _db_path(hermes_root)
+    if not path.is_file():
+        raise OperatorCompletionError("missions store missing")
+    now = _now()
+    try:
+        with _connect(path, write=True) as db:
+            _begin_write(db)
+            pred_row = _get_row(db, mission_id)
+            node = db.execute(
+                "SELECT state FROM plan_nodes WHERE mission_id=? AND node_id=?",
+                (mission_id, node_id),
+            ).fetchone()
+            if node is None:
+                raise OperatorCompletionError("plan node not found")
+            if str(node["state"]) != "failed":
+                raise OperatorCompletionError("plan node is not in failed state")
+            spec = json.loads(pred_row["spec_json"])
+            digest = _mission_objective_digest(spec)
+            marker = json.dumps(
+                {
+                    "anchor_url": anchor_url,
+                    "objective_sha256": digest,
+                    "reason": reason,
+                    "evidence_ref": evidence_ref,
+                },
+                sort_keys=True,
+            )
+            # scan this node's prior receipt events for idempotency/conflict
+            prior = db.execute(
+                "SELECT details_json FROM mission_events WHERE mission_id=? "
+                "AND event_type='mission.node_operator_completed' ORDER BY seq",
+                (mission_id,),
+            ).fetchall()
+            for row in prior:
+                try:
+                    details = json.loads(row["details_json"] or "{}")
+                except (TypeError, ValueError):
+                    continue
+                if str(details.get("node_id") or "") != node_id:
+                    continue
+                if str(details.get("marker") or "") == marker:
+                    db.commit()
+                    return {"operator_completed": True, "idempotent": True,
+                            "changed": False, "mission_id": mission_id,
+                            "node_id": node_id, "anchor_url": anchor_url}
+                raise OperatorCompletionError(
+                    "node already operator-completed with a different receipt"
+                )
+            live_notice = _event(
+                db,
+                mission_id,
+                "mission.node_operator_completed",
+                details={
+                    "node_id": node_id,
+                    "marker": marker,
+                    "reason": reason,
+                    "evidence_ref": evidence_ref,
+                    "anchor_url": anchor_url,
+                    "objective_sha256": digest,
+                },
+            )
+            db.execute(
+                "UPDATE missions SET version=version+1,updated_at=? WHERE mission_id=?",
+                (now, mission_id),
+            )
+            db.commit()
+        _publish_live_event(live_notice, hermes_root)
+        _audit(
+            "record_operator_completion", op.OperatorPolicy(), dry_run=False,
+            success=True, changed=True, mission_id=mission_id,
+            summary=f"node {node_id} operator-completed (anchor {anchor_url})",
+        )
+        return {"operator_completed": True, "idempotent": False, "changed": True,
+                "mission_id": mission_id, "node_id": node_id,
+                "anchor_url": anchor_url}
+    except OperatorCompletionError:
+        raise
+    except (LookupError, OSError, sqlite3.Error, ValueError) as exc:
+        raise OperatorCompletionError(f"operator completion failed: {exc}") from exc
+
+
+def _is_operator_completed_node(
+    db: sqlite3.Connection,
+    mission_id: str,
+    node_id: str,
+) -> str:
+    """Verify an operator-anchored completion receipt end to end; returns the
+    anchor URL when the receipt is real, else ``""``.
+
+    Guards, all fail-closed: receipt present; predecessor objective digest
+    matches the digest recorded at write time; the node is STILL
+    terminal-failed; the receipt carries a non-empty https anchor URL.
+    """
+    rows = db.execute(
+        "SELECT details_json FROM mission_events WHERE mission_id=? "
+        "AND event_type='mission.node_operator_completed' ORDER BY seq",
+        (mission_id,),
+    ).fetchall()
+    marker = None
+    for r in rows:
+        try:
+            details = json.loads(r[0] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if str(details.get("node_id") or "") == node_id:
+            marker = details
+    if not isinstance(marker, dict):
+        return ""
+    pred_row = db.execute(
+        "SELECT spec_json FROM missions WHERE mission_id=?", (mission_id,)
+    ).fetchone()
+    if pred_row is None:
+        return ""
+    try:
+        spec = json.loads(pred_row[0])
+    except (TypeError, ValueError):
+        return ""
+    if _mission_objective_digest(spec) != str(marker.get("objective_sha256") or ""):
+        return ""
+    has_plan_nodes = db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='plan_nodes'"
+    ).fetchone()
+    if not has_plan_nodes:
+        return ""
+    node = db.execute(
+        "SELECT state FROM plan_nodes WHERE mission_id=? AND node_id=?",
+        (mission_id, node_id),
+    ).fetchone()
+    if node is None or str(node[0]) != "failed":
+        return ""
+    anchor = str(marker.get("anchor_url") or "")
+    if not anchor.startswith("https://"):
+        return ""
+    return anchor
+
+
+def list_operator_completion_receipts(
+    mission_id: str,
+    *,
+    hermes_root: Path | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Read raw operator-anchored completion receipts for a mission's nodes,
+    keyed by node_id. Unfiltered by design — the probe re-verifies each one
+    (digest + terminal-failed node + https anchor) before honouring it."""
+    path = _db_path(hermes_root)
+    if not path.is_file():
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    try:
+        with _connect(path, write=False) as db:
+            rows = db.execute(
+                "SELECT details_json FROM mission_events WHERE mission_id=? "
+                "AND event_type='mission.node_operator_completed' ORDER BY seq",
+                (mission_id,),
+            ).fetchall()
+        for row in rows:
+            try:
+                details = json.loads(row["details_json"] or "{}")
+            except (TypeError, ValueError):
+                continue
+            node_id = str(details.get("node_id") or "")
+            if node_id:
+                out[node_id] = details
+    except (OSError, sqlite3.Error):
+        return {}
+    return out
 
 
 def list_node_discharge_markers(
