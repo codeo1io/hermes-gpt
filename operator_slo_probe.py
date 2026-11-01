@@ -721,6 +721,7 @@ def probe_routine_completion(missions_db: Path) -> SloRecord:
         rec.notes.append(f"source unreadable: {exc}")
         return rec
     discharged_by: dict[str, str] = {}
+    operator_anchored_by: dict[str, str] = {}
     try:
         terminal = conn.execute(
             f"SELECT COUNT(*) FROM plan_nodes WHERE "
@@ -748,12 +749,26 @@ def probe_routine_completion(missions_db: Path) -> SloRecord:
                 discharger = ""
             if discharger:
                 discharged_by[f"{mission_id}/{node_id}"] = discharger
+                continue
+            try:
+                anchor = oprt._is_operator_completed_node(conn, str(mission_id), str(node_id))
+            except sqlite3.Error:
+                anchor = ""
+            if anchor:
+                operator_anchored_by[f"{mission_id}/{node_id}"] = anchor
     except sqlite3.Error as exc:
         rec.notes.append(f"plan_nodes query failed: {exc}")
         return rec
     finally:
         conn.close()
-    discharged = len(discharged_by)
+    discharged = len(discharged_by) + len(operator_anchored_by)
+    if operator_anchored_by:
+        rec.notes.append(
+            "operator-anchored completions (verified receipts, objective "
+            "landed outside the rails): " + ", ".join(
+                f"{k}->{v}" for k, v in sorted(operator_anchored_by.items())
+            )
+        )
     if discharged_by:
         rec.notes.append(
             "discharged failures (verified supersede markers, count as "
