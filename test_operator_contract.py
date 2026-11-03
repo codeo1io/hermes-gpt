@@ -432,6 +432,36 @@ def test_define_rejects_artifact_escape(hermes_root):
     assert out["success"] is False
 
 
+def test_define_rejects_bad_forbid_null_fields(hermes_root):
+    """forbid_null_fields must be a nonempty list of nonempty strings."""
+    ws = hermes_root.parent / "ws"
+    c = _contract_for_ws(
+        ws,
+        expected_artifacts=[
+            {"path": "proof.json", "must_exist": True, "min_bytes": 1,
+             "forbid_null_fields": []},
+        ],
+    )
+    out = _run_define(c, hermes_root)
+    assert out["success"] is False
+
+
+def test_define_accepts_forbid_null_fields(hermes_root):
+    ws = hermes_root.parent / "ws"
+    c = _contract_for_ws(
+        ws,
+        expected_artifacts=[
+            {"path": "proof.json", "must_exist": True, "min_bytes": 1,
+             "forbid_null_fields": ["branch", "head_sha", "pr_url"]},
+        ],
+    )
+    out = _run_define(c, hermes_root)
+    assert out["success"] is True
+    # canonical form carries the constraint through
+    art = out["contract"]["expected_artifacts"][0]
+    assert art["forbid_null_fields"] == ["branch", "head_sha", "pr_url"]
+
+
 # ---------------------------------------------------------------------------
 # 3. SATISFIED happy path
 # ---------------------------------------------------------------------------
@@ -549,6 +579,83 @@ def test_false_done_rejected_missing_artifact(hermes_root):
     by_kind = {ch["kind"]: ch["status"] for ch in out["checks"]}
     assert by_kind["artifacts"] == "FAIL"
     assert any("artifacts" in r for r in out["rejected_reasons"])
+
+
+def test_false_done_rejected_null_field_scaffold(hermes_root):
+    """The 2026-11-03 M5 -008 laundering class (fail-closed content bar).
+
+    A worker writes a minimal JSON scaffold that satisfies ``min_bytes``
+    while every field that would prove real work (branch, head_sha,
+    native_session_id, pr_url) is null. ``forbid_null_fields`` makes that
+    shape a hard artifacts FAIL instead of a satisfied size check.
+    """
+    ws = hermes_root.parent / "ws"
+    proof = ws / "m5-opencode-recovery-proof.json"
+    proof.parent.mkdir(parents=True, exist_ok=True)
+    # byte-for-byte shape of the real 398-byte -008 scaffold
+    proof.write_text(json.dumps({
+        "mission": "ap-msn-m5-opencode-recovery-008",
+        "attempt_id": "ap-...-04e5fe6a3d1beb39",
+        "milestones": [{"id": "started", "ts": "2026-11-03T00:00:00Z",
+                        "note": "delegate session started; artifact initialized"}],
+        "branch": None,
+        "head_sha": None,
+        "native_session_id": None,
+        "pr_url": None,
+        "ci": None,
+        "tests": None,
+    }), encoding="utf-8")
+    assert proof.stat().st_size >= 100  # min_bytes alone admits it (the hole)
+    c = _contract_for_ws(
+        ws,
+        task_id="t-scaffold",
+        expected_artifacts=[{
+            "path": "m5-opencode-recovery-proof.json",
+            "must_exist": True,
+            "min_bytes": 100,
+            "forbid_null_fields": ["branch", "head_sha", "native_session_id", "pr_url"],
+        }],
+    )
+    _add_review_evidence(c, reviewer="default")
+    out = _run_validate(c, hermes_root)
+    assert out["verdict"] == "NOT_SATISFIED"
+    assert out["false_done_detected"] is True
+    by_kind = {ch["kind"]: ch["status"] for ch in out["checks"]}
+    assert by_kind["artifacts"] == "FAIL"
+    arts = next(ch for ch in out["checks"] if ch["kind"] == "artifacts")
+    assert "artifact_null_field" in arts["failure_codes"]
+    assert any("artifacts" in r for r in out["rejected_reasons"])
+
+
+def test_validate_satisfied_with_forbid_null_fields_populated(hermes_root):
+    """A populated proof passes the same bar — no false rejections."""
+    ws = hermes_root.parent / "ws"
+    proof = ws / "m5-opencode-recovery-proof.json"
+    proof.parent.mkdir(parents=True, exist_ok=True)
+    proof.write_text(json.dumps({
+        "mission": "ap-msn-m5-opencode-recovery-007",
+        "branch": "conductor/ap-msn-m5-opencode-recovery-007",
+        "head_sha": "a3cebf3",
+        "native_session_id": "ses_e639af577ffeVcpEWe7eRSKR1M",
+        "pr_url": "https://github.com/codeo1io/hermes-conductor/pull/406",
+        "ci": "success",
+        "tests": "9/9 pass",
+    }), encoding="utf-8")
+    c = _contract_for_ws(
+        ws,
+        task_id="t-done",
+        expected_artifacts=[{
+            "path": "m5-opencode-recovery-proof.json",
+            "must_exist": True,
+            "min_bytes": 100,
+            "forbid_null_fields": ["branch", "head_sha", "native_session_id", "pr_url"],
+        }],
+    )
+    _add_review_evidence(c, reviewer="default")
+    out = _run_validate(c, hermes_root)
+    assert out["verdict"] == "SATISFIED"
+    by_kind = {ch["kind"]: ch["status"] for ch in out["checks"]}
+    assert by_kind["artifacts"] == "PASS"
 
 
 def test_false_done_rejected_failed_test(hermes_root, monkeypatch):
