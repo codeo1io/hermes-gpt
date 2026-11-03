@@ -313,6 +313,20 @@ def artifact_constraints(item: dict[str, Any], min_bytes: int) -> dict[str, Any]
         if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
             raise ValueError("artifact sha256 must be lowercase SHA-256")
         out["sha256"] = digest
+    if "forbid_null_fields" in item:
+        fields = item["forbid_null_fields"]
+        if (
+            not isinstance(fields, list)
+            or not fields
+            or any(
+                not isinstance(f, str) or not f.strip() or len(f) > 200
+                for f in fields
+            )
+        ):
+            raise ValueError(
+                "forbid_null_fields must be a non-empty list of non-empty strings"
+            )
+        out["forbid_null_fields"] = fields
     return out
 
 
@@ -620,7 +634,7 @@ def _surface_contract(contract: dict[str, Any]) -> dict[str, Any]:
             "path": a["path"],
             "must_exist": a["must_exist"],
             "min_bytes": a["min_bytes"],
-            **{key: a[key] for key in ("max_bytes", "sha256") if key in a},
+            **{key: a[key] for key in ("max_bytes", "sha256", "forbid_null_fields") if key in a},
         }
         for a in contract.get("expected_artifacts", [])
     ]
@@ -811,6 +825,31 @@ def _admitted_artifact_evidence(
     return [item for item in value if isinstance(item, dict)]
 
 
+def _null_field_violations(path: Path, art: dict[str, Any]) -> list[str]:
+    """Fields a contract forbids to be null that the artifact reports null.
+
+    Returns the violating field names (empty = no violation / constraint
+    absent). The artifact must be readable JSON containing an object at the
+    root; anything else is unverifiable under the constraint, which fails
+    closed via a synthetic violation naming the whole document.
+    """
+    forbidden = art.get("forbid_null_fields")
+    if not forbidden:
+        return []
+    try:
+        with path.open("rb") as fh:
+            payload = json.load(fh)
+    except (OSError, ValueError):
+        return ["<document>"]
+    if not isinstance(payload, dict):
+        return ["<document>"]
+    return [
+        name
+        for name in forbidden
+        if payload.get(name) is None
+    ]
+
+
 def _artifact_identity(s: os.stat_result, *, cross_api: bool = False) -> tuple[int, int, int, int, int]:
     # CPython on Windows can expose creation time through stat() and change
     # time through fstat(). Compare birth time across those APIs when available;
@@ -908,6 +947,10 @@ def _check_artifacts(
                 if "max_bytes" in art and info.st_size > art["max_bytes"]:
                     reasons.add("artifact_too_large")
                     continue
+                null_fields = _null_field_violations(cand, art)
+                if null_fields:
+                    reasons.add("artifact_null_field")
+                    continue
                 digest = _artifact_hash(cand, min_bytes=art["min_bytes"], max_bytes=art.get("max_bytes")) if art.get("sha256") else ""
                 if art.get("sha256") and _artifact_identity(info) != _artifact_identity(cand.stat()):
                     raise OSError("artifact changed between size and digest verification")
@@ -933,6 +976,10 @@ def _check_artifacts(
                 and item["size_bytes"] >= art["min_bytes"]
                 and ("max_bytes" not in art or item["size_bytes"] <= art["max_bytes"])
                 and ("sha256" not in art or item.get("sha256") == art["sha256"])
+                and not (
+                    art.get("forbid_null_fields")
+                    and any(item.get(f) is None for f in art["forbid_null_fields"])
+                )
                 and item.get("provenance") == "coordinator_verified_artifact"
             ),
             None,
