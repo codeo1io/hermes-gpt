@@ -321,10 +321,42 @@ def probe_double_claim(delegations_db: Path) -> SloRecord:
 # Watchdog journal parsing (shared by stall-detection and auto-recovery)
 # ---------------------------------------------------------------------------
 
+# journalctl -o short-iso emits "+HHMM" (no colon); ISO-8601 also allows
+# the colon form "+HH:MM" and negative offsets. The regex accepts all three
+# timestamp shapes; _parse_journal_timestamp below interprets them portably
+# (datetime.fromisoformat rejects no-colon offsets on Python <= 3.10, which
+# silently dropped 252/252 live ticks on such interpreters — 2026-11-04).
 _WATCHDOG_LINE_RE = re.compile(
-    r"^(?P<date>\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\+\d{4})?) \S+ "
+    r"^(?P<date>\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}"
+    r"(?:[+-]\d{2}:?\d{2})?) \S+ "
     r"maestro-watchdog\[\d+\]: (?P<payload>\{.*\})$"
 )
+
+
+def _parse_journal_timestamp(raw: str) -> float | None:
+    """Journal timestamp -> epoch seconds, portable across Python >= 3.10.
+
+    ``datetime.fromisoformat`` cannot parse the ``+HHMM`` (no-colon) offset
+    journalctl emits until Python 3.11. Normalizing the offset to the colon
+    form (rather than parsing by hand) keeps tz-database handling inside the
+    stdlib and preserves the naive->UTC default. Returns None when the
+    timestamp is malformed; callers treat that as an unparseable line.
+    """
+    candidate = raw
+    m = re.search(r"([+-])(\d{2})(\d{2})$", candidate)
+    if m:
+        # "+HHMM"/"-HHMM" -> "+HH:MM"/"-HH:MM": datetime.fromisoformat
+        # cannot parse the no-colon offset journalctl emits until 3.11.
+        candidate = (
+            candidate[: m.start()] + m.group(1) + m.group(2) + ":" + m.group(3)
+        )
+    try:
+        dt = datetime.fromisoformat(candidate)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
 
 
 def parse_watchdog_journal(lines: list[str]) -> list[dict[str, Any]]:
@@ -347,13 +379,10 @@ def parse_watchdog_journal(lines: list[str]) -> list[dict[str, Any]]:
         if not isinstance(payload, dict):
             continue
         raw = m.group("date").replace(" ", "T", 1)
-        try:
-            dt = datetime.fromisoformat(raw)
-        except ValueError:
+        ts = _parse_journal_timestamp(raw)
+        if ts is None:
             continue
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        payload["__ts"] = dt.timestamp()
+        payload["__ts"] = ts
         ticks.append(payload)
     return ticks
 

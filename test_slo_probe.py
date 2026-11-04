@@ -723,3 +723,75 @@ class TestCollectAll:
         assert s["pass"] + s["fail"] + s["unknown"] == len(doc["records"])
         assert len(s["failed_ids"]) == s["fail"]
         assert len(s["unknown_ids"]) == s["unknown"]
+
+
+# ---------------------------------------------------------------------------
+# Regression: journalctl -o short-iso emits +HHMM offsets (no colon); Python
+# <=3.10 datetime.fromisoformat rejects them, silently parsing the ENTIRE
+# live journal to 0 ticks -> fabricated "no stall episodes" UNKNOWN. Found
+# live 2026-11-04: 252/252 journal lines dropped on /usr/bin/python3 3.10.
+# ---------------------------------------------------------------------------
+
+
+class TestParseWatchdogJournalOffsetCompat:
+    def _line(self, ts: str, payload: dict | None = None) -> str:
+        import json as _json
+
+        body = _json.dumps(payload or {"healthy": True})
+        return f"{ts} agent-runner maestro-watchdog[2356306]: {body}"
+
+    def test_short_iso_plus_hhmm_offset_parses_on_all_pythons(self) -> None:
+        lines = [
+            self._line("2026-11-04T12:28:13+0000"),
+            self._line("2026-11-04T12:28:43+0000"),
+        ]
+        ticks = slo.parse_watchdog_journal(lines)
+        assert len(ticks) == 2, (
+            "journalctl -o short-iso +HHMM offsets must parse on every "
+            "supported interpreter (py<=3.10 fromisoformat rejects them)"
+        )
+        assert ticks[0]["__ts"] == 1793795293.0
+        assert ticks[1]["__ts"] - ticks[0]["__ts"] == 30.0
+
+    def test_negative_hhmm_offset_parses(self) -> None:
+        ticks = slo.parse_watchdog_journal(
+            [self._line("2026-11-04T07:28:13-0500")]
+        )
+        assert len(ticks) == 1
+        assert ticks[0]["__ts"] == 1793795293.0
+
+    def test_colon_offsets_and_naive_still_parse(self) -> None:
+        # Pre-existing accepted shapes keep parsing: short-iso with colon
+        # offsets, and naive (short) lines which default to UTC.
+        colon = slo.parse_watchdog_journal(
+            [self._line("2026-11-04T12:28:13+00:00")]
+        )
+        naive = slo.parse_watchdog_journal(
+            [self._line("2026-11-04 12:28:13")]
+        )
+        assert len(colon) == 1 and len(naive) == 1
+        assert colon[0]["__ts"] == naive[0]["__ts"] == 1793795293.0
+
+    def test_malformed_timestamp_still_skipped_silently(self) -> None:
+        # Unparseable/non-matching lines are skipped, never fatal (pre-
+        # existing contract); garbage payload JSON likewise.
+        ticks = slo.parse_watchdog_journal(
+            [
+                self._line("2026-11-04T12:28:13+0000"),
+                "2026-11-04T99:99:99+0000 agent-runner maestro-watchdog[1]: {}",
+                "not a journal line at all",
+                self._line("2026-11-04T12:29:13+0000"),
+            ]
+        )
+        assert len(ticks) == 2
+
+    def test_live_shape_roundtrip_count(self) -> None:
+        # Byte-shape captured from journalctl --user -t maestro-watchdog
+        # -o short-iso on the production host 2026-11-04 (verbatim prefix).
+        line = (
+            "2026-11-04T12:28:13+0000 agent-runner maestro-watchdog[2356306]: "
+            '{"api_ok": true, "healthy": true, "heartbeat_age_seconds": 10.7}'
+        )
+        ticks = slo.parse_watchdog_journal([line])
+        assert len(ticks) == 1
+        assert ticks[0]["api_ok"] is True
