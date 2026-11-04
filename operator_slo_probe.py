@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import sqlite3
@@ -387,6 +388,139 @@ def parse_watchdog_journal(lines: list[str]) -> list[dict[str, Any]]:
     return ticks
 
 
+#: 2026-11-04: journald retains only ~3h of maestro-watchdog ticks on the
+#: production host (SystemMaxUse=512M at ~472M, files rotating every
+#: 20-40 min), while the SLO window is trailing 24h — episodes that
+#: rotated out of the journal were laundered into UNKNOWN "nothing to
+#: measure". collect_all therefore unions the journalctl read with the
+#: durable rolling archive maintained by the native-rails heartbeat
+#: (nrm-watchdog-journal-archive.py) and PROVES window coverage before
+#: any verdict: any gap larger than WATCHDOG_TICK_MAX_GAP_S means
+#: episodes inside the hole are invisible — reported as an explicit
+#: unauditable-window note, never as absence.
+WATCHDOG_TICK_MAX_GAP_S = float(
+    os.environ.get("NRM_WATCHDOG_TICK_MAX_GAP_S", "3600")
+)
+WATCHDOG_WINDOW_S = float(os.environ.get("NRM_WATCHDOG_WINDOW_S", "86400"))
+
+#: benign absence notes that a coverage gap replaces: claiming "nothing
+#: to measure" while the window is unauditable launders evidence loss.
+_BENIGN_ABSENCE_NOTES = (
+    "no parseable watchdog ticks in window",
+    "no stall episodes in window (nothing to measure)",
+    "only transient blips in window (nothing to handle)",
+)
+
+
+def default_watchdog_archive(hermes_root: Path) -> Path:
+    """Durable rolling watchdog-archive path under ``hermes_root``.
+
+    ``NRM_WATCHDOG_ARCHIVE`` overrides (same seam as the native-rails
+    scorecard, nrm_scorecard.WATCHDOG_ARCHIVE).
+    """
+    env = os.environ.get("NRM_WATCHDOG_ARCHIVE")
+    if env:
+        return Path(env)
+    return (
+        hermes_root
+        / "native-rails-migration"
+        / ".backstop-state"
+        / "watchdog-journal-archive"
+        / "ticks.jsonl"
+    )
+
+
+def _read_archive_ticks(
+    path: Path,
+) -> tuple[list[dict[str, Any]] | None, bool]:
+    """Parseable ticks from the durable archive, if any.
+
+    Returns ``(ticks, unreadable)``: ``unreadable=True`` means the archive
+    exists but cannot be read — it contributes nothing and never restores
+    coverage; the caller surfaces the breakage as a note.
+    """
+    if not path.exists():
+        return [], False
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return None, True
+    return parse_watchdog_journal(lines), False
+
+
+def _wd_iso(ts: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+
+
+def _wd_coverage_edges(
+    ticks: list[dict[str, Any]],
+    window_start: float,
+    window_end: float,
+    *,
+    max_gap_s: float = WATCHDOG_TICK_MAX_GAP_S,
+) -> list[str]:
+    """Named coverage edges for a tick list covering [start, end].
+
+    A gap larger than ``max_gap_s`` anywhere — window head (retention
+    rotated the start away), interior (episodes inside a hole are
+    invisible), or tail (the watchdog itself stopped ticking) — leaves
+    the window unauditable.
+    """
+    if not ticks:
+        return [
+            "window start unauditable (no parseable watchdog ticks in "
+            f"the {WATCHDOG_WINDOW_S / 3600:.0f}h window)"
+        ]
+    edges: list[str] = []
+    head_gap = ticks[0]["__ts"] - window_start
+    if head_gap > max_gap_s:
+        edges.append(
+            "window start unauditable (journal head "
+            f"{_wd_iso(ticks[0]['__ts'])}, {head_gap / 3600:.1f}h of the "
+            f"{WATCHDOG_WINDOW_S / 3600:.0f}h window missing)"
+        )
+    interior = 0
+    largest = 0.0
+    prev = ticks[0]["__ts"]
+    for tick in ticks[1:]:
+        gap = tick["__ts"] - prev
+        if gap > max_gap_s:
+            interior += 1
+            largest = max(largest, gap)
+        prev = tick["__ts"]
+    if interior:
+        edges.append(
+            f"interior gap(s): {interior}, largest {largest:.0f}s — "
+            "episodes inside a hole are invisible"
+        )
+    tail_gap = window_end - ticks[-1]["__ts"]
+    if tail_gap > max_gap_s:
+        edges.append(
+            "watchdog not ticking since "
+            f"{_wd_iso(ticks[-1]['__ts'])} ({tail_gap / 3600:.1f}h)"
+        )
+    return edges
+
+
+def _apply_coverage_edges(rec: SloRecord, edges: list[str]) -> SloRecord:
+    """Replace benign absence notes with the honest unauditable verdict.
+
+    A coverage gap can never certify absence; a PASS under an unauditable
+    window is downgraded to UNKNOWN. FAIL stands — detected failures are
+    real regardless of coverage.
+    """
+    rec.notes = [n for n in rec.notes if n not in _BENIGN_ABSENCE_NOTES]
+    rec.notes.extend(edges)
+    rec.notes.append(
+        "window unauditable — cannot certify absence of stalls or "
+        "restarts in the missing span"
+    )
+    if rec.verdict == PASS:
+        rec.verdict = UNKNOWN
+    return rec
+
+
 _ACTIVE_EXECUTION_STATES = frozenset(
     {
         "STARTING",
@@ -557,6 +691,23 @@ def probe_stall_detection(
     timestamps yield UNKNOWN (approximating latency would be gaming).
     Episodes with no action tick count as undetected against both bounds.
     """
+    return probe_stall_detection_ticks(
+        parse_watchdog_journal(journal_lines),
+        journal_source=journal_source,
+    )
+
+
+def probe_stall_detection_ticks(
+    ticks: list[dict[str, Any]],
+    *,
+    journal_source: str = "maestro-watchdog journal",
+) -> SloRecord:
+    """Tick-level core of :func:`probe_stall_detection`.
+
+    ``collect_all`` passes pre-merged ticks (journal + rolling archive,
+    window-filtered); the public line-based API delegates here after
+    parsing, so both entry points share one verdict arithmetic.
+    """
     rec = SloRecord(
         slo_id="stall_detection",
         target=(
@@ -567,7 +718,6 @@ def probe_stall_detection(
         denominator=None,
         sources=[journal_source],
     )
-    ticks = parse_watchdog_journal(journal_lines)
     if not ticks:
         rec.notes.append("no parseable watchdog ticks in window")
         return rec
@@ -657,6 +807,18 @@ def probe_auto_recovery(
     the top level or in the supervisor object, or semantic progress
     resumed)? Denominator = observed restart actions.
     """
+    return probe_auto_recovery_ticks(
+        parse_watchdog_journal(journal_lines),
+        journal_source=journal_source,
+    )
+
+
+def probe_auto_recovery_ticks(
+    ticks: list[dict[str, Any]],
+    *,
+    journal_source: str = "maestro-watchdog journal",
+) -> SloRecord:
+    """Tick-level core of :func:`probe_auto_recovery` (pre-merged ticks)."""
     rec = SloRecord(
         slo_id="auto_recovery",
         target=(
@@ -667,7 +829,6 @@ def probe_auto_recovery(
         denominator=None,
         sources=[journal_source],
     )
-    ticks = parse_watchdog_journal(journal_lines)
     if not ticks:
         rec.notes.append("no parseable watchdog ticks in window")
         return rec
@@ -963,9 +1124,20 @@ def collect_all(
     """Run every probe; returns the full measurement document.
 
     ``journal_reader`` is injectable for tests; default reads journalctl.
+
+    2026-11-04: the journalctl read is UNIONED with the durable rolling
+    watchdog archive (heartbeat-maintained) and window coverage is PROVEN
+    before any verdict — journald retains only ~3h of watchdog ticks on
+    the production host, so a journal-only read over a 24h window was
+    laundering rotated-out episodes into UNKNOWN "nothing to measure"
+    (the founding "never gamed" contract, retention edition). An
+    unauditable window is reported as an explicit coverage edge and can
+    never certify absence; the archive contributes ticks but never
+    fabricates them (unreadable -> contributes nothing, surfaced).
     """
     root = hermes_root or default_hermes_root()
     reader = journal_reader or _read_journal
+    now_ts = now if now is not None else time.time()
     delegations_db = root / "delegations" / "delegations.db"
     missions_db = root / "missions" / "missions.db"
     state_db = root / "state.db"
@@ -996,12 +1168,71 @@ def collect_all(
             )
         )
     else:
-        records.append(probe_stall_detection(lines))
-        records.append(probe_auto_recovery(lines))
+        journal_ticks = parse_watchdog_journal(lines)
+        archive_ticks: list[dict[str, Any]] = []
+        archive_unreadable = False
+        archive_path = default_watchdog_archive(root)
+        at, unreadable = _read_archive_ticks(archive_path)
+        if unreadable:
+            archive_unreadable = True
+        elif at:
+            archive_ticks = at
+        ticks = list(journal_ticks)
+        used_archive = False
+        if archive_ticks:
+            seen = {t["__ts"] for t in ticks}
+            new = [t for t in archive_ticks if t["__ts"] not in seen]
+            if new:
+                ticks.extend(new)
+                ticks.sort(key=lambda t: t["__ts"])
+                used_archive = True
+        window_start = now_ts - WATCHDOG_WINDOW_S
+        window_end = now_ts
+        ticks = [t for t in ticks if t["__ts"] >= window_start]
+        edges = _wd_coverage_edges(ticks, window_start, window_end)
+        journal_source = f"maestro-watchdog journal ({journal_since})"
+        if used_archive:
+            journal_source += f" + rolling archive {archive_path}"
+
+        rec_stall = probe_stall_detection_ticks(
+            ticks, journal_source=journal_source
+        )
+        if archive_unreadable:
+            rec_stall.notes.append(
+                f"watchdog archive unreadable ({archive_path}); "
+                "contributed nothing"
+            )
+        if edges:
+            _apply_coverage_edges(rec_stall, edges)
+            rec_stall.value = dict(rec_stall.value or {})
+            rec_stall.value["coverage_complete"] = False
+            rec_stall.value["coverage_edges"] = edges
+        elif rec_stall.value is not None:
+            rec_stall.value = dict(rec_stall.value)
+            rec_stall.value["coverage_complete"] = True
+        records.append(rec_stall)
+
+        rec_auto = probe_auto_recovery_ticks(
+            ticks, journal_source=journal_source
+        )
+        if archive_unreadable:
+            rec_auto.notes.append(
+                f"watchdog archive unreadable ({archive_path}); "
+                "contributed nothing"
+            )
+        if edges:
+            _apply_coverage_edges(rec_auto, edges)
+            rec_auto.value = dict(rec_auto.value or {})
+            rec_auto.value["coverage_complete"] = False
+            rec_auto.value["coverage_edges"] = "see stall_detection edges"
+        elif rec_auto.value is not None:
+            rec_auto.value = dict(rec_auto.value)
+            rec_auto.value["coverage_complete"] = True
+        records.append(rec_auto)
 
     return {
         "measured_at": time.strftime(
-            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(now if now is not None else time.time())
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_ts)
         ),
         "hermes_root": str(root),
         "journal_window": journal_since,
