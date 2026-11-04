@@ -795,3 +795,213 @@ class TestParseWatchdogJournalOffsetCompat:
         ticks = slo.parse_watchdog_journal([line])
         assert len(ticks) == 1
         assert ticks[0]["api_ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# Regression: journald retention laundering (2026-11-04). journald retains
+# only ~3h of maestro-watchdog ticks on the production host while the SLO
+# window is trailing 24h — a journal-only read over the window reported
+# UNKNOWN "only transient blips (nothing to handle)" while the window's
+# start was physically unauditable, and episodes that rotated out of the
+# journal were invisible. collect_all must (a) union the durable rolling
+# archive so archived episodes count, and (b) PROVE coverage before any
+# verdict: an unauditable window is an explicit coverage edge and can
+# never certify absence.
+# ---------------------------------------------------------------------------
+
+
+class TestWatchdogArchiveUnionCoverage:
+    EP2 = 1793790000.0  # fixed epoch base; collect_all(now=...) pins the window
+
+    def _line(self, offset_s: float, payload: dict | None = None) -> str:
+        import datetime as _dt
+        import json as _json
+
+        t = _dt.datetime.fromtimestamp(
+            self.EP2 + offset_s, tz=_dt.timezone.utc
+        )
+        body = _json.dumps(payload or {"semantic_healthy": True})
+        return f"{t.strftime('%Y-%m-%dT%H:%M:%S+0000')} agent-runner maestro-watchdog[2356306]: {body}"
+
+    def _run(self, tmp_path: Path, journal: list[str], archive: list[str]):
+        import os
+
+        (tmp_path / "ticks.jsonl").write_text("\n".join(archive) + "\n")
+        old = {
+            k: os.environ.get(k)
+            for k in (
+                "NRM_WATCHDOG_ARCHIVE",
+                "NRM_WATCHDOG_TICK_MAX_GAP_S",
+                "NRM_WATCHDOG_WINDOW_S",
+            )
+        }
+        os.environ["NRM_WATCHDOG_ARCHIVE"] = str(tmp_path / "ticks.jsonl")
+        os.environ["NRM_WATCHDOG_TICK_MAX_GAP_S"] = "3600"
+        try:
+            return slo.collect_all(
+                hermes_root=tmp_path,
+                journal_reader=lambda u, s: (journal, None),
+                # fixture offsets span [0, 86400]; anchor `now` at the
+                # window END so offset 0 IS the window start
+                now=self.EP2 + 86400.0,
+            )
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def test_retention_hole_degrades_instead_of_nothing_to_measure(
+        self, tmp_path: Path
+    ) -> None:
+        # Journal retains only the last ~2h of a 24h window; no archive.
+        # The pre-fix harness reported UNKNOWN "only transient blips in
+        # window (nothing to handle)" for exactly this shape.
+        journal = [
+            self._line(float(o))
+            for o in range(79200, 86400, 60)  # last 2h only
+        ]
+        doc = self._run(tmp_path, journal, archive=[])
+        ids = {r["slo_id"]: r for r in doc["records"]}
+        stall = ids["stall_detection"]
+        assert stall["verdict"] == slo.UNKNOWN
+        assert stall["value"]["coverage_complete"] is False
+        assert any(
+            "window start unauditable" in n for n in stall["notes"]
+        ), f"expected coverage edge, notes={stall['notes']}"
+        assert not any(
+            "nothing to handle" in n or "nothing to measure" in n
+            for n in stall["notes"]
+        ), "benign absence note must not survive an unauditable window"
+        auto = ids["auto_recovery"]
+        assert auto["value"]["coverage_complete"] is False
+
+    def test_archive_union_restores_window_and_counts_archived_episode(
+        self, tmp_path: Path
+    ) -> None:
+        # The archive holds the early-window span (incl. a persistent
+        # undetected episode at ~5.2h in) that journald rotated away; the
+        # journal holds only the last 2h. Union must (a) kill the head
+        # gap, (b) count the archived episode, (c) FAIL the SLO honestly
+        # (undetected episode), and (d) record archive provenance.
+        archive = [self._line(0.0)]
+        # healthy ticks each 30min bridging the whole window until the
+        # journal takes over at 22h (no interior hole)
+        for off in range(1800, 79200, 1800):
+            archive.append(self._line(float(off)))
+        # persistent undetected episode at ~5.2h: 3 stall ticks, no action
+        archive.extend(
+            self._line(float(o), {"semantic_healthy": False})
+            for o in (18600, 18720, 18840)
+        )
+        journal = [
+            self._line(float(o)) for o in range(79200, 86400, 600)
+        ]  # last 2h, healthy
+        doc = self._run(tmp_path, journal, archive=archive)
+        ids = {r["slo_id"]: r for r in doc["records"]}
+        stall = ids["stall_detection"]
+        # union closed the head gap: coverage complete, episode measured
+        assert stall["value"]["coverage_complete"] is True
+        assert stall["value"]["persistent_episodes"] == 1
+        assert stall["value"]["undetected"] == 1
+        assert stall["verdict"] == slo.FAIL, (
+            "an archived undetected persistent episode must FAIL the SLO — "
+            "rotation must not launder it away"
+        )
+        assert any("rolling archive" in s for s in stall["sources"])
+
+    def test_full_coverage_journal_only_still_clean(self, tmp_path: Path):
+        # A fully-covered window from the journal alone (no archive file)
+        # keeps its normal verdict and reports coverage_complete True.
+        journal = [
+            self._line(float(o)) for o in range(0, 86400, 1800)
+        ]
+        doc = self._run(tmp_path, journal, archive=[])
+        ids = {r["slo_id"]: r for r in doc["records"]}
+        stall = ids["stall_detection"]
+        assert stall["value"]["coverage_complete"] is True
+        # pre-existing zero-episode value shape keeps its "episodes" key
+        assert stall["value"]["episodes"] == 0
+        # verdict stays the honest UNKNOWN-nothing-to-measure ONLY when
+        # coverage is proven complete
+        assert any(
+            "nothing to measure" in n or "nothing to handle" in n
+            for n in stall["notes"]
+        )
+        assert stall["verdict"] == slo.UNKNOWN
+
+    def test_unreadable_archive_contributes_nothing_but_is_surfaced(
+        self, tmp_path: Path
+    ) -> None:
+        # Journal covers only the tail; the archive exists but is a
+        # directory (unreadable): coverage must stay degraded and the
+        # breakage surfaced — an unreadable archive never restores
+        # coverage nor crashes the probe.
+        journal = [
+            self._line(float(o)) for o in range(79200, 86400, 600)
+        ]
+        import os
+
+        (tmp_path / "ticks.jsonl").mkdir()
+        old = {
+            k: os.environ.get(k)
+            for k in ("NRM_WATCHDOG_ARCHIVE",)
+        }
+        os.environ["NRM_WATCHDOG_ARCHIVE"] = str(tmp_path / "ticks.jsonl")
+        try:
+            doc = slo.collect_all(
+                hermes_root=tmp_path,
+                journal_reader=lambda u, s: (journal, None),
+                now=self.EP2 + 86400.0,
+            )
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        ids = {r["slo_id"]: r for r in doc["records"]}
+        stall = ids["stall_detection"]
+        assert stall["value"]["coverage_complete"] is False
+        assert any("unreadable" in n for n in stall["notes"])
+
+    def test_interior_gap_is_an_edge_even_with_archive(self, tmp_path):
+        # Archive + journal both present but leave an interior hole
+        # (archive stops at 4h, journal starts at 22h): episodes inside
+        # the hole are invisible — an explicit interior-gap edge.
+        archive = [self._line(float(o)) for o in range(0, 14400, 1800)]
+        journal = [self._line(float(o)) for o in range(79200, 86400, 600)]
+        doc = self._run(tmp_path, journal, archive=archive)
+        ids = {r["slo_id"]: r for r in doc["records"]}
+        stall = ids["stall_detection"]
+        assert stall["value"]["coverage_complete"] is False
+        assert any("interior gap" in n for n in stall["notes"])
+        assert not any(
+            "nothing to handle" in n or "nothing to measure" in n
+            for n in stall["notes"]
+        )
+
+    def test_coverage_gap_downgrades_pass_to_unknown(self, tmp_path: Path):
+        # last 1h only, healthy, with one fast-detected stall episode
+        # (2 stall ticks, restart at +200s) — a PASS shape that must be
+        # downgraded because the window's head is unauditable.
+        journal = [
+            self._line(82800.0),
+            self._line(83400.0, {"semantic_healthy": False}),
+            self._line(
+                83600.0, {"semantic_healthy": False, "restarted": True}
+            ),
+            self._line(84000.0),
+            self._line(84600.0),
+            self._line(85200.0),
+            self._line(85800.0),
+        ]
+        doc = self._run(tmp_path, journal, archive=[])
+        ids = {r["slo_id"]: r for r in doc["records"]}
+        stall = ids["stall_detection"]
+        assert stall["value"]["persistent_episodes"] == 1
+        assert stall["value"]["within_5m"] == 1
+        assert stall["verdict"] == slo.UNKNOWN, (
+            "PASS under an unauditable window launders the missing span"
+        )
