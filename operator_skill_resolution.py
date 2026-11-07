@@ -13,7 +13,8 @@ Authority model (review follow-up):
   ``build_preloaded_skills_prompt`` uses), fresh on every call with no
   discovery-cache TTL. Preprocessing is disabled so a validation probe
   cannot execute ``skills.inline_shell`` snippets.
-- The cross-profile catalog (``_find_all_skills`` + plugin skill metadata)
+- The cross-profile catalog (``find_all_skills`` + plugin skill metadata,
+  with ``_find_all_skills`` compatibility for older Agents)
   is provenance/diagnostics only: it classifies a rejection as
   ``skill_not_found`` vs ``skill_not_resolvable_for_profile`` and reports
   ``available_profiles``. It never overrules an explicit-load probe.
@@ -38,7 +39,6 @@ from pathlib import Path
 from typing import Any
 
 import operator_policy as op
-from operator_profile_scope import profile_override_scope
 
 
 @dataclass(frozen=True)
@@ -151,6 +151,15 @@ def _agent_root_candidates() -> list[Path]:
     return unique
 
 
+def _catalog_loader(skills_tool: Any) -> Callable[[], Any]:
+    """Prefer the Agent's public catalog API, retaining the legacy contract."""
+    for name in ("find_all_skills", "_find_all_skills"):
+        loader = getattr(skills_tool, name, None)
+        if callable(loader):
+            return loader
+    raise _LoaderUnavailable("Hermes Agent skill catalog API is unavailable")
+
+
 def _require_agent_modules() -> tuple[Any, Any]:
     """Return ``(skills_tool, hermes_constants)`` or raise _LoaderUnavailable."""
     last_error: Exception | None = None
@@ -173,8 +182,10 @@ def _require_agent_modules() -> tuple[Any, Any]:
         try:
             skills_tool = importlib.import_module("tools.skills_tool")
             constants = importlib.import_module("hermes_constants")
-            if _find_all_skills_fn(skills_tool) is not None:
-                return skills_tool, constants
+            _catalog_loader(skills_tool)
+            if not callable(getattr(skills_tool, "skill_view", None)):
+                raise _LoaderUnavailable("Hermes Agent explicit skill loader is unavailable")
+            return skills_tool, constants
         except Exception as exc:  # noqa: BLE001 - optional Agent runtime
             last_error = exc
             continue
@@ -182,22 +193,6 @@ def _require_agent_modules() -> tuple[Any, Any]:
         "Hermes Agent loader is unavailable; refusing to validate skills"
         + (f": {last_error}" if last_error is not None else "")
     )
-
-
-def _find_all_skills_fn(skills_tool: Any) -> Any:
-    """Resolve the catalog entrypoint across Agent generations.
-
-    Upstream renamed the private ``_find_all_skills`` to the public
-    ``find_all_skills`` (same keyword-only ``skip_disabled`` contract); older
-    forks still ship only the private name. Accept either so the loader
-    tracks Agent updates without a fork-side chase (item 327: the
-    agent-loader CI lane installs upstream HEAD and broke on the rename).
-    """
-    for name in ("find_all_skills", "_find_all_skills"):
-        fn = getattr(skills_tool, name, None)
-        if callable(fn):
-            return fn
-    return None
 
 
 def _agent_modules() -> tuple[Any, Any] | None:
@@ -210,16 +205,16 @@ def _agent_modules() -> tuple[Any, Any] | None:
 
 @contextmanager
 def _profile_scope(profile_home: Path, constants: Any):
-    """Scope one call to a profile home under the shared rm-207 profile gate.
-
-    The Agent override is process-global, so concurrent Operator tool calls
-    for different profiles must not hold windows at the same time; the gate
-    in ``operator_profile_scope`` serializes conflicting homes while allowing
-    same-home overlap. Degrades to a plain no-op scope exactly as before when
-    the constants module lacks the override pair.
-    """
-    with profile_override_scope(profile_home, constants):
+    setter = getattr(constants, "set_hermes_home_override", None)
+    resetter = getattr(constants, "reset_hermes_home_override", None)
+    if not callable(setter) or not callable(resetter):
         yield
+        return
+    token = setter(profile_home)
+    try:
+        yield
+    finally:
+        resetter(token)
 
 
 def _plugin_entries(skills_tool: Any) -> list[dict[str, Any]]:
@@ -270,7 +265,7 @@ def _discovery_entries(profile: str, hermes_root: Path) -> list[dict[str, Any]]:
     profile_home = op.resolve_profile_home(profile, hermes_root)
     try:
         with _profile_scope(profile_home, constants):
-            raw = _find_all_skills_fn(skills_tool)()
+            raw = _catalog_loader(skills_tool)()
             plugin_raw = _plugin_entries(skills_tool)
     except Exception as exc:
         raise _LoaderUnavailable(
