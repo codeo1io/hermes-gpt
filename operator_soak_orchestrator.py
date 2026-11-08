@@ -422,6 +422,51 @@ def _window_counts(ticks_path: Path, window_start: float) -> dict[str, int]:
     return counts
 
 
+# ---------------------------------------------------------------------------
+# Probe verdict classification (vacuous-vs-gap UNKNOWN split, 2026-11-08)
+# ---------------------------------------------------------------------------
+
+#: SLOs whose UNKNOWN can be a measured-zero ("nothing to measure") verdict
+#: rather than missing evidence. A zero-episode window with PROVEN coverage
+#: (``coverage_complete`` True) is a measured clean outcome: the watchdog
+#: observed the whole span and no stall/restart crossed the bar. The founding
+#: directive's "never gamed" contract forbids fabricating a denominator, not
+#: crediting a proven-zero one; a coverage gap keeps the verdict UNKNOWN and
+#: keeps withholding promotion (unchanged).
+_VACUOUS_OK_SLO_IDS = frozenset({"stall_detection", "auto_recovery"})
+
+
+def _vacuous_unknown_ids(doc: dict[str, Any] | None) -> list[str]:
+    """UNKNOWN records that are measured-zero over a fully-audited window.
+
+    Eligible only for stall_detection/auto_recovery: their denominators
+    (persistent episodes / restart actions) are legitimately zero in a
+    healthy window, and the probe union (journal + rolling archive) PROVED
+    the window fully covered (``coverage_complete`` True). Any other
+    UNKNOWN — an unreadable source, a missing store, a coverage gap — is
+    not vacuous and never verifies a window.
+    """
+    out: list[str] = []
+    for rec in (doc or {}).get("records", []):
+        if rec.get("verdict") != slo.UNKNOWN:
+            continue
+        if rec.get("slo_id") not in _VACUOUS_OK_SLO_IDS:
+            continue
+        val = rec.get("value") or {}
+        if val.get("coverage_complete") is not True:
+            continue
+        if rec["slo_id"] == "stall_detection":
+            measured_zero = (
+                val.get("persistent_episodes") == 0
+                and val.get("episodes", 0) == 0
+            )
+        else:  # auto_recovery
+            measured_zero = val.get("restarts") == 0
+        if measured_zero:
+            out.append(rec["slo_id"])
+    return out
+
+
 def run_soak_tick(
     store: SoakStore,
     *,
@@ -483,6 +528,17 @@ def run_soak_tick(
             probe_verdict = slo.PASS
         # else: UNKNOWN — fail-closed, reported not gamed
 
+    # Vacuous-vs-gap split (2026-11-08): an UNKNOWN that is a measured-zero
+    # over a PROVEN fully-audited window (zero stall episodes / zero restart
+    # actions with coverage_complete=True) verifies the window as clean —
+    # the healthy steady state must be promotable, not deadlocked. Any other
+    # UNKNOWN (coverage gap, unreadable source, missing store) still
+    # withholds promotion exactly as before.
+    vacuous_ids = _vacuous_unknown_ids(doc)
+    unknown_ids = (doc or {}).get("summary", {}).get("unknown_ids", [])
+    gap_unknown_ids = [i for i in unknown_ids if i not in vacuous_ids]
+    probe_unknown_gaps = probe_verdict == slo.UNKNOWN and bool(gap_unknown_ids)
+
     counts = _window_counts(store.ticks_path, window_start)
     counts["violations"] += violations
 
@@ -495,7 +551,7 @@ def run_soak_tick(
         fail_count=counts["probe_fails"] + (1 if probe_verdict == slo.FAIL else 0),
         violation_count=counts["violations"],
         probe_failed_now=probe_verdict == slo.FAIL,
-        probe_unknown_now=probe_verdict == slo.UNKNOWN,
+        probe_unknown_now=probe_unknown_gaps,
     )
 
     # --- transition --------------------------------------------------------
@@ -508,6 +564,8 @@ def run_soak_tick(
         "probe_error": probe_error,
         "probe_fail_ids": (doc or {}).get("summary", {}).get("failed_ids", []),
         "probe_unknown_ids": (doc or {}).get("summary", {}).get("unknown_ids", []),
+        "probe_vacuous_ids": vacuous_ids,
+        "probe_gap_unknown_ids": gap_unknown_ids,
         "violations": violations,
         "action": action,
         "to_stage": decision.get("to_stage"),
