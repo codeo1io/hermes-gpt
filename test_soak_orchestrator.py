@@ -324,6 +324,110 @@ def test_tick_unknown_withholds_promotion(store):
     assert store.load_state()["stage"] == "A"
 
 
+def vacuous_unknown_doc() -> dict:
+    """UNKNOWNs that are measured-zero over PROVEN-complete coverage.
+
+    stall_detection: 0 episodes + coverage_complete True; auto_recovery:
+    0 restarts + coverage_complete True. Everything else PASSes. This is
+    the healthy steady state the soak must be able to promote through
+    (2026-11-08 stage-A deadlock: resets 1115, promotions 0).
+    """
+    return {
+        "summary": {"pass": 6, "fail": 0, "unknown": 2,
+                    "failed_ids": [],
+                    "unknown_ids": ["stall_detection", "auto_recovery"]},
+        "records": [
+            {"slo_id": "false_success", "verdict": "PASS"},
+            {"slo_id": "duplicate_dispatch", "verdict": "PASS"},
+            {"slo_id": "double_claim", "verdict": "PASS"},
+            {"slo_id": "routine_completion", "verdict": "PASS"},
+            {"slo_id": "continuity", "verdict": "PASS"},
+            {"slo_id": "disk_free", "verdict": "PASS"},
+            {"slo_id": "stall_detection", "verdict": "UNKNOWN",
+             "value": {"persistent_episodes": 0, "episodes": 0,
+                       "coverage_complete": True}},
+            {"slo_id": "auto_recovery", "verdict": "UNKNOWN",
+             "value": {"restarts": 0, "coverage_complete": True}},
+        ],
+    }
+
+
+def gap_unknown_doc() -> dict:
+    """UNKNOWN from an unauditable window: coverage_complete False."""
+    return {
+        "summary": {"pass": 6, "fail": 0, "unknown": 2,
+                    "failed_ids": [],
+                    "unknown_ids": ["stall_detection", "auto_recovery"]},
+        "records": [
+            {"slo_id": "stall_detection", "verdict": "UNKNOWN",
+             "value": {"persistent_episodes": 0, "episodes": 0,
+                       "coverage_complete": False,
+                       "coverage_edges": ["interior gap(s): 1"]}},
+            {"slo_id": "auto_recovery", "verdict": "UNKNOWN",
+             "value": {"restarts": 0, "coverage_complete": False}},
+        ],
+    }
+
+
+def test_tick_vacuous_unknown_promotes_on_full_window(store):
+    # measured-zero over proven coverage verifies the window: the healthy
+    # steady state (no stalls, no restarts, fully audited) promotes.
+    started(store, now=0.0, window_s=100.0)
+    r = soak.run_soak_tick(store, now=100.0, probe_runner=vacuous_unknown_doc)
+    assert r["probe_verdict"] == slo.UNKNOWN  # reported, never gamed
+    assert r["tick"]["probe_vacuous_ids"] == ["stall_detection", "auto_recovery"]
+    assert r["tick"]["probe_gap_unknown_ids"] == []
+    assert r["action"] == "promote", r["reason"]
+    assert r["to_stage"] == "B"
+    assert store.load_state()["stage"] == "B"
+    assert store.load_state()["promotions"] == 1
+
+
+def test_tick_gap_unknown_still_withholds_promotion(store):
+    # a coverage-gap UNKNOWN (episodes invisible inside a hole) keeps
+    # withholding promotion — an unverified window is not observed-clean.
+    started(store, now=0.0, window_s=100.0)
+    r = soak.run_soak_tick(store, now=100.0, probe_runner=gap_unknown_doc)
+    assert r["probe_verdict"] == slo.UNKNOWN
+    assert r["tick"]["probe_vacuous_ids"] == []
+    assert r["tick"]["probe_gap_unknown_ids"] == ["stall_detection", "auto_recovery"]
+    assert r["action"] == "hold", r["reason"]
+    assert "UNKNOWN" in r["reason"]
+    assert store.load_state()["stage"] == "A"
+    assert store.load_state().get("promotions", 0) == 0
+
+
+def test_tick_vacuous_unknown_mid_window_holds(store):
+    # before the full window elapses the same vacuous doc just holds.
+    started(store, now=0.0, window_s=100.0)
+    r = soak.run_soak_tick(store, now=50.0, probe_runner=vacuous_unknown_doc)
+    assert r["action"] == "hold"
+    assert "remaining" in r["reason"]
+
+
+def test_vacuous_classification_requires_proven_zero(store):
+    # an UNKNOWN with episodes/restarts > 0 but no action is NOT vacuous
+    # (undetected stall — but coverage proven, so the probe itself would
+    # FAIL; this pins the classifier against misreading a nonzero shape).
+    doc = {
+        "summary": {"pass": 6, "fail": 1, "unknown": 1,
+                    "failed_ids": ["stall_detection"],
+                    "unknown_ids": ["auto_recovery"]},
+        "records": [
+            {"slo_id": "stall_detection", "verdict": "FAIL",
+             "value": {"persistent_episodes": 2, "undetected": 2,
+                       "coverage_complete": True}},
+            {"slo_id": "auto_recovery", "verdict": "UNKNOWN",
+             "value": {"restarts": 0, "coverage_complete": True}},
+        ],
+    }
+    assert soak._vacuous_unknown_ids(doc) == ["auto_recovery"]
+    started(store, now=0.0, window_s=100.0)
+    r = soak.run_soak_tick(store, now=10.0, probe_runner=lambda: doc)
+    # a FAIL dominates: reset, never promote
+    assert r["action"] == "reset"
+
+
 def test_tick_violation_resets_canary(store):
     started(store, now=0.0, window_s=1000.0)
     r = soak.run_soak_tick(store, now=10.0, probe_runner=pass_doc,
