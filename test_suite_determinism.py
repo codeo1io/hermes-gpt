@@ -51,6 +51,12 @@ _EXPECTED_SKIPIF_COUNTS = {
     # imsg/hermes-send are POSIX in practice) — platform condition, upstream
     # test_operator_attention_delivery.py:51.
     "test_operator_attention_delivery.py": 1,
+    # v0.18.0 adoption: upstream's agent-readiness probes are POSIX-only
+    # (process-group pipe inheritance, detached descendant + named-pipe
+    # fixtures, /proc-style metadata roots) and Windows symlink permissions
+    # differ — platform conditions on 4 tests in upstream
+    # test_operator_agent_readiness.py:82/94/242/256.
+    "test_operator_agent_readiness.py": 4,
 }
 
 _SKIP_PATTERN = re.compile(r"\bskipif\b")
