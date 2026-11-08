@@ -83,7 +83,11 @@ _SURFACE_DICT_FNS: dict[str, Callable[..., dict[str, Any]]] = {
 _REVIEW_RECORD_LIMIT = 200
 # Max workflow rows surfaced in the contracts list read-model.
 _CONTRACT_WORKFLOW_LIMIT = 50
-_agent_root_provider: Callable[[], Any] = lambda: None
+def _agent_root_provider_default() -> None:
+    return None
+
+
+_agent_root_provider: Callable[[], Any] = _agent_root_provider_default
 
 
 def set_agent_root_provider(provider: Callable[[], Any]) -> None:

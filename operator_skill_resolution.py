@@ -160,6 +160,20 @@ def _catalog_loader(skills_tool: Any) -> Callable[[], Any]:
     raise _LoaderUnavailable("Hermes Agent skill catalog API is unavailable")
 
 
+def _find_all_skills_fn(skills_tool: Any) -> Any:
+    """Back-compat alias for the fork's item-327 renamed-entrypoint probe.
+
+    Upstream v0.18.0 call sites use ``_catalog_loader`` directly (fail-closed
+    raise); this None-on-miss wrapper is retained so the fork's regression
+    test (agent-loader lane, upstream rename ``_find_all_skills`` ->
+    ``find_all_skills``) keeps its original contract.
+    """
+    try:
+        return _catalog_loader(skills_tool)
+    except _LoaderUnavailable:
+        return None
+
+
 def _require_agent_modules() -> tuple[Any, Any]:
     """Return ``(skills_tool, hermes_constants)`` or raise _LoaderUnavailable."""
     last_error: Exception | None = None

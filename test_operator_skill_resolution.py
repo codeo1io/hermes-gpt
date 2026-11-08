@@ -150,7 +150,9 @@ def test_public_catalog_preferred_without_calling_legacy():
     def legacy():
         pytest.fail("legacy catalog must not be called when public API is callable")
 
-    public = lambda: [{"name": "public"}]
+    def public():
+        return [{"name": "public"}]
+
     tool = SimpleNamespace(find_all_skills=public, _find_all_skills=legacy)
     assert resolution._catalog_loader(tool) is public
 
