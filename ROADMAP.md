@@ -14,14 +14,9 @@
 ## Open items
 
 ### Adopt upstream skill-loader hardening trio (upstream issue #74 full half)
-- id: `rm-081` | track: reliability | priority: 115.0 | status: candidate
+- id: `rm-081` | track: reliability | priority: 115.0 | status: in_progress
 - acceptance: merged tree reconciles fork+upstream halves into a single resolution authority; loader failure is fail-closed with a test proving a required-but-unloadable skill blocks dispatch; probes use preprocess=False with a test asserting inline_shell side effects never run during validation; fork surfaces (plan create/validate/placement) keep enforcement at parity with upstream's breadth (work contracts/swarm); full suite + upstream's new tests green on both SDK lanes
-- evidence: campaign-recorded in hermes-gpt ROADMAP.md
-
-### Adopt upstream v0.13 Autopilot (9-commit gap; PR #82)
-- id: `rm-098` | track: reliability | priority: 115.0 | status: candidate
-- acceptance: the 9 upstream commits merge or cherry-pick onto the fork line with conflicts reviewed line-by-line against fork invariants (Owner Mode break-glass, secret-path denials, default read-only; Autopilot stays default-off at adoption); full suite green in CI shape; CHANGELOG records the catch-up; #83/#84 recorded as follow-on once merged upstream
-- evidence: campaign-recorded in hermes-gpt ROADMAP.md
+- evidence: partial (2026-11-08): upstream half landed via the v0.18.0 adoption (canonical PR #85, all checks green with the fork rider shim and rider test present); preprocess=False probe operator_skill_resolution.py:317-346; fail-closed tests test_operator_skill_resolution.py:196/:274; plan-surface parity operator_mission_plan.py:605-619,:821,:972; CHANGELOG 0.18.0 find_all_skills bullet. Residual: on run lineage HEAD 1a64767df3 the item-327 rider regression test is red (test_operator_skill_resolution.py:432 AttributeError _find_all_skills_fn — this lineage's merge took upstream's rider-less module copy; canonical master 768c1b2807 carries the wrapper)
 
 ### Move blocking SQLite off the serving event loop (ui_chat + live-events WS)
 - id: `rm-076` | track: reliability | priority: 110.0 | status: in_progress
@@ -68,7 +63,7 @@
 ### Python floor bump 3.10->3.11 plus a 3.13 CI lane (dated deadline)
 - id: `rm-100` | track: reliability | priority: 75.0 | status: candidate
 - acceptance: CI matrix adds a green 3.13 lane (and 3.14 if deps allow); a dated plan lands the 3.11 floor bump with the next fork release (requires-python >=3.11, matrix drops 3.10, tomli conditional removed); CHANGELOG records both
-- evidence: campaign-recorded in hermes-gpt ROADMAP.md
+- evidence: verified 2026-11-08 nothing landed: test matrix still 3.10/3.11/3.12 (ci.yml:46); no 3.13 lane (compatibility job pins 3.14 at ci.yml:153 but is SKIPPED on PRs, per PR #85 rollup); requires-python stays >=3.10 with the tomli conditional (pyproject:10,:22); no dated floor-bump plan located
 
 ### cron next-fire + timezone preview at arm time
 - id: `rm-132` | track: reliability | priority: 72.0 | status: in_progress
@@ -78,7 +73,7 @@
 ### MCP spec-revision lineage refresh + SDK 2.3.x lane
 - id: `rm-048` | track: reliability | priority: 70.0 | status: in_progress
 - acceptance: docs/mcp-compatibility.md corrected to describe the revision lineage per SDK family instead of claiming one "latest"; the rm-009 revision assertion parameterized per installed SDK pin (still fails loudly on unexpected revisions); a mcp==2.3.x lane added to CI (or pins refreshed per rm-009's cadence rule) with a spec-delta review note for hermes surfaces; MCP-Auth cross-RFC notes (RFC 9728/9700 now Proposed Standard, draft-ietf-oauth-parallel-refresh adopted) reflected in docs/oauth.md where they touch hermes behavior
-- evidence: campaign-recorded in hermes-gpt ROADMAP.md
+- evidence: partial (2026-11-08): CI pins SDK lanes mcp 1.28.1/1.30.0/2.0.0/2.2.0 (ci.yml:59) — no 2.3.x lane; docs/mcp-compatibility.md:11-14 already separates SDK package version from negotiated revision; docs/oauth.md has no RFC 9728/9700/parallel-refresh notes (grep zero hits 2026-11-08)
 
 ### Ship or document a browser-UI build path (web assets absent from wheel/MANIFEST)
 - id: `rm-077` | track: reliability | priority: 70.0 | status: candidate
@@ -88,7 +83,7 @@
 ### fork distribution identity: local version segments or never-publish
 - id: `rm-133` | track: reliability | priority: 68.0 | status: candidate
 - acceptance: decision recorded FIRST — (a) local version segment (e.g. 0.12.0+codeo1io or +<line-tag>) on fork releases, or (b) explicit never-publish-on-PyPI policy with a private index — in RELEASE_CHECKLIST.md + README; artifact metadata carries line provenance (commit or origin URL) so pip + doctor distinguish codebases; doctor VERSION line gains the line identity (extends operator_diagnostics.py:904); decision + implementation land BEFORE any 0.13-numbered fork release.
-- evidence: campaign-recorded in hermes-gpt ROADMAP.md
+- evidence: verified 2026-11-08: decision still unrecorded (RELEASE_CHECKLIST.md carries channel-verification rules only); the hazard is now live — fork pyproject carries version 0.18.0 identical to upstream's published PyPI 0.18.0 while the published wheel/sdist omit all 8 fork-only modules (operator_campaign_compiler/controller/lane, operator_work_class, operator_hermes_agent_runner, operator_profile_scope, operator_slo_probe, operator_soak_orchestrator; reproducible by diffing the published 0.18.0 wheel member list against pyproject py-modules)
 
 ### Extend skill validation to Work Contract and Swarm dispatch (hermetic #76 semantics)
 - id: `rm-054` | track: reliability | priority: 65.0 | status: candidate
@@ -108,7 +103,7 @@
 ### Raise build floor to setuptools>=77 (PEP 639 license string)
 - id: `rm-027` | track: reliability | priority: 62.0 | status: in_progress
 - acceptance: floor raised to >=77 (or license switched to table form) so declared-floor builds work; sdist+wheel build verified in a --no-isolation environment; no behavior change to isolated CI builds
-- evidence: campaign-recorded in hermes-gpt ROADMAP.md
+- evidence: partial (2026-11-08): build floor setuptools>=77 present (pyproject:2); residual: --no-isolation build verification and a CHANGELOG record (grep finds no setuptools entry)
 
 ### Ship-or-de-reference README-referenced docs; add a shipped-docs guard test
 - id: `rm-046` | track: reliability | priority: 60.0 | status: in_progress
@@ -125,11 +120,6 @@
 - acceptance: provenance-capture doctor check (or deploy-time record) captures the serving process's self-reported version + working-tree state (commit, dirty flag, branch) into a durable operator-visible record; a release/ops rule BLOCKS promoting a build whose live checkout carries uncommitted deltas (or forces an explicit override with the delta recorded); docs/runtime-checkout.md refreshed or re-labeled per AGENTS.md rules as part of the fix.
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
 
-### Correct hermes_mission_usage _24h keys — they previously reported all-time totals
-- id: `rm-152` | track: reliability | priority: 60.0 | status: in_progress
-- acceptance: usage rows joined/filtered by sessions.started_at >= cutoff with the schema-drift fallback the intent comment describes (missing started_at -> fail loud or explicitly-degraded output, never silently all-time); a new test with a stale pre-cutoff usage row asserted EXCLUDED from _24h sums; the baked test updated to a two-window fixture; full test_operator_mission.py green
-- evidence: campaign-recorded in hermes-gpt ROADMAP.md
-
 ### declare the browser-UI agent-runtime cross-project seam
 - id: `rm-136` | track: reliability | priority: 58.0 | status: candidate
 - acceptance: the seam is DECLARED — vendored/stubbed interfaces behind an explicit boundary module, OR a documented contract (which external tree provides them, at what version) + an import-contract test that runs on the clean checkout and fails LOUDLY (never silent IMPORT_UNAVAILABLE) when the declared provider is missing; pyproject/docs name the external requirement; if a degradation path is kept, it is visible in doctor.
@@ -138,17 +128,12 @@
 ### Branch protection on codeo1io master (extends rm-008 with red-master evidence)
 - id: `rm-038` | track: reliability | priority: 55.0 | status: candidate
 - acceptance: master branch protection requires the CI test+lint jobs with linear history; direct pushes restricted to admins; a red push/PR is observed to be rejected once
-- evidence: campaign-recorded in hermes-gpt ROADMAP.md
+- evidence: verified 2026-11-08: gh api repos/codeo1io/hermes-gpt/branches/master/protection returns 404 "Branch not protected" — master is unprotected (PR #85 merged 2026-11-08 without protection); not started
 
 ### Bound pyyaml (the last bare runtime dependency)
 - id: `rm-040` | track: reliability | priority: 55.0 | status: in_progress
 - acceptance: pyproject pins `pyyaml>=6,<7`; CI installs the bounded range green; cap moves become deliberate changelog events (rm-023 policy)
-- evidence: campaign-recorded in hermes-gpt ROADMAP.md
-
-### Stop .gitignore '*.ps1' from swallowing new example scripts
-- id: `rm-047` | track: reliability | priority: 55.0 | status: in_progress
-- acceptance: negation rule added; `git check-ignore examples/foo.example.ps1` exits 1 post-fix; tracked example set unchanged (`git ls-files examples/` identical); packaging still ships them
-- evidence: campaign-recorded in hermes-gpt ROADMAP.md
+- evidence: partial (2026-11-08): pyyaml>=6.0.3,<7 pinned in pyproject dependencies; CI installs the bounded range green (PR #85 test lanes SUCCESS); CHANGELOG records only the 0.11.0-era promotion to runtime dependency (CHANGELOG.md:135), not the bound event
 
 ### PyPI vs repo version drift guard
 - id: `rm-052` | track: reliability | priority: 55.0 | status: in_progress
@@ -168,7 +153,7 @@
 ### Declare starlette and anyio as direct dependencies
 - id: `rm-099` | track: reliability | priority: 55.0 | status: in_progress
 - acceptance: pyproject declares starlette and anyio with bounds consistent with the resolved floor (e.g. starlette>=0.40,<2; anyio>=4,<5) and a comment naming mcp[cli] as the existing transitive source; CI installs green on the declared range; the declaration introduces no version drift (resolver output unchanged before/after)
-- evidence: campaign-recorded in hermes-gpt ROADMAP.md
+- evidence: partial (2026-11-08): starlette>=0.40,<2 and anyio>=4,<5 declared in pyproject dependencies with the direct-import rationale comment (comment cites rm-099); CI green on the declared range (PR #85); no CHANGELOG record located
 
 ### Document the convergence-shipped OAuth surface and repair the CHANGELOG
 - id: `rm-034` | track: reliability | priority: 52.0 | status: candidate
@@ -225,16 +210,11 @@
 ### Harden token/key file staging beyond chmod-after-write
 - id: `rm-153` | track: reliability | priority: 45.0 | status: in_progress
 - acceptance: every staged secret file created with restrictive mode AT creation under a unique-adjacent name (in-repo precedent operator_cron.py / operator_workspace.py / operator_job_supervisor.py) or O_EXCL; secrets dirs mkdir with explicit 0o700; fsync of key material before the atomic replace; a umask-0 test asserting final file AND dir modes are 0600/0700; a two-writer test asserting no interleaved or lost staging writes; the token DB reaches 0600 with no observable window (or documents why it cannot)
-- evidence: campaign-recorded in hermes-gpt ROADMAP.md
+- evidence: verified 2026-11-08: token_store.py still chmod-after-write (:129,:167,:245,:379); oauth_auth.py has no O_EXCL/mkstemp/0o700-at-creation staging; the in-repo precedent sites operator_cron.py:433, operator_workspace.py:61, operator_autopilot.py:204 are uniquified
 
 ### cron NL-grammar edges: plural weekdays + property-based invariant lane
 - id: `rm-138` | track: reliability | priority: 44.0 | status: in_progress
 - acceptance: plural weekday names accepted (or a targeted error naming the singular form); a hypothesis property-based lane in the dev group (declaration comment naming the transitive source per the rm-099 rule) pins the four invariants with a fixed seed for deterministic CI; zero-minute floor coverage rides rm-057.
-- evidence: campaign-recorded in hermes-gpt ROADMAP.md
-
-### Updater must verify it found a hermes-gpt checkout before fast-forwarding
-- id: `rm-042` | track: reliability | priority: 42.0 | status: in_progress
-- acceptance: candidate roots are verified as hermes-gpt checkouts (pyproject name / package marker / remote URL) with a loud refusal otherwise; regression test using a foreign git-root fixture
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
 
 ### Single peer_main: dedupe the dead entry point and test the packaged peer CLI
@@ -245,7 +225,7 @@
 ### Retire fixed-name '.tmp' staging across operator write paths
 - id: `rm-154` | track: reliability | priority: 40.0 | status: in_progress
 - acceptance: every staging site uses a unique-adjacent temp name (pid+token or mkstemp) created with restrictive mode and atomically replaced; a repo-wide guard test fails on any NEW fixed-name staging path (scan '.tmp' literals constructed without a uniquifier, mirroring the census command `rg -n "\.tmp" --glob '*.py' -g '!test_*'`); the touched files' existing tests stay green; no behavior change beyond the name
-- evidence: campaign-recorded in hermes-gpt ROADMAP.md
+- evidence: census 2026-11-08: fixed-name '.tmp' staging remains at operator_swarm.py:565, operator_config.py:333/:443/:620, operator_codex.py:57/:92, operator_session.py:68, operator_campaign_lane.py:104, operator_soak_orchestrator.py:309; no guard test exists; operator_cron.py:433, operator_workspace.py:61, operator_autopilot.py:204 already use unique-adjacent names
 
 ### Profile-aware skill-resolution gate before placement/dispatch
 - id: `rm-041` | track: reliability | priority: 38.0 | status: in_progress
@@ -315,12 +295,7 @@
 ### Reconcile divergent vercel.json configs
 - id: `rm-045` | track: reliability | priority: 15.0 | status: in_progress
 - acceptance: one authoritative config kept (the other deleted or its role documented in the docs/README.md authority map); deploy shape verified once
-- evidence: campaign-recorded in hermes-gpt ROADMAP.md
-
-### Remove or wire the unused dompurify web dependencies
-- id: `rm-044` | track: reliability | priority: 12.0 | status: in_progress
-- acceptance: dependencies removed (clean install + green web build) or sanitization genuinely wired with a test proving raw HTML is stripped
-- evidence: campaign-recorded in hermes-gpt ROADMAP.md
+- evidence: partial (2026-11-08): web/vercel.json deleted — a single root vercel.json remains; residual: a docs/README.md authority-map row (no vercel mention today) and one deploy-shape verification record
 
 ## Closed items
 
@@ -344,5 +319,10 @@
 - `rm-032` MCP 2026-07-28 minor-spec adoption and SDK-3.0 proofing — superseded
 - `rm-033` Bound pyyaml (last bare runtime dependency) — superseded
 - `rm-155` Refresh stale top-level documentation — done
+- `rm-042` Updater must verify it found a hermes-gpt checkout before fast-forwarding — done
+- `rm-044` Remove or wire the unused dompurify web dependencies — done
+- `rm-047` Stop .gitignore '*.ps1' from swallowing new example scripts — done
+- `rm-098` Adopt upstream v0.13 Autopilot (9-commit gap; PR #82) — done
+- `rm-152` Correct hermes_mission_usage _24h keys — they previously reported all-time totals — done
 
 <!-- managed by hermes-roadmap render; do not edit by hand -->
