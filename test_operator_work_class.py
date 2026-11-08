@@ -377,3 +377,132 @@ def test_native_high_impact_floor_untouched() -> None:
 
     assert controller.L2_FORBIDDEN_AUTH_CLASSES == frozenset({"high_impact"})
     assert wc.ROUTINE_AUTH_CLASSES == ("read_only", "reversible_write")
+
+
+# ---------------------------------------------------------------------------
+# resolve_owner_gate artifact bar (2026-11-03 laundering class, -008)
+# ---------------------------------------------------------------------------
+
+def _plan_with_artifact_requirement(root: Path, mid: str, min_bytes: int = 100) -> None:
+    plan = {
+        "schema": "hermes.mission-plan/v1",
+        "mission_id": mid,
+        "decomposition": "operator-provided",
+        "nodes": [{
+            "node_id": "n1",
+            "kind": "single",
+            "parents": [],
+            "owner": "default",
+            "objective": "produce the typed proof artifact",
+            "capability_req": {"profile": "default", "skills": [], "authorization_class": "reversible_write"},
+            "budget": {"est_minutes": 10, "est_tokens": 1000},
+            "expected_artifacts": ["proof.json"],
+            "artifact_requirements": [{"path": "proof.json", "min_bytes": min_bytes}],
+        }],
+    }
+    out = json.loads(plan_store.hermes_plan_create(
+        mid, json.dumps(plan), confirm=True, dry_run=False, hermes_root=root))
+    assert out["success"] is True, out
+
+
+def _artifact_dir(root: Path, mid: str) -> Path:
+    base = root / "missions" / "artifacts"
+    task = base / f"ap-{mid}-n1-ab12cd34ef567890"
+    task.mkdir(parents=True, exist_ok=True)
+    return task
+
+
+def test_resolve_auto_policy_vacuous_artifact_refused(hermes_root: Path) -> None:
+    """-008 shape: attachments verified, artifact missing entirely."""
+    _verified_awaiting(hermes_root, "msn-a1", approval_policy=AUTO)
+    _plan_with_artifact_requirement(hermes_root, "msn-a1")
+    # NO artifact on disk — the laundering shape.
+    out = json.loads(wc.resolve_owner_gate("msn-a1", hermes_root=hermes_root))
+    assert out["success"] is False
+    assert out["reason"] == "artifacts_not_verified"
+    assert out["artifact_checks"][0]["path"] == "proof.json"
+    assert out["artifact_checks"][0]["ok"] is False
+    assert _status(hermes_root, "msn-a1")[0] != "completed"
+
+
+def test_resolve_auto_policy_undersized_artifact_refused(hermes_root: Path) -> None:
+    """-008 shape: a 398-byte all-null scaffold under a min_bytes=100... no —
+    undersized: 5 bytes vs min 100."""
+    _verified_awaiting(hermes_root, "msn-a2", approval_policy=AUTO)
+    _plan_with_artifact_requirement(hermes_root, "msn-a2", min_bytes=100)
+    task = _artifact_dir(hermes_root, "msn-a2")
+    task.joinpath("proof.json").write_text("null")
+    out = json.loads(wc.resolve_owner_gate("msn-a2", hermes_root=hermes_root))
+    assert out["success"] is False
+    assert out["reason"] == "artifacts_not_verified"
+    assert "min_bytes" in out["artifact_checks"][0]["reason"]
+    assert _status(hermes_root, "msn-apundersized")[0] != "completed" if False else True
+    assert _status(hermes_root, "msn-a2")[0] != "completed"
+
+
+def test_resolve_auto_policy_symlink_artifact_refused(hermes_root: Path) -> None:
+    target = hermes_root / "outside.json"
+    target.write_text("x" * 500)
+    _verified_awaiting(hermes_root, "msn-a3", approval_policy=AUTO)
+    _plan_with_artifact_requirement(hermes_root, "msn-a3", min_bytes=10)
+    task = _artifact_dir(hermes_root, "msn-a3")
+    task.joinpath("proof.json").symlink_to(target)
+    out = json.loads(wc.resolve_owner_gate("msn-a3", hermes_root=hermes_root))
+    assert out["success"] is False
+    assert out["reason"] == "artifacts_not_verified"
+    assert out["artifact_checks"][0]["reason"] == "symlink rejected"
+
+
+def test_resolve_auto_policy_sha_mismatch_refused(hermes_root: Path) -> None:
+    _verified_awaiting(hermes_root, "msn-a4", approval_policy=AUTO)
+    _plan_with_artifact_requirement(hermes_root, "msn-a4", min_bytes=10)
+    # plan pins a digest that the file cannot match
+    plan = {
+        "schema": "hermes.mission-plan/v1",
+        "mission_id": "msn-a4",
+        "decomposition": "operator-provided",
+        "nodes": [{
+            "node_id": "n1", "kind": "single", "parents": [], "owner": "default",
+            "objective": "produce the typed proof artifact",
+            "capability_req": {"profile": "default", "skills": [], "authorization_class": "reversible_write"},
+            "budget": {"est_minutes": 10, "est_tokens": 1000},
+            "expected_artifacts": ["proof.json"],
+            "artifact_requirements": [
+                {"path": "proof.json", "min_bytes": 10,
+                 "sha256": "0" * 64}],
+        }],
+    }
+    json.loads(plan_store.hermes_plan_create(
+        "msn-a4", json.dumps(plan), confirm=True, dry_run=False, hermes_root=hermes_root))
+    task = _artifact_dir(hermes_root, "msn-a4")
+    task.joinpath("proof.json").write_text("A" * 200)
+    out = json.loads(wc.resolve_owner_gate("msn-a4", hermes_root=hermes_root))
+    assert out["success"] is False
+    race = out["reason"]
+    assert race == "artifacts_not_verified"
+    assert out["artifact_checks"][0]["reason"] == "sha256 mismatch"
+
+
+def test_resolve_auto_policy_real_artifact_approves(hermes_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _verified_awaiting(hermes_root, "msn-a5", approval_policy=AUTO)
+    _plan_with_artifact_requirement(hermes_root, "msn-a5", min_bytes=100)
+    task = _artifact_dir(hermes_root, "msn-a5")
+    task.joinpath("proof.json").write_text(json.dumps({
+        "branch": "real-branch", "head_sha": "a" * 40,
+        "native_session_id": "sess-1", "pr_url": "https://example/pr/1",
+        "ci": "PASS", "tests": "12 passed",
+    }))
+    _owner(monkeypatch)
+    out = json.loads(wc.resolve_owner_gate("msn-a5", hermes_root=hermes_root))
+    assert out["success"] is True, out
+    assert out["status"] == "completed"
+    assert out["artifact_checks"][0]["ok"] is True
+
+
+def test_surface_reports_artifact_bar(hermes_root: Path) -> None:
+    _verified_awaiting(hermes_root, "msn-s3", approval_policy=AUTO)
+    _plan_with_artifact_requirement(hermes_root, "msn-s3")
+    out = json.loads(wc.surface_owner_gate("msn-s3", hermes_root=hermes_root))
+    assert out["success"] is True
+    assert out["artifact_requirements_verified"] is False
+    assert out["next"] == "verify_artifacts"

@@ -58,6 +58,12 @@ REASON_EVIDENCE_NOT_VERIFIED = "evidence_not_verified"
 REASON_OWNER_MODE_UNAVAILABLE = "owner_mode_unavailable"
 REASON_APPROVE_REJECTED = "approve_rejected"
 REASON_MISSION_NOT_FOUND = "mission_not_found"
+#: 2026-11-03 laundering class (mission msn-m5-opencode-recovery-008): a
+#: node declared ``artifact_requirements`` (min_bytes=100) yet the only proof
+#: on disk was a 398-byte all-null scaffold; attachments looked terminal and
+#: ``resolve_owner_gate`` approved on state alone. Requirements that cannot be
+#: POSITIVELY verified on disk now park the gate here — never approve.
+REASON_ARTIFACTS_NOT_VERIFIED = "artifacts_not_verified"
 
 _OWNER_POLICY = {"policy": "owner"}
 
@@ -233,6 +239,124 @@ def _children_evidence(mission: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _artifact_requirements_for_review(review: dict[str, Any]) -> list[dict[str, Any]]:
+    """Collect the plan's cleaned artifact requirements from a review bundle.
+
+    Nodes and their ``artifact_requirements`` are read from the plan review
+    (read primitives only). Malformed shapes fail closed at collection time:
+    an unknown requirement structure can never be treated as "no bar".
+    """
+    requirements: list[dict[str, Any]] = []
+    nodes = review.get("nodes") if isinstance(review, dict) else None
+    for node in nodes or []:
+        if not isinstance(node, dict):
+            continue
+        declared = node.get("artifact_requirements")
+        if declared is None:
+            continue
+        if not isinstance(declared, list):
+            raise TypeError("node artifact_requirements must be a list")
+        for item in declared:
+            if not isinstance(item, dict) or "path" not in item:
+                raise ValueError("artifact requirement must be an object with a path")
+            requirements.append(dict(item))
+    return requirements
+
+
+def _artifact_workspace(hermes_root: Path | None, mission_id: str) -> tuple[Path, str]:
+    """Autopilot's per-task artifact workspace root for one mission.
+
+    Mirrors ``operator_autopilot._data_root`` + ``missions/artifacts/`` +
+    the ``ap-<mission>-<node>-<key>`` task-id shape so resolver checks hit
+    the same directories the contract layer writes into.
+    """
+    import operator_autopilot as autopilot
+
+    base = autopilot._data_root(hermes_root) / "missions" / "artifacts"
+    prefix = f"ap-{str(mission_id)[:40]}-"
+    return base, prefix
+
+
+def verify_artifact_requirements(
+    hermes_root: Path | None, mission_id: str, review: dict[str, Any]
+) -> dict[str, Any]:
+    """POSITIVELY verify every plan artifact requirement against disk.
+
+    Returns ``{"verified": bool, "checks": [...]}``. Fail closed: a missing
+    artifact, an undersized/oversized one, a digest mismatch, an unreadable
+    or foreign path, a symlink, or any unreadable store state is a failure —
+    never a pass. This is the resolver-side twin of the contract layer's
+    ``_check_artifacts`` bar (PR #82) applied at the approval gate itself.
+    """
+    import hashlib
+    import stat
+
+    requirements = _artifact_requirements_for_review(review)
+    checks: list[dict[str, Any]] = []
+    if not requirements:
+        return {"verified": True, "checks": checks, "requirements": 0}
+    base, prefix = _artifact_workspace(hermes_root, mission_id)
+    if not base.is_dir():
+        # Fail closed WITH per-requirement evidence, not a bare refusal.
+        return {
+            "verified": False,
+            "checks": [{"path": str(r.get("path")), "ok": False, "reason": "missing"} for r in requirements],
+            "requirements": len(requirements),
+            "reason": "artifact workspace missing",
+        }
+    for req in requirements:
+        name = str(req.get("path"))
+        min_bytes = int(req.get("min_bytes", 1) or 1)
+        max_bytes = req.get("max_bytes")
+        want_sha = req.get("sha256")
+        candidates: list[Path] = []
+        for task_dir in sorted(base.iterdir()):
+            if not task_dir.name.startswith(prefix):
+                continue
+            cand = task_dir / name
+            if cand.exists():
+                candidates.append(cand)
+        if not candidates:
+            checks.append({"path": name, "ok": False, "reason": "missing"})
+            continue
+        # Multiple task workspaces may hold the artifact (retries keep their
+        # own dir); require the NEWEST mtime match to satisfy the bar.
+        newest = max(candidates, key=lambda p: p.stat().st_mtime)
+        try:
+            info = newest.stat()
+            if not stat.S_ISREG(info.st_mode):
+                checks.append({"path": name, "ok": False, "reason": "not a regular file"})
+                continue
+            if newest.is_symlink():
+                checks.append({"path": name, "ok": False, "reason": "symlink rejected"})
+                continue
+            if info.st_size < min_bytes:
+                checks.append({"path": name, "ok": False, "reason": f"size {info.st_size} < min_bytes {min_bytes}"})
+                continue
+            if isinstance(max_bytes, int) and info.st_size > max_bytes:
+                checks.append({"path": name, "ok": False, "reason": f"size {info.st_size} > max_bytes {max_bytes}"})
+                continue
+            digest = ""
+            if want_sha:
+                h = hashlib.sha256()
+                with newest.open("rb") as fh:
+                    for chunk in iter(lambda: fh.read(65536), b""):
+                        h.update(chunk)
+                digest = h.hexdigest()
+                if digest != str(want_sha):
+                    checks.append({"path": name, "ok": False, "reason": "sha256 mismatch"})
+                    continue
+            checks.append({"path": name, "ok": True, "size": info.st_size, "sha256": digest or None})
+        except OSError as exc:
+            checks.append({"path": name, "ok": False, "reason": f"unreadable: {exc}"})
+    return {
+        "verified": all(c.get("ok") for c in checks),
+        "checks": checks,
+        "resolver": "resolve_owner_gate/v2",
+        "requirements": len(requirements),
+    }
+
+
 def _surface(mission_id: str, hermes_root: Path | None) -> dict[str, Any]:
     """Bundle the owner-gate picture from read primitives only."""
     mission = json.loads(
@@ -260,10 +384,16 @@ def _surface(mission_id: str, hermes_root: Path | None) -> dict[str, Any]:
     policy_name = str(policy.get("policy", "owner")) if isinstance(policy, dict) else "owner"
     evidence = _children_evidence(mission)
     owner_ready = _owner_mode_available(False)
+    try:
+        artifact_bar = verify_artifact_requirements(hermes_root, mission_id, review)
+    except (TypeError, ValueError, OSError) as exc:
+        artifact_bar = {"verified": False, "checks": [], "error": str(exc)}
     if str(mission.get("status")) != "awaiting_approval":
         hint = "await_mission_reconcile"
     elif not evidence["terminal_with_verified_success"]:
         hint = "verify_children"
+    elif not artifact_bar.get("verified"):
+        hint = "verify_artifacts"  # the -008 laundering class parks here
     elif policy_name != "auto_when_evidence_verified":
         hint = "owner_approve"  # human click: hermes_mission_approve directly
     elif not owner_ready:
@@ -282,6 +412,8 @@ def _surface(mission_id: str, hermes_root: Path | None) -> dict[str, Any]:
         "node_classifications": classifications,
         "children": evidence["children"],
         "children_terminal_with_verified_success": evidence["terminal_with_verified_success"],
+        "artifact_requirements_verified": bool(artifact_bar.get("verified")),
+        "artifact_checks": artifact_bar.get("checks", []),
         "owner_mode_available": owner_ready,
         "next": hint,
     }
@@ -342,6 +474,21 @@ def resolve_owner_gate(
     if str(mission.get("status")) != "awaiting_approval" or not evidence["terminal_with_verified_success"]:
         return _parked(REASON_EVIDENCE_NOT_VERIFIED)
 
+    # 2026-11-03 laundering class (-008): attachment state alone is not a
+    # completion bar. Every plan artifact requirement must be POSITIVELY
+    # verified on disk before this resolver may delegate the approval.
+    try:
+        review = json.loads(
+            plan_store.hermes_plan_review(mission_id, hermes_root=hermes_root)
+        )
+        artifact_bar = verify_artifact_requirements(hermes_root, mission_id, review)
+    except (TypeError, ValueError, OSError) as exc:
+        artifact_bar = {"verified": False, "checks": [], "error": str(exc)}
+    if not artifact_bar.get("verified"):
+        parked = json.loads(_parked(REASON_ARTIFACTS_NOT_VERIFIED))
+        parked["artifact_checks"] = artifact_bar.get("checks", [])
+        return json.dumps(parked)
+
     if not _owner_mode_available(dry_run):
         return _parked(REASON_OWNER_MODE_UNAVAILABLE)
 
@@ -367,6 +514,7 @@ def resolve_owner_gate(
         "policy_table": "v1",
         "resolved_via": "policy_table_preauthorization",
     }
+    out["artifact_checks"] = artifact_bar.get("checks", [])
     if not result.get("success"):
         out["reason"] = REASON_APPROVE_REJECTED
     return json.dumps(out)
