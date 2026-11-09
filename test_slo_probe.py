@@ -345,6 +345,88 @@ class TestStallDetection:
         assert rec.verdict == slo.FAIL
         assert rec.value["undetected"] == 1
 
+    def test_idle_stall_engaged_within_bound_is_detected(self) -> None:
+        """The 2026-11-08 18:04:34Z live shape: two IDLE semantic-unhealthy
+        ticks (nothing working the backlog), then the supervisor ENGAGES
+        (CYCLING, execution_healthy) 135s after the run closed. Engagement
+        IS the handling under the deployed watchdog's KTD4 model — a
+        restart there would kill productive work — so the episode is
+        detected-and-handled (latency 135s <= 5m), not undetected."""
+        lines = [
+            watchdog_line(
+                ts_at(0),
+                {"semantic_healthy": True},
+            ),
+            # stall run: IDLE, execution not healthy-working the backlog
+            watchdog_line(
+                ts_at(60),
+                {"supervisor": {"semantic_healthy": False, "execution_state": "IDLE"}},
+            ),
+            watchdog_line(
+                ts_at(120),
+                {"supervisor": {"semantic_healthy": False, "execution_state": "IDLE"}},
+            ),
+            # engagement tick: healthy-by-model (active state, excused)
+            watchdog_line(
+                ts_at(255),
+                {"supervisor": {"semantic_healthy": False, "execution_state": "CYCLING", "execution_healthy": True}},
+            ),
+            watchdog_line(ts_at(320), {"semantic_healthy": True}),
+        ]
+        rec = slo.probe_stall_detection(lines)
+        assert rec.verdict == slo.PASS, rec.value
+        assert rec.value["persistent_episodes"] == 1
+        assert rec.value["within_5m"] == 1
+        assert rec.value["undetected"] == 0
+        assert rec.value["worst_latency_s"] == 195.0
+        assert rec.value["excused_productive_ticks"] == 1
+
+    def test_engagement_beyond_bound_is_still_undetected(self) -> None:
+        """An engagement that only arrives after the 900s SLO bound is NOT
+        a detection credit — the episode stays undetected (FAIL), because
+        the directive bound is 15m worst-case and 5m for 95%."""
+        lines = [
+            watchdog_line(
+                ts_at(0),
+                {"supervisor": {"semantic_healthy": False, "execution_state": "IDLE"}},
+            ),
+            watchdog_line(
+                ts_at(60),
+                {"supervisor": {"semantic_healthy": False, "execution_state": "IDLE"}},
+            ),
+            watchdog_line(
+                ts_at(1200),
+                {"supervisor": {"semantic_healthy": False, "execution_state": "CYCLING", "execution_healthy": True}},
+            ),
+            watchdog_line(ts_at(1260), {"semantic_healthy": True}),
+        ]
+        rec = slo.probe_stall_detection(lines)
+        assert rec.verdict == slo.FAIL
+        assert rec.value["undetected"] == 1
+
+    def test_active_run_still_needs_explicit_restart(self) -> None:
+        """A stall run whose ticks were already ACTIVE (wedged beyond dwell)
+        is not credited by mere continued activity — only a restart or the
+        run's own recovery counts; here neither fires, so undetected."""
+        lines = [
+            watchdog_line(
+                ts_at(0),
+                {"supervisor": {"semantic_healthy": False, "execution_state": "CYCLING", "execution_healthy": False}},
+            ),
+            watchdog_line(
+                ts_at(60),
+                {"supervisor": {"semantic_healthy": False, "execution_state": "CYCLING", "execution_healthy": False}},
+            ),
+            watchdog_line(
+                ts_at(120),
+                {"supervisor": {"semantic_healthy": False, "execution_state": "CYCLING", "execution_healthy": True}},
+            ),
+            watchdog_line(ts_at(180), {"semantic_healthy": True}),
+        ]
+        rec = slo.probe_stall_detection(lines)
+        assert rec.verdict == slo.FAIL
+        assert rec.value["undetected"] == 1
+
     def test_unknown_when_no_episodes(self) -> None:
         lines = [watchdog_line(ts_at(0), {"semantic_healthy": True})] * 3
         rec = slo.probe_stall_detection(lines)

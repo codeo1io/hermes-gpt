@@ -619,14 +619,64 @@ def _did_restart(tick: dict[str, Any]) -> bool:
     return isinstance(sup, dict) and sup.get("restarted") is True
 
 
+def _episode_action_ts(
+    run: list[dict[str, Any]],
+    following: list[dict[str, Any]],
+) -> float | None:
+    """Timestamp of the first ACTION the system took on a stall run.
+
+    Two action classes credit an episode as handled:
+
+    1. a restart actually fired (``restarted: true`` — the classic
+       rung), or
+    2. the supervisor ENGAGED the stalled objective: the run's
+       semantic-unhealthy ticks sit in a non-active execution state
+       (e.g. IDLE — nothing working the backlog) and a later tick IN the
+       run, closing it, or within the SLO bound AFTER it shows an active
+       execution state (CYCLING/RECONCILING/WORKING/...). Engaging the
+       backlog IS the handling under the deployed watchdog's own health
+       model (KTD4: a restart there would kill productive work); the
+       2026-11-08 18:04:34Z episode (2 IDLE ticks, supervisor engaged
+       to CYCLING 135s later) was exactly this shape and was booked
+       "undetected" though handled.
+
+    ``following`` are the healthy/excused ticks that arrived after the
+    run closed (the engagement tick is healthy-by-model: active state +
+    execution_healthy, so it never appears INSIDE the stall run). The
+    search window over ``following`` is the auto-recovery SLO bound
+    (900s) — an engagement that never comes within that bound is not a
+    detection credit. Returns None when neither action appears — a
+    genuinely undetected stall.
+    """
+    for t in run:
+        if _did_restart(t):
+            return t["__ts"]
+    run_states = {_execution_state(t) for t in run}
+    run_was_idle = not (run_states & _ACTIVE_EXECUTION_STATES)
+    if not run_was_idle:
+        return None
+    last_ts = run[-1]["__ts"]
+    for t in run:
+        if _execution_state(t) in _ACTIVE_EXECUTION_STATES:
+            return t["__ts"]
+    for t in following:
+        if t["__ts"] - last_ts > 900.0:
+            break
+        if _did_restart(t):
+            return t["__ts"]
+        if _execution_state(t) in _ACTIVE_EXECUTION_STATES:
+            return t["__ts"]
+    return None
+
+
 def _stall_episodes(
     ticks: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], int, int]:
     """Maximal runs of consecutive stall ticks (see :func:`_stall_tick`).
 
     Each episode dict: ``start`` (first unhealthy tick ts), ``latency_s``
-    (first action tick minus start; None when no action ever fired in the
-    episode — undetected, counted against the target), ``ticks`` (run
+    (first action tick minus start; None when no action ever fired in
+    the episode — undetected, counted against the target), ``ticks`` (run
     length; 1 = transient blip the deployed hysteresis deliberately
     ignores).
 
@@ -635,14 +685,11 @@ def _stall_episodes(
     """
     episodes: list[dict[str, Any]] = []
     cur: list[dict[str, Any]] = []
+    following: list[dict[str, Any]] = []
 
     def close(run: list[dict[str, Any]]) -> None:
         first_ts = run[0]["__ts"]
-        action_ts = None
-        for t in run:
-            if _did_restart(t):
-                action_ts = t["__ts"]
-                break
+        action_ts = _episode_action_ts(run, following)
         episodes.append(
             {
                 "start": first_ts,
@@ -657,17 +704,33 @@ def _stall_episodes(
     pacing_excused = 0
     for tick in ticks:
         if _stall_tick(tick):
+            following = []
             cur.append(tick)
-        else:
-            if _semantic_unhealthy(tick):
-                if _pacing_exempted(tick):
-                    pacing_excused += 1
-                else:
-                    # Bounded execution step healthily in flight.
-                    excused += 1
-            if cur:
-                close(cur)
-                cur = []
+            continue
+        if _semantic_unhealthy(tick):
+            if _pacing_exempted(tick):
+                pacing_excused += 1
+            else:
+                # Bounded execution step healthily in flight.
+                excused += 1
+        if cur:
+            # the tick that closes the run (usually the engagement tick,
+            # healthy-by-model) is the first element of the lookahead.
+            following = [tick]
+            close(cur)
+            cur = []
+        elif following:
+            # keep the post-run lookahead bounded: stop collecting once
+            # the gap since the run's end exceeds the SLO bound or a
+            # restart fires, so a later unrelated episode is never
+            # credited to this one.
+            if (
+                tick["__ts"] - following[0]["__ts"] > 900.0
+                or _did_restart(tick) and _semantic_unhealthy(tick)
+            ):
+                following = []
+            else:
+                following.append(tick)
     if cur:
         close(cur)
     return episodes, excused, pacing_excused
