@@ -469,7 +469,7 @@ class TestStallDetection:
     def test_pacing_receipt_cannot_hide_unhealthy_or_wedged_idle(self) -> None:
         """A forged or stale exemption must not hide an undetected stall."""
         for bad in ({"healthy": False}, {"execution_healthy": False},
-                    {"pacing_exempted": False}, {"operator_lane_stalled": {"id": "x"}}):
+                    {"pacing_exempted": False}):
             tick = {"semantic_healthy": False, "execution_state": "IDLE",
                     "execution_healthy": True, "healthy": True,
                     "pacing_exempted": True, "operator_lane_stalled": None}
@@ -482,6 +482,24 @@ class TestStallDetection:
             rec = slo.probe_stall_detection(lines)
             assert rec.verdict == slo.FAIL
             assert rec.value["undetected"] == 1
+
+    def test_latched_paced_idle_is_excused_per_watchdog_contract(self) -> None:
+        """Latched operator lane + pacing receipt + healthy execution: the
+        watchdog restarts NEITHER cause (storm contract dominates the pacing
+        path; escalation carries the finding). The probe mirrors that —
+        excused and reported, not an undetected stall."""
+        tick = {"semantic_healthy": False, "execution_state": "IDLE",
+                "execution_healthy": True, "healthy": True,
+                "pacing_exempted": True,
+                "operator_lane_stalled": {"boundary_at": "2026-11-07"}}
+        lines = [
+            watchdog_line(ts_at(0), {"supervisor": dict(tick)}),
+            watchdog_line(ts_at(60), {"supervisor": dict(tick)}),
+            watchdog_line(ts_at(120), {"semantic_healthy": True}),
+        ]
+        rec = slo.probe_stall_detection(lines)
+        assert rec.value["episodes"] == 0
+        assert rec.value.get("excused_operator_lane_ticks") == 2
 
     def test_idle_semantic_stall_is_not_excused(self) -> None:
         """No active execution step + semantic-unhealthy = genuine stall —
@@ -499,6 +517,55 @@ class TestStallDetection:
         assert rec.verdict == slo.FAIL
         assert rec.value["undetected"] == 1
         assert rec.value.get("excused_productive_ticks", 0) == 0
+
+    def test_operator_lane_latched_semantic_stall_is_excused(self) -> None:
+        """Item-220 storm contract: while an operator-lane episode is
+        latched, the deployed watchdog suppresses semantic restarts and
+        escalates instead. The probe mirrors that contract — such ticks are
+        excused and reported (never erased), never counted as undetected
+        stalls. Regression: the live 2026-11-08T18:04:34Z 2-tick episode
+        (IDLE, execution_healthy, latched operator lane, no restart)
+        reset the TEST-04 soak window 1158 times."""
+        latched = {
+            "semantic_healthy": False,
+            "execution_state": "IDLE",
+            "execution_healthy": True,
+            "operator_lane_stalled": {
+                "boundary_at": "2026-11-07T10:01:41.479312+00:00",
+            },
+        }
+        lines = [
+            watchdog_line(ts_at(0), {"supervisor": dict(latched)}),
+            watchdog_line(ts_at(63), {"supervisor": dict(latched)}),
+            watchdog_line(ts_at(240), {"semantic_healthy": True}),
+        ]
+        rec = slo.probe_stall_detection(lines)
+        assert rec.value["episodes"] == 0
+        assert rec.value.get("excused_operator_lane_ticks") == 2
+        # Excused, never erased: the ticks surface in the probe value.
+
+    def test_operator_lane_latch_cannot_hide_wedged_execution(self) -> None:
+        """Anti-gaming bound: the latch excuse must not swallow a genuinely
+        wedged execution step (execution_healthy false) even while the
+        operator lane is latched — the watchdog's own model still restarts
+        those."""
+        latched_wedged = {
+            "semantic_healthy": False,
+            "execution_state": "WORKING",
+            "execution_healthy": False,
+            "operator_lane_stalled": {"boundary_at": "2026-11-07"},
+        }
+        lines = [
+            watchdog_line(ts_at(0), {"supervisor": dict(latched_wedged)}),
+            watchdog_line(
+                ts_at(60),
+                {"supervisor": {**latched_wedged, "restarted": True}},
+            ),
+            watchdog_line(ts_at(120), {"semantic_healthy": True}),
+        ]
+        rec = slo.probe_stall_detection(lines)
+        assert rec.value["persistent_episodes"] == 1
+        assert rec.value["within_5m"] == 1
 
 
 # ---------------------------------------------------------------------------

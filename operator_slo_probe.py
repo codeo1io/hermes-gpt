@@ -567,6 +567,20 @@ def _semantic_unhealthy(tick: dict[str, Any]) -> bool:
     return tick.get("semantic_healthy") is False
 
 
+def _operator_lane_latched(tick: dict[str, Any]) -> bool:
+    """True when the tick reports a latched operator-lane stall episode.
+
+    The deployed watchdog suppresses semantic-stale restarts while an
+    operator-lane episode is latched (item-220 restart-storm contract);
+    escalation is the finding + report. The probe excuses these ticks so a
+    by-design-suppressed episode never counts as an undetected stall.
+    """
+    for holder in (tick, tick.get("supervisor")):
+        if isinstance(holder, dict) and holder.get("operator_lane_stalled"):
+            return True
+    return False
+
+
 def _pacing_exempted(tick: dict[str, Any]) -> bool:
     """Only an explicit, live watchdog pacing receipt excuses an idle tick.
 
@@ -597,8 +611,14 @@ def _stall_tick(tick: dict[str, Any]) -> bool:
     watchdog's own model would agree: no active execution step, or the
     active step is beyond its dwell bound (``execution_healthy`` false).
 
+    Operator-lane-latched episodes: during a latched operator-lane episode,
+    the watchdog's item-220 storm contract suppresses semantic restarts
+    (escalation carries it, not a restart every 30s). Such ticks are
+    separately excused and never counted as undetected stalls.
+
     Ticks excluded by this rule are surfaced separately in the probe value
-    (``excused_productive_ticks``) — excluded, never erased.
+    (``excused_productive_ticks`` and ``excused_operator_lane_ticks``) —
+    excluded, never erased.
     """
     if not _semantic_unhealthy(tick):
         return False
@@ -606,6 +626,12 @@ def _stall_tick(tick: dict[str, Any]) -> bool:
         _execution_state(tick) in _ACTIVE_EXECUTION_STATES
         and _execution_healthy(tick)
     )
+    # Item-220 operator-lane-latched episode with a HEALTHY execution state:
+    # the watchdog suppresses semantic restarts (escalation carries it). A
+    # wedged step (execution_healthy false) keeps its immediate restart even
+    # during the latch — the probe mirrors that boundary.
+    if _operator_lane_latched(tick) and _execution_healthy(tick):
+        return False
     return not (excused or _pacing_exempted(tick))
 
 
@@ -621,7 +647,7 @@ def _did_restart(tick: dict[str, Any]) -> bool:
 
 def _stall_episodes(
     ticks: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], int, int]:
+) -> tuple[list[dict[str, Any]], int, int, int]:
     """Maximal runs of consecutive stall ticks (see :func:`_stall_tick`).
 
     Each episode dict: ``start`` (first unhealthy tick ts), ``latency_s``
@@ -630,8 +656,9 @@ def _stall_episodes(
     length; 1 = transient blip the deployed hysteresis deliberately
     ignores).
 
-    Returns (episodes, productive_exemptions, explicit_pacing_exemptions).
-    Every excluded semantic-unhealthy tick is reported separately.
+    Returns (episodes, productive_exemptions, explicit_pacing_exemptions,
+    operator_lane_latch_exemptions). Every excluded semantic-unhealthy
+    tick is reported separately.
     """
     episodes: list[dict[str, Any]] = []
     cur: list[dict[str, Any]] = []
@@ -655,12 +682,15 @@ def _stall_episodes(
 
     excused = 0
     pacing_excused = 0
+    operator_lane_excused = 0
     for tick in ticks:
         if _stall_tick(tick):
             cur.append(tick)
         else:
             if _semantic_unhealthy(tick):
-                if _pacing_exempted(tick):
+                if _operator_lane_latched(tick) and _execution_healthy(tick):
+                    operator_lane_excused += 1
+                elif _pacing_exempted(tick):
                     pacing_excused += 1
                 else:
                     # Bounded execution step healthily in flight.
@@ -670,7 +700,7 @@ def _stall_episodes(
                 cur = []
     if cur:
         close(cur)
-    return episodes, excused, pacing_excused
+    return episodes, excused, pacing_excused, operator_lane_excused
 
 
 # ---------------------------------------------------------------------------
@@ -721,7 +751,7 @@ def probe_stall_detection_ticks(
     if not ticks:
         rec.notes.append("no parseable watchdog ticks in window")
         return rec
-    episodes, excused_productive, excused_pacing = _stall_episodes(ticks)
+    episodes, excused_productive, excused_pacing, excused_operator_lane = _stall_episodes(ticks)
     if not episodes:
         rec.numerator = 0
         rec.denominator = 0
@@ -729,6 +759,7 @@ def probe_stall_detection_ticks(
             "episodes": 0,
             "excused_productive_ticks": excused_productive,
             "excused_pacing_ticks": excused_pacing,
+            "excused_operator_lane_ticks": excused_operator_lane,
         }
         rec.verdict = UNKNOWN
         rec.notes.append("no stall episodes in window (nothing to measure)")
@@ -762,6 +793,7 @@ def probe_stall_detection_ticks(
         "undetected": undetected,
         "excused_productive_ticks": excused_productive,
         "excused_pacing_ticks": excused_pacing,
+        "excused_operator_lane_ticks": excused_operator_lane,
         "worst_latency_s": worst,
         "worst_latency_min": (
             round(worst / 60.0, 2) if worst is not None else None
