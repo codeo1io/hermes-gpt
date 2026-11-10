@@ -286,9 +286,15 @@ DELEGATION_STATES = frozenset(
     {"reserved", "queued", "running", "reconciling", "succeeded", "failed", "cancelled"}
 )
 DELEGATION_TERMINAL = frozenset({"succeeded", "failed", "cancelled"})
-MISSION_STATES = frozenset(
-    {"draft", "running", "awaiting_approval", "completed", "paused", "blocked"}
-)
+# Single-sourced from the mission store's authoritative status vocabulary
+# (``operator_mission_runtime.STATUSES``). The classifier's hand-copied set
+# previously omitted the terminal ``failed`` status: a delegation whose
+# SIGTERM'd worker terminalized its mission failed (msn-m5-opencode-recovery-009,
+# 2026-11-10) then failed envelope validation — "a value outside the
+# authoritative vocabulary" — and fail-closed to unknown instead of ever
+# classifying the dead-worker signal. Importing the store's tuple keeps the
+# two vocabularies from drifting apart again.
+MISSION_STATES = frozenset(mission.STATUSES)
 NODE_STATES = frozenset(
     {
         "pending",
@@ -356,6 +362,19 @@ TRANSIENT_TOKENS: tuple[str, ...] = (
     "connection_refused",
     "network_error",
     "timeout",
+    # Conductor-owned typed infrastructure markers (backend_retry.py).
+    # ``delegate transport error:`` prefixes every transport-availability
+    # failure the spool/delegate wheel folds (S2 class: the transport's own
+    # crash is availability, never provider-blamed); the bounded same-session
+    # continuation exhaustion a SIGTERM'd worker leaves behind carries it.
+    # ``delegate delivery incomplete:`` is the BD-4.3 transport-succeeded /
+    # phase-result-never-arrived shape — likewise infrastructure, not a
+    # phase verdict. Without these tokens the msn-m5-opencode-recovery-009
+    # interruption (2026-11-10) classified unknown_fail_closed and the
+    # dead worker's work was never adopted or retried. Underscore form:
+    # _normalize_tokens folds the text to underscore-joined n-grams.
+    "delegate_transport_error",
+    "delegate_delivery_incomplete",
 )
 ENVIRONMENT_TOKENS: tuple[str, ...] = (
     "workspace_missing",

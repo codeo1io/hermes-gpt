@@ -601,12 +601,80 @@ def _controller_plan_rows(root: Path) -> list:
 # ---------------------------------------------------------------------------
 
 
+def run_interruption_recovery_regressions() -> None:
+    """msn-m5-opencode-recovery-009 (2026-11-10) regressions.
+
+    A SIGTERM'd autopilot worker terminalized its delegation AND its mission
+    failed. Two stacked defects blocked recovery: the classifier's
+    MISSION_STATES hand-copy omitted the store's terminal ``failed`` status
+    (envelope validation fail-closed), and the conductor-owned typed
+    infrastructure markers (``delegate transport error:`` …) matched no
+    transient token. The interrupted work landed unknown_fail_closed instead
+    of a bounded retry.
+    """
+    print("== interruption recovery regressions (009) ==")
+    # 1. Mission-status vocabulary is single-sourced from the store.
+    eq(fs.MISSION_STATES, frozenset(mission.STATUSES),
+       "MISSION_STATES single-sourced from operator_mission_runtime.STATUSES")
+    check("failed" in fs.MISSION_STATES, "terminal mission status 'failed' is valid")
+
+    # 2. The live -009 envelope (verbatim shapes from the incident) classifies
+    #    transient → bounded retry, not unknown_fail_closed.
+    live = {
+        "delegation": {"state": "failed", "backend_state": "failed",
+                       "outcome": "failed", "validation_verdict": ""},
+        "runner": {
+            "status": "failed", "outcome": "failed",
+            "error": ("delegate transport error: mission_node incomplete "
+                      "after bounded same-session continuation: "
+                      "no typed completion artifact"),
+        },
+        "worker_exit": None,
+        "last_failure_error": ("delegate transport error: mission_node incomplete "
+                               "after bounded same-session continuation: "
+                               "no typed completion artifact"),
+        "capability": None,
+        "plan": {"node_state": "failed", "parent_done": True,
+                 "all_children_terminal": False, "retries": 0,
+                 "replan_attempts_used": 0},
+        "mission": {"status": "failed", "final_approval_required": True},
+        "breaker": {"consecutive_failures": 1, "limit": 2, "gave_up": False},
+    }
+    d = fs.classify("m", "n", fs._validate_envelope(live))
+    eq(d["classification"], fs.CLASS_TRANSIENT, "009 dead-worker envelope → transient")
+    eq(d["row_key"], "retry_transient_backoff", "009 envelope proposes bounded retry")
+    check(d["auto_retry"] is True, "009 envelope auto-retries under a closed breaker")
+    check(d["need_attention"] is False, "009 envelope needs no human attention")
+    check("transient:delegate_transport_error" in d["matched_tokens"],
+          "typed transport marker matched")
+
+    # 3. Delivery-incomplete carries the same infrastructure class.
+    di = json.loads(json.dumps(live))
+    di["last_failure_error"] = ("delegate delivery incomplete: phase result "
+                                "never arrived after worker answer")
+    di["runner"]["error"] = di["last_failure_error"]
+    d2 = fs.classify("m", "n", fs._validate_envelope(di))
+    eq(d2["classification"], fs.CLASS_TRANSIENT,
+       "delegate delivery incomplete → transient")
+
+    # 4. Fail-closed still holds for genuinely unflavored text (the guard
+    #    these regressions must not weaken).
+    plain = json.loads(json.dumps(live))
+    plain["last_failure_error"] = ""
+    plain["runner"]["error"] = ""
+    d3 = fs.classify("m", "n", fs._validate_envelope(plain))
+    eq(d3["classification"], fs.CLASS_UNKNOWN,
+       "unflavored failed delegation still fail-closes to unknown")
+    check(d3["need_attention"] is True, "unflavored failure still needs attention")
+
+
 def run() -> int:
     run_taxonomy_matrix()
     run_class_action_semantics()
     run_determinism()
     run_structural_rejects()
     run_inv9_envelope()
+    run_interruption_recovery_regressions()
     with tempfile.TemporaryDirectory(prefix="fs-matrix-") as td:
         root = Path(td) / "hermes"
         root.mkdir()
