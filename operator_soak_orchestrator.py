@@ -457,7 +457,7 @@ def _vacuous_unknown_ids(doc: dict[str, Any] | None) -> list[str]:
             continue
         if rec["slo_id"] == "stall_detection":
             measured_zero = (
-                val.get("persistent_episodes") == 0
+                val.get("persistent_episodes", 0) == 0
                 and val.get("episodes", 0) == 0
             )
         else:  # auto_recovery
