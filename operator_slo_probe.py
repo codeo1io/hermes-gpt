@@ -912,8 +912,19 @@ def probe_auto_recovery_ticks(
     ticks: list[dict[str, Any]],
     *,
     journal_source: str = "maestro-watchdog journal",
+    window_end: float | None = None,
 ) -> SloRecord:
-    """Tick-level core of :func:`probe_auto_recovery` (pre-merged ticks)."""
+    """Tick-level core of :func:`probe_auto_recovery`.
+
+    ``window_end`` is the measurement instant (epoch seconds). A restart
+    whose 15-minute recovery horizon (restart + 900s) extends beyond
+    ``window_end`` is RIGHT-CENSORED: recovery may still land after the
+    probe measured, so counting it as unrecovered would manufacture a
+    FAIL out of an in-flight recovery. Censored restarts are excluded
+    from the judged denominator and reported via ``pending_recovery``;
+    if every restart is still pending, the verdict is UNKNOWN (hold and
+    re-measure later) rather than a FAIL that resets a soak window.
+    """
     rec = SloRecord(
         slo_id="auto_recovery",
         target=(
@@ -935,7 +946,13 @@ def probe_auto_recovery_ticks(
         rec.verdict = UNKNOWN
         rec.notes.append("no restart actions in window (nothing to measure)")
         return rec
+    # Measurement instant: explicit window_end, else the newest observed
+    # tick (the probe can never see past its own evidence).
+    measure_ts = (
+        window_end if window_end is not None else max(t["__ts"] for t in ticks)
+    )
     recovered = 0
+    censored = 0
     latencies: list[float] = []
     for act in actions:
         act_ts = act["__ts"]
@@ -954,14 +971,35 @@ def probe_auto_recovery_ticks(
             latencies.append(ok_ts - act_ts)
             if ok_ts - act_ts <= 900.0:
                 recovered += 1
-    denom = len(actions)
+            continue
+        # No recovery observed in-window. If the 15m horizon is still
+        # open at the measurement instant the outcome is genuinely
+        # unjudgeable — right-censor it instead of scoring it as FAIL.
+        if act_ts + 900.0 > measure_ts:
+            censored += 1
+    denom = len(actions) - censored
     rec.numerator = recovered
     rec.denominator = denom
     rec.value = {
-        "restarts": denom,
+        "restarts": len(actions),
         "recovered_within_15m": recovered,
+        "pending_recovery": censored,
         "healthy_latency_s": [round(x, 1) for x in latencies],
     }
+    if censored:
+        rec.notes.append(
+            f"{censored} restart(s) within 15m of measurement right-censored "
+            "(recovery horizon still open; not judged)"
+        )
+    if denom == 0:
+        # Every restart is still inside its recovery horizon: nothing is
+        # judgeable yet. Hold as UNKNOWN — the next tick re-measures with
+        # the horizon closed.
+        rec.verdict = UNKNOWN
+        rec.notes.append(
+            "all restarts pending recovery at measurement; verdict held"
+        )
+        return rec
     rec.verdict = _verdict_for_ratio(
         recovered, denom, at_least=SLO_AUTO_RECOVERY_PCT_WITHIN_15M
     )
@@ -1308,7 +1346,7 @@ def collect_all(
         records.append(rec_stall)
 
         rec_auto = probe_auto_recovery_ticks(
-            ticks, journal_source=journal_source
+            ticks, journal_source=journal_source, window_end=now_ts
         )
         if archive_unreadable:
             rec_auto.notes.append(
