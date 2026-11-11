@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Campaign controller recurrence: a manifest may declare a bounded `recurrence` block (`interval_s`, `max_generations`, `max_consecutive_failures`) and run its segment DAG as consecutive generations. Segment `mission_id` templates must carry a `{gen}` token so every generation mints its own finite Missions (duplicate-refusal makes collisions impossible); rollover is paced, capped, and stops permanently after the configured run of failing generations. State loss re-derives the current generation from the mission store. Manifests without `recurrence` are byte-identical in behavior.
+
 ## 0.18.0 — Agent readiness and compatibility
 
 - Add read-only Flight Deck Agent readiness: separate server source and CLI identity, static protocol declarations, prior authorized preflight observations, session-control gate state, and an explicit unverified live-acceptance boundary. No Agent code execution, turn submission or configuration changes.
