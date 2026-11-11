@@ -696,6 +696,89 @@ class TestAutoRecovery:
         rec = slo.probe_auto_recovery(lines)
         assert rec.verdict == slo.UNKNOWN
 
+    # -- right-censoring (2026-11-10T17:00Z live reset, probe ran 6s
+    #    after a legitimate supervisor restart; every restart in the
+    #    archive recovered within ~260s) --------------------------------
+
+    def test_restart_at_edge_is_censored_not_failed(self) -> None:
+        # Exact live shape: healthy restarts earlier in the window (all
+        # recovered), plus a fresh restart whose recovery lands AFTER the
+        # probe measured. Judged denominator must exclude it.
+        lines = [
+            # restart at t=0, recovered at t=120 (well within 15m)
+            watchdog_line(
+                ts_at(0), {"semantic_healthy": False, "restarted": True}
+            ),
+            watchdog_line(ts_at(120), {"semantic_healthy": True}),
+            # probe measures at t=7200; a restart fired at t=7194 and
+            # recovers at t=7322 — but the probe cannot see that yet.
+            watchdog_line(
+                ts_at(7194),
+                {"semantic_healthy": False, "supervisor": {"restarted": True}},
+            ),
+        ]
+        ticks = slo.parse_watchdog_journal(lines)
+        rec = slo.probe_auto_recovery_ticks(
+            ticks, window_end=EP + 7200.0
+        )
+        # judged 1/1 = 100% -> PASS; the pending one is censored, not FAIL
+        assert rec.verdict == slo.PASS
+        assert rec.value["restarts"] == 2
+        assert rec.value["recovered_within_15m"] == 1
+        assert rec.value["pending_recovery"] == 1
+        assert any("right-censored" in n for n in rec.notes)
+
+    def test_all_restarts_pending_holds_unknown(self) -> None:
+        # Probe fires seconds after the only restart in the window:
+        # nothing is judgeable — UNKNOWN (hold), never a FAIL that
+        # resets a soak window on an in-flight recovery.
+        lines = [
+            watchdog_line(
+                ts_at(0), {"semantic_healthy": False, "restarted": True}
+            ),
+        ]
+        ticks = slo.parse_watchdog_journal(lines)
+        rec = slo.probe_auto_recovery_ticks(
+            ticks, window_end=EP + 6.0
+        )
+        assert rec.verdict == slo.UNKNOWN
+        assert rec.value["pending_recovery"] == 1
+        assert rec.denominator == 0
+        assert any("verdict held" in n for n in rec.notes)
+
+    def test_old_unrecovered_restart_still_fails(self) -> None:
+        # Censoring must NOT mask a genuinely failed recovery: the
+        # horizon closed long before measurement and no healthy tick
+        # ever followed — that stays a FAIL.
+        lines = [
+            watchdog_line(
+                ts_at(0), {"semantic_healthy": False, "restarted": True}
+            ),
+            watchdog_line(ts_at(1200), {"semantic_healthy": False}),
+        ]
+        ticks = slo.parse_watchdog_journal(lines)
+        rec = slo.probe_auto_recovery_ticks(
+            ticks, window_end=EP + 3600.0
+        )
+        assert rec.verdict == slo.FAIL
+        assert rec.value["pending_recovery"] == 0
+
+    def test_no_window_end_censors_by_last_tick(self) -> None:
+        # Legacy call shape (no window_end): measurement instant falls
+        # back to the newest observed tick, so a restart on the newest
+        # tick is still censored (cannot have later evidence).
+        lines = [
+            watchdog_line(ts_at(120), {"semantic_healthy": True}),
+            watchdog_line(
+                ts_at(240),
+                {"semantic_healthy": False, "restarted": True},
+            ),
+        ]
+        ticks = slo.parse_watchdog_journal(lines)
+        rec = slo.probe_auto_recovery_ticks(ticks)
+        assert rec.verdict == slo.UNKNOWN
+        assert rec.value["pending_recovery"] == 1
+
 
 # ---------------------------------------------------------------------------
 # SLO-5 routine completion
