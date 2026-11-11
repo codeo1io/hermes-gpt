@@ -363,3 +363,216 @@ def test_status_roundtrip(hermes_root: Path) -> None:
     assert out["state"]["segments"]["s1"]["phase"] == "minted"
     missing = json.loads(ctrl.campaign_controller_status("camp-none", hermes_root=hermes_root))
     assert missing["found"] is False
+
+
+# ---------------------------------------------------------------------------
+# Recurrence (generation-based, bounded)
+# ---------------------------------------------------------------------------
+
+import datetime as _dt  # noqa: E402  (test-local convenience)
+
+
+def _backdate_finished(root: Path, campaign_id: str, seconds: int = 120) -> None:
+    state = json.loads((root / "campaigns" / campaign_id / "state.json").read_text())
+    past = _dt.datetime.now(_dt.timezone.utc).timestamp() - seconds
+    state["generation_finished_at"] = _dt.datetime.fromtimestamp(
+        past, tz=_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    (root / "campaigns" / campaign_id / "state.json").write_text(json.dumps(state))
+
+
+def _rec_manifest(mid: str = "msn-camp-recur-g{gen}", *, interval_s: int = 60,
+                   max_generations: int = 3, max_consecutive_failures: int | None = None,
+                   campaign_id: str = "camp-test") -> str:
+    rec: dict = {"interval_s": interval_s, "max_generations": max_generations}
+    if max_consecutive_failures is not None:
+        rec["max_consecutive_failures"] = max_consecutive_failures
+    return json.dumps({
+        "schema": ctrl.MANIFEST_SCHEMA,
+        "campaign_id": campaign_id,
+        "recurrence": rec,
+        "segments": [_segment("s1", mid)],
+    })
+
+
+def _set_generation_outcome(root: Path, mid: str, outcome: str) -> None:
+    """Drive a generation mission to a terminal status.
+
+    ``failed`` goes through the sanctioned transition; ``completed`` would
+    require the Owner-approve path (children + verified attachments), which
+    is operator_autopilot/mission-runtime territory — the controller only
+    reads terminal status, so tests set it directly in the store.
+    """
+    import sqlite3
+    if outcome == "failed":
+        json.loads(mission.hermes_mission_transition(
+            mid, "failed", reason="test fail", confirm=True, dry_run=False, hermes_root=root))
+        return
+    db_path = root / "missions" / "missions.db"
+    con = sqlite3.connect(db_path)
+    try:
+        con.execute("UPDATE missions SET status=?, updated_at=datetime('now') WHERE mission_id=?",
+                    (outcome, mid))
+        con.commit()
+    finally:
+        con.close()
+
+
+def test_recurrence_requires_gen_token(hermes_root: Path) -> None:
+    out = json.loads(ctrl.campaign_controller_tick(
+        _rec_manifest("msn-no-token"), hermes_root=hermes_root))
+    assert out["success"] is False
+    assert "must contain" in out["error"] and "{gen}" in out["error"]
+
+
+def test_recurrence_rejects_bad_bounds(hermes_root: Path) -> None:
+    for bad in ({"interval_s": 59, "max_generations": 3},
+                {"interval_s": 30 * 86400 + 1, "max_generations": 3},
+                {"interval_s": 60, "max_generations": 0},
+                {"interval_s": 60, "max_generations": 1001},
+                {"interval_s": "60", "max_generations": 3},
+                {"interval_s": 60, "max_generations": 3, "bogus": 1},
+                {"interval_s": 60, "max_generations": 3, "max_consecutive_failures": 11}):
+        doc = json.loads(_rec_manifest())
+        doc["recurrence"] = bad
+        out = json.loads(ctrl.campaign_controller_tick(
+            json.dumps(doc), hermes_root=hermes_root))
+        assert out["success"] is False, bad
+        assert "recurrence" in out["error"], bad
+
+
+def test_generation_rollover_mints_next_generation(hermes_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(autopilot, "hermes_autopilot_start", lambda mid, **kw: json.dumps(
+        {"success": True, "run": autopilot._write_run(mid, kw.get("hermes_root"), state="running")}))
+    manifest = _rec_manifest()
+    _tick(manifest, hermes_root)   # mint g1
+    _tick(manifest, hermes_root)   # plan+start g1
+    _set_generation_outcome(hermes_root, "msn-camp-recur-g1", "completed")
+    out = _tick(manifest, hermes_root)  # g1 terminal -> outcome recorded
+    assert _phase(out, "s1") == "succeeded"
+    assert out["finished"] is False    # recurrence owed: not finished
+    assert out["recurrence"]["generation"] == 1
+    assert out["recurrence"]["rollover_due"] is False  # pacing just started
+    state = json.loads((hermes_root / "campaigns" / "camp-test" / "state.json").read_text())
+    assert state["generation_history"][-1]["outcome"] == "succeeded"
+    _backdate_finished(hermes_root, "camp-test")
+    out = _tick(manifest, hermes_root)  # rollover + same-tick mint of g2
+    roll = [a for a in out["actions"] if a["action"] == "generation_rollover"]
+    assert roll and roll[0]["to_generation"] == 2
+    assert out["recurrence"]["generation"] == 2
+    g2 = json.loads(mission.hermes_mission_get("msn-camp-recur-g2", hermes_root=hermes_root))
+    assert g2.get("found", True) is not False and g2["status"] == "draft"
+    g1 = json.loads(mission.hermes_mission_get("msn-camp-recur-g1", hermes_root=hermes_root))
+    assert g1["status"] == "completed"  # prior generation untouched
+
+
+def test_rollover_paces_by_interval(hermes_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(autopilot, "hermes_autopilot_start", lambda mid, **kw: json.dumps(
+        {"success": True, "run": autopilot._write_run(mid, kw.get("hermes_root"), state="running")}))
+    manifest = _rec_manifest()
+    _tick(manifest, hermes_root)
+    _tick(manifest, hermes_root)
+    _set_generation_outcome(hermes_root, "msn-camp-recur-g1", "completed")
+    out = _tick(manifest, hermes_root)
+    assert out["finished"] is False
+    assert out["recurrence"]["rollover_due"] is False
+    assert out["recurrence"]["next_generation_at"] is not None
+    out2 = _tick(manifest, hermes_root)  # pacing holds: no g2 mint
+    assert [a for a in out2["actions"] if a["action"] == "mission_create"] == []
+    assert json.loads(mission.hermes_mission_get(
+        "msn-camp-recur-g2", hermes_root=hermes_root)).get("success") is False
+
+
+def test_max_generations_cap_finishes(hermes_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(autopilot, "hermes_autopilot_start", lambda mid, **kw: json.dumps(
+        {"success": True, "run": autopilot._write_run(mid, kw.get("hermes_root"), state="running")}))
+    manifest = _rec_manifest(max_generations=1)
+    _tick(manifest, hermes_root)
+    _tick(manifest, hermes_root)
+    _set_generation_outcome(hermes_root, "msn-camp-recur-g1", "completed")
+    out = _tick(manifest, hermes_root)
+    assert out["finished"] is True  # cap reached: recurring campaign is done
+    assert out["recurrence"]["generation"] == 1
+
+
+def test_consecutive_failure_bound_stops_recurrence(hermes_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(autopilot, "hermes_autopilot_start", lambda mid, **kw: json.dumps(
+        {"success": True, "run": autopilot._write_run(mid, kw.get("hermes_root"), state="running")}))
+    manifest = _rec_manifest(max_generations=10, max_consecutive_failures=2)
+    for gen in (1, 2):
+        _tick(manifest, hermes_root)
+        _tick(manifest, hermes_root)
+        json.loads(mission.hermes_mission_transition(
+            f"msn-camp-recur-g{gen}", "failed", reason="test fail", confirm=True, dry_run=False,
+            hermes_root=hermes_root))
+        _tick(manifest, hermes_root)
+        _backdate_finished(hermes_root, "camp-test")
+    out = _tick(manifest, hermes_root)
+    assert out["finished"] is True  # 2 consecutive failures = permanent park
+    assert [a for a in out["actions"] if a["action"] == "generation_rollover"] == []
+    state = json.loads((hermes_root / "campaigns" / "camp-test" / "state.json").read_text())
+    assert state["consecutive_failures"] == 2
+    assert str(state["recurrence_stopped"]).startswith("consecutive_failures=2")
+    assert json.loads(mission.hermes_mission_get(
+        "msn-camp-recur-g3", hermes_root=hermes_root)).get("success") is False
+
+
+def test_success_resets_failure_counter(hermes_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(autopilot, "hermes_autopilot_start", lambda mid, **kw: json.dumps(
+        {"success": True, "run": autopilot._write_run(mid, kw.get("hermes_root"), state="running")}))
+    manifest = _rec_manifest(max_generations=10, max_consecutive_failures=2)
+    for gen, outcome in ((1, "failed"), (2, "completed"), (3, "failed")):
+        _tick(manifest, hermes_root)
+        _tick(manifest, hermes_root)
+        _set_generation_outcome(hermes_root, f"msn-camp-recur-g{gen}", outcome)
+        _tick(manifest, hermes_root)
+        _backdate_finished(hermes_root, "camp-test")
+    out = _tick(manifest, hermes_root)
+    assert out["finished"] is False              # bound not hit (1 failure after a success)
+    assert out["recurrence"]["generation"] == 4  # rolled to g4
+
+
+def test_state_loss_recovers_generation(hermes_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(autopilot, "hermes_autopilot_start", lambda mid, **kw: json.dumps(
+        {"success": True, "run": autopilot._write_run(mid, kw.get("hermes_root"), state="running")}))
+    manifest = _rec_manifest(max_generations=5)
+    _tick(manifest, hermes_root)
+    _tick(manifest, hermes_root)
+    _set_generation_outcome(hermes_root, "msn-camp-recur-g1", "completed")
+    _tick(manifest, hermes_root)
+    _backdate_finished(hermes_root, "camp-test")
+    _tick(manifest, hermes_root)  # rollover -> g2 minted
+    assert json.loads(mission.hermes_mission_get(
+        "msn-camp-recur-g2", hermes_root=hermes_root)).get("found") is not False
+    # state loss: delete state.json — the next tick must ADOPT g2, never re-mint
+    (hermes_root / "campaigns" / "camp-test" / "state.json").unlink()
+    out = _tick(manifest, hermes_root)
+    assert out["recurrence"]["generation"] == 2
+    assert [a for a in out["actions"] if a["action"] == "mission_create"] == []
+    assert _phase(out, "s1") in ("minted", "active", "parked_autopilot_gate")
+
+
+def test_recurrence_dry_run_mutates_nothing(hermes_root: Path) -> None:
+    manifest = _rec_manifest()
+    out = json.loads(ctrl.campaign_controller_tick(manifest, hermes_root=hermes_root))
+    assert out["success"] is True and out["dry_run"] is True
+    assert not (hermes_root / "campaigns").exists()
+    g1 = json.loads(mission.hermes_mission_get(
+        "msn-camp-recur-g1", hermes_root=hermes_root))
+    assert g1.get("success") is False or g1.get("found") is False
+
+
+def test_nonrecurring_manifest_has_no_generation_fields(hermes_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # regression: finite campaigns (the live nrm-cleanup-pilot shape) keep
+    # byte-identical behavior — finished once, no generation state
+    monkeypatch.setattr(autopilot, "hermes_autopilot_start", lambda mid, **kw: json.dumps(
+        {"success": True, "run": autopilot._write_run(mid, kw.get("hermes_root"), state="running")}))
+    manifest = _manifest(_segment("s1", "msn-c1"))
+    _tick(manifest, hermes_root)
+    _tick(manifest, hermes_root)
+    json.loads(mission.hermes_mission_transition(
+        "msn-c1", "failed", reason="done", confirm=True, dry_run=False, hermes_root=hermes_root))
+    out = _tick(manifest, hermes_root)
+    assert out["finished"] is True
+    assert out["recurrence"] is None
+    state = json.loads((hermes_root / "campaigns" / "camp-test" / "state.json").read_text())
+    assert "generation" not in state and "generation_history" not in state
