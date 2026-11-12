@@ -21,17 +21,30 @@ from pathlib import Path
 import pytest
 
 import operator_autopilot as autopilot
-import operator_campaign_controller as ctrl
 import operator_campaign_lane as lane
 import operator_mission_runtime as mission
+import operator_policy as op
 
 from test_operator_campaign_controller import (
     _backdate_finished,
     _rec_manifest,
-    _segment,
     _set_generation_outcome,
-    hermes_root,
 )
+
+
+@pytest.fixture
+def hermes_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Mirrors test_operator_campaign_controller.hermes_root (self-contained)."""
+    root = tmp_path / "hermes"
+    root.mkdir()
+    op.set_audit_log_override(tmp_path / "audit.jsonl")
+    monkeypatch.setenv(op.OPERATOR_ENABLED_ENV, "1")
+    monkeypatch.setenv(op.OPERATOR_LEVEL_ENV, "workspace")
+    monkeypatch.setenv(op.OPERATOR_APPLY_MODE_ENV, "direct")
+    monkeypatch.delenv(op.OWNER_ACTIVE_ENV, raising=False)
+    monkeypatch.delenv(op.OWNER_ACK_ENV, raising=False)
+    monkeypatch.delenv(autopilot.AUTOPILOT_ENV, raising=False)
+    return root
 
 
 def _manifest_file(tmp_path: Path, name: str, manifest: str) -> Path:
