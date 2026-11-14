@@ -4,6 +4,7 @@ import base64
 import hashlib
 import threading
 from contextlib import contextmanager
+from datetime import UTC
 from pathlib import Path
 
 import pytest
@@ -523,7 +524,7 @@ def test_slow_launch_does_not_hold_peer_lock_for_unrelated_conflict_domain(
 
     def delayed_launch(_contract, **_kwargs):
         launch_entered.set()
-        assert launch_resume.wait(5), "test did not release delayed writer launch"
+        assert launch_resume.wait(60), "test did not release delayed writer launch"
         return {"success": True, "changed": True, "backend": "pi_rpc"}
 
     svc.write_dispatch_fn = delayed_launch
@@ -538,7 +539,7 @@ def test_slow_launch_does_not_hold_peer_lock_for_unrelated_conflict_domain(
 
     accept_thread = threading.Thread(target=run_accept)
     accept_thread.start()
-    assert launch_entered.wait(5), "accept did not reach delayed writer launch"
+    assert launch_entered.wait(30), "accept did not reach delayed writer launch"
 
     def run_unrelated_operations():
         try:
@@ -565,12 +566,16 @@ def test_slow_launch_does_not_hold_peer_lock_for_unrelated_conflict_domain(
 
     unrelated_thread = threading.Thread(target=run_unrelated_operations)
     unrelated_thread.start()
-    assert unrelated_finished.wait(2), "slow external launch held the peer-wide lock"
-    assert claim_for(svc, "workspace:unrelated")["state"] == "ACTIVE"
-
-    launch_resume.set()
-    accept_thread.join(5)
-    unrelated_thread.join(5)
+    try:
+        assert unrelated_finished.wait(30), "slow external launch held the peer-wide lock"
+        assert claim_for(svc, "workspace:unrelated")["state"] == "ACTIVE"
+        # The unrelated operations must finish BEFORE the blocked launch is
+        # released. This detects lock retention without requiring a fast VM.
+        assert not launch_resume.is_set() and accept_thread.is_alive()
+    finally:
+        launch_resume.set()
+        accept_thread.join(30)
+        unrelated_thread.join(30)
     assert not accept_thread.is_alive()
     assert not unrelated_thread.is_alive()
     assert errors == []
@@ -1274,10 +1279,10 @@ def facts(now):
 
 
 def test_auto_remote_write_unlock_requires_live_g4c_features(tmp_path, monkeypatch):
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     monkeypatch.setattr(runners, "_runner_allowed", lambda _name: True)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     common = {
         "registry_loader": lambda: {"node-a": node()},
         "routing_policy_loader": lambda: base_router.RoutingPolicy(targets={"node-a": facts(now)}),
@@ -1302,7 +1307,7 @@ def test_auto_remote_write_unlock_requires_live_g4c_features(tmp_path, monkeypat
 
 
 def test_g4c_auto_route_audits_only_authoritative_post_unlock_decision(tmp_path, monkeypatch):
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     monkeypatch.setattr(runners, "_runner_allowed", lambda _name: True)
     audits: list[dict[str, object]] = []
@@ -1317,7 +1322,7 @@ def test_g4c_auto_route_audits_only_authoritative_post_unlock_decision(tmp_path,
         )
 
     monkeypatch.setattr(base_router, "_audit_route", capture_audit)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     decision = fabric.AutoRouter(
         registry_loader=lambda: {"node-a": node()},
         routing_policy_loader=lambda: base_router.RoutingPolicy(targets={"node-a": facts(now)}),
@@ -1359,7 +1364,7 @@ def test_g4c_auto_route_audits_only_authoritative_post_unlock_decision(tmp_path,
 def test_g4c_auto_route_audits_failure_when_feature_gate_raises(tmp_path, monkeypatch):
     """A gate crash after the preliminary base route must still leave one audit
     record, must not claim the preliminary winner, and must propagate."""
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     monkeypatch.setattr(runners, "_runner_allowed", lambda _name: True)
     audits: list[dict[str, object]] = []
@@ -1379,7 +1384,7 @@ def test_g4c_auto_route_audits_failure_when_feature_gate_raises(tmp_path, monkey
         def get(self, *_args, **_kwargs):
             raise RuntimeError("g4c feature gate exploded")
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     router_obj = fabric.AutoRouter(
         registry_loader=lambda: {"node-a": node()},
         routing_policy_loader=lambda: base_router.RoutingPolicy(targets={"node-a": facts(now)}),
@@ -1406,10 +1411,10 @@ def test_g4c_auto_route_audits_failure_when_feature_gate_raises(tmp_path, monkey
 
 
 def test_auto_remote_artifact_unlock_requires_snapshot_features(tmp_path, monkeypatch):
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     monkeypatch.setattr(runners, "_runner_allowed", lambda _name: True)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     router_obj = fabric.AutoRouter(
         registry_loader=lambda: {"node-a": node()},
         routing_policy_loader=lambda: base_router.RoutingPolicy(targets={"node-a": facts(now)}),
@@ -1429,10 +1434,10 @@ def test_auto_remote_artifact_unlock_requires_snapshot_features(tmp_path, monkey
 
 
 def test_local_auto_write_remains_fail_closed(tmp_path, monkeypatch):
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     monkeypatch.setattr(runners, "_runner_allowed", lambda _name: True)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     route = fabric.AutoRouter(
         registry_loader=dict,
         routing_policy_loader=lambda: base_router.RoutingPolicy(targets={"local": facts(now)}),
