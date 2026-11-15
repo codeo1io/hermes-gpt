@@ -93,12 +93,22 @@ def _write_kanban(root: Path, task_id: str, kind: str, ts: str, summary: str = "
         conn.close()
 
 
+def _seed_ts(days_ago: float, hour: int) -> str:
+    """Seed timestamps anchored to NOW: the 90-day retention window
+    (DEFAULT_MAX_AGE_DAYS) must never expire the fixture data. The original
+    fixed 2026-08-15 seeds aged out exactly on 2026-11-13 (Aug 15 + 90d),
+    flipping every seeded-events assertion from >=5 events to 0 — a pure
+    wall-clock time bomb, not a product regression."""
+    base = datetime.now(timezone.utc) - timedelta(days=days_ago)
+    return base.replace(hour=hour, minute=0, second=0, microsecond=0).isoformat()
+
+
 def _seed_all_sources(root: Path) -> None:
-    _write_audit(root, [{"timestamp": "2026-08-15T10:00:00+00:00", "tool": "hermes_contract_validate", "profile": "dev", "success": True, "summary": "validate ok"}])
-    _write_swarm(root, "sw-1", "done", "2026-08-15T11:00:00+00:00")
-    _write_codex(root, "codex-1", "finished", "2026-08-15T12:00:00+00:00")
-    _write_cron(root, "job-1", "completed", "2026-08-15T13:00:00+00:00")
-    _write_kanban(root, "t_123", "claimed", "2026-08-15T14:00:00+00:00", "claimed by dev")
+    _write_audit(root, [{"timestamp": _seed_ts(0, 10), "tool": "hermes_contract_validate", "profile": "dev", "success": True, "summary": "validate ok"}])
+    _write_swarm(root, "sw-1", "done", _seed_ts(0, 11))
+    _write_codex(root, "codex-1", "finished", _seed_ts(0, 12))
+    _write_cron(root, "job-1", "completed", _seed_ts(0, 12))
+    _write_kanban(root, "t_123", "claimed", _seed_ts(0, 14), "claimed by dev")
 
 
 def test_query_all_sources_returns_ordered_timeline(hermes_root):
@@ -119,7 +129,7 @@ def test_no_raw_body_across_all_sources(hermes_root):
     # Add a nasty audit row with prompt text that must be summarized, not passed.
     _write_audit(
         hermes_root,
-        [{"timestamp": "2026-08-15T15:00:00+00:00", "tool": "hermes_skill_create", "profile": "dev", "success": True, "summary": "created skill", "prompt": "SECRET PROMPT BODY with api key sk-1234567890abcdefghijklmnop", "content": "raw content body"}],
+        [{"timestamp": _seed_ts(0, 15), "tool": "hermes_skill_create", "profile": "dev", "success": True, "summary": "created skill", "prompt": "SECRET PROMPT BODY with api key sk-1234567890abcdefghijklmnop", "content": "raw content body"}],
     )
     out = json.loads(ev.hermes_events_tail(limit=100, hermes_root=hermes_root))
     raw = json.dumps(out)
@@ -216,7 +226,7 @@ def test_query_by_kind_filters(hermes_root):
 
 def test_limit_caps_and_truncation_flag(hermes_root):
     for i in range(10):
-        _write_audit(hermes_root, [{"timestamp": f"2026-08-15T10:{i:02d}:00+00:00", "tool": "hermes_operator_status", "profile": "dev", "success": True, "summary": f"event {i}"}])
+        _write_audit(hermes_root, [{"timestamp": _seed_ts(0, 10).replace(":00:00+00:00", f":{i:02d}:00+00:00"), "tool": "hermes_operator_status", "profile": "dev", "success": True, "summary": f"event {i}"}])
     out = json.loads(ev.hermes_events_query(source="audit", limit=3, hermes_root=hermes_root))
     assert out["count_returned"] == 3
     assert out["count_total"] == 10
