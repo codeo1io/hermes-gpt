@@ -411,3 +411,98 @@ def test_plan_set_status_is_operator_reviewable(hermes_root):
     assert ok["success"] is True
     got = _j(plan.hermes_plan_get("msn-plan", hermes_root=hermes_root))
     assert got["status"] == "approved"
+
+
+# -- cutover/native-mission-authority-20261117: create-only CAS + node binding
+
+
+def test_plan_create_require_absent_is_create_only_cas(hermes_root):
+    """require_absent=true refuses to REPLACE an existing plan: concurrent
+    first-dispatchers converge on ONE plan; the loser gets the winner's
+    identity (version/status/sha) back and adopts it — never a version bump."""
+    _make_mission(hermes_root)
+    d = _j(plan.hermes_plan_decompose("msn-plan", hermes_root=hermes_root))
+    first = _j(plan.hermes_plan_create(
+        "msn-plan", json.dumps(d), confirm=True, dry_run=False,
+        require_absent=True, hermes_root=hermes_root))
+    assert first["success"] is True and first["version"] == 1
+
+    # The racing second create: same content, require_absent — REFUSED, with
+    # the existing plan's identity for adoption.
+    second = _j(plan.hermes_plan_create(
+        "msn-plan", json.dumps(d), confirm=True, dry_run=False,
+        require_absent=True, hermes_root=hermes_root))
+    assert second["success"] is False
+    assert second["code"] == "PLAN_ALREADY_EXISTS"
+    assert second["existing_version"] == 1
+    assert second["existing_status"] == "draft"
+    assert len(second["existing_plan_sha256"]) == 64
+
+    # Version was NOT bumped by the refused racer.
+    got = _j(plan.hermes_plan_get("msn-plan", hermes_root=hermes_root))
+    assert got["version"] == 1
+
+    # Legacy default (require_absent=False) still replaces per policy.
+    d["nodes"][0]["budget"]["est_minutes"] = 90
+    legacy = _j(plan.hermes_plan_create(
+        "msn-plan", json.dumps(d), confirm=True, dry_run=False, hermes_root=hermes_root))
+    assert legacy["success"] is True and legacy["version"] == 2
+
+
+def test_plan_bind_delegation_gates_node_lineage(hermes_root):
+    """Plan-node binding makes the MissionPlan authoritative for one
+    delegation: correct sha binds and marks the node dispatched; a divergent
+    sha refuses; rebinding the same pair is idempotent; a foreign delegation
+    refuses on an already-bound node."""
+    import hashlib as _h
+
+    _make_mission(hermes_root)
+    d = _j(plan.hermes_plan_decompose("msn-plan", hermes_root=hermes_root))
+    _j(plan.hermes_plan_create("msn-plan", json.dumps(d), confirm=True, dry_run=False, hermes_root=hermes_root))
+    good_sha = _h.sha256(b"contract-bytes").hexdigest()
+    bad_sha = _h.sha256(b"other-contract").hexdigest()
+
+    # dry-run probe is read-only
+    probe = _j(plan.hermes_plan_bind_delegation(
+        "msn-plan", "implementation", "dlg-bindtest0000001", good_sha,
+        dry_run=True, hermes_root=hermes_root))
+    assert probe["success"] is True and probe["changed"] is False
+    assert probe["node_exists"] is True
+
+    # confirm required
+    noc = _j(plan.hermes_plan_bind_delegation(
+        "msn-plan", "implementation", "dlg-bindtest0000001", good_sha,
+        dry_run=False, hermes_root=hermes_root))
+    assert noc["success"] is False and noc["code"] == "CONFIRMATION_REQUIRED"
+
+    # binding without confirm=false, confirm=True
+    bound = _j(plan.hermes_plan_bind_delegation(
+        "msn-plan", "implementation", "dlg-bindtest0000001", good_sha,
+        confirm=True, dry_run=False, hermes_root=hermes_root))
+    assert bound["success"] is True and bound["changed"] is True
+    assert bound["node_state"] == "dispatched"
+
+    # idempotent rebind
+    again = _j(plan.hermes_plan_bind_delegation(
+        "msn-plan", "implementation", "dlg-bindtest0000001", good_sha,
+        confirm=True, dry_run=False, hermes_root=hermes_root))
+    assert again["success"] is True and again["changed"] is False
+    assert again.get("idempotent") is True
+
+    # divergent lineage refuses
+    mismatch = _j(plan.hermes_plan_bind_delegation(
+        "msn-plan", "implementation", "dlg-bindtest0000002", bad_sha,
+        confirm=True, dry_run=False, hermes_root=hermes_root))
+    assert mismatch["success"] is False
+    assert mismatch["code"] == "PLAN_NODE_ALREADY_BOUND"
+
+    # unknown node refuses
+    missing = _j(plan.hermes_plan_bind_delegation(
+        "msn-plan", "zz", "dlg-bindtest0000003", good_sha,
+        confirm=True, dry_run=False, hermes_root=hermes_root))
+    assert missing["success"] is False
+
+    # node state persisted the binding
+    got = _j(plan.hermes_plan_get("msn-plan", hermes_root=hermes_root))
+    node_a = next(n for n in got["nodes"] if n["node_id"] == "implementation")
+    assert node_a["state"] == "dispatched"

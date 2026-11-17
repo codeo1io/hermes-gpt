@@ -102,6 +102,18 @@ def _bounded_turn_budget(pinned: Any, invocation_timeout: Any) -> float:
     return max(_MIN_TURN_BUDGET_SECONDS, min(seconds, _MAX_TURN_BUDGET_SECONDS))
 
 
+def _optional_override(value: Any) -> str | None:
+    """Guard for optional ``execution.options`` text overrides (S2, 2026-11-17).
+
+    An override applies only when the caller pinned a non-empty string;
+    anything else (absent, non-string, empty) falls back to legacy payload
+    semantics so the additive options can never reshape a legacy envelope.
+    """
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
 #: Coding backends the Hermes Agent runtime understands for one delegation.
 #: The session binding is keyed by backend; a binding served on a different
 #: backend would collapse two identities, so the mapping is fixed here.
@@ -124,6 +136,34 @@ def _spool_root(hermes_root: Path | None = None) -> Path:
     if raw:
         return Path(raw).expanduser()
     return DEFAULT_SPOOL_ROOT
+
+
+def _resolve_spool_root(hermes_root: Path | None = None, options: dict[str, Any] | None = None) -> Path:
+    """Resolve the dispatch/observation spool root for one contract (D2, 2026-11-17).
+
+    ``execution.options.spool_root`` routes a single dispatch to a dedicated
+    delegate spool (e.g. the conductor maestro fastlane) without touching the
+    process-global ``HERMES_GPT_DELEGATE_SPOOL_ROOT`` env the sidecar serves
+    ALL missions with. Validated: absolute, real directory, no symlink, and
+    the canonical ``pending/`` + ``results/`` spool layout. Anything else
+    refuses (fail closed) rather than silently falling back to the shared
+    firehose the lane was built to escape.
+    """
+    raw = str((options or {}).get("spool_root") or "").strip()
+    if not raw:
+        return _spool_root(hermes_root)
+    root = Path(raw).expanduser()
+    if not root.is_absolute():
+        raise ValueError(f"options.spool_root must be an absolute path: {raw!r}")
+    resolved = root.resolve()
+    if str(resolved) != str(root):
+        raise ValueError(f"options.spool_root must not contain symlinks: {raw!r}")
+    if not (root.is_dir() and (root / "pending").is_dir() and (root / "results").is_dir()):
+        raise ValueError(
+            f"options.spool_root is not an initialized delegate spool "
+            f"(missing pending/ or results/): {raw!r}"
+        )
+    return root
 
 
 def _atomic_write_json(path: Path, value: dict[str, Any]) -> None:
@@ -181,6 +221,40 @@ class HermesAgentBackend:
     """
 
     name = "hermes_agent"
+
+    def __init__(self) -> None:
+        # D2 (2026-11-17): task_id -> per-dispatch spool root recorded at
+        # dispatch time. Observing/cancelling a task that was dispatched to a
+        # dedicated lane (maestro fastlane) must read THAT lane's spool, not
+        # the process-global env root. The delegation row's backend_ref_json
+        # is the durable authority (written at the dispatch CAS); this
+        # in-process map is the live cache for same-process observation.
+        self._task_roots: dict[str, str] = {}
+
+    def _record_task_root(self, task_id: str, root: Path) -> None:
+        try:
+            self._task_roots[str(task_id)] = str(root)
+        except Exception:  # pragma: no cover - defensive
+            pass
+
+    def seed_task_root(self, task_id: str, root: str) -> None:
+        """D2 durable recovery: adopt a per-dispatch root recorded in a
+        delegation row's backend_ref (authority: the dispatch CAS). Seeding
+        never overrides a root recorded by an actual dispatch in this
+        process; it only fills in after a sidecar restart."""
+        key = str(task_id)
+        if key in self._task_roots:
+            return
+        try:
+            self._task_roots[key] = str(Path(root).expanduser())
+        except Exception:  # pragma: no cover - defensive
+            pass
+
+    def _task_root_override(self, task_id: str) -> dict[str, Any] | None:
+        cached = self._task_roots.get(str(task_id))
+        if cached:
+            return {"spool_root": cached}
+        return None
 
     # -- RunnerBackend protocol -------------------------------------------
 
@@ -281,7 +355,8 @@ class HermesAgentBackend:
                 "workspace": str(workspace_path),
             }
 
-        root = _spool_root(hermes_root)
+        root = _resolve_spool_root(hermes_root, options)
+        self._record_task_root(task_id, root)
         pending = root / "pending"
         results = root / "results"
         if not (pending.is_dir() and results.is_dir()):
@@ -326,7 +401,20 @@ class HermesAgentBackend:
         # fleet firehose — which starved the first real native mission order
         # 2h+ in pending while 86 typed orders flowed past it.
         payload_timeout = _bounded_turn_budget(options.get("timeout"), timeout)
-        instruction = str(options.get("context") or "")
+        # S2 (2026-11-17) additive option passthrough: the conductor renders
+        # the authoritative phase-bounded prompt, so options.prompt overrides
+        # the bounded objective summary in phase_prompt, and options.instruction
+        # rides action_payload (taking precedence over legacy options.context).
+        # Absent/empty/non-string values keep the legacy payload byte-identical.
+        prompt_override = _optional_override(options.get("prompt"))
+        phase_prompt = (
+            prompt_override
+            if prompt_override is not None
+            else str(contract.get("objective") or "")
+        )
+        instruction = _optional_override(options.get("instruction"))
+        if instruction is None:
+            instruction = str(options.get("context") or "")
         payload = {
             "schema": 1,
             "interface": "delegate_session",
@@ -336,7 +424,7 @@ class HermesAgentBackend:
             "intent": str(options.get("intent") or "mission_node"),
             "backend_hint": native_backend,
             "workspace_path": str(workspace_path),
-            "phase_prompt": str(contract.get("objective") or ""),
+            "phase_prompt": phase_prompt,
             "timeout_seconds": payload_timeout,
             "attempt_seq": int(options.get("attempt_seq") or 1),
             # Session binding: the stable logical identity Hermes Agent keys
@@ -353,6 +441,28 @@ class HermesAgentBackend:
             "spool_path": str(root),
         }
         action_payload: dict[str, Any] = {"phase_timeout_seconds": payload_timeout}
+        # D3 (2026-11-17) additive merge: callers may enrich the work order
+        # with durable control keys (phase_result_required, phase_id,
+        # evidence_expectations, unit_key, session_affinity_key,
+        # maintenance.repo_path, autonomous_questions, completion_locked,
+        # execution_cwd, …) via options.action_payload, and pin native
+        # session identity via options.session_binding (native_session_id,
+        # binding_id, resume …). Structured objects merge shallowly; scalars
+        # must not clobber the runner's own guaranteed keys
+        # (phase_timeout_seconds / expected_artifacts / instruction /
+        # execution_cwd — the spool server's fold + EDF + artifact semantics
+        # depend on them).
+        caller_ap = options.get("action_payload")
+        if isinstance(caller_ap, dict) and caller_ap:
+            for key, value in caller_ap.items():
+                if not isinstance(key, str) or key in (
+                    "phase_timeout_seconds",
+                    "expected_artifacts",
+                    "instruction",
+                    "execution_cwd",
+                ):
+                    continue
+                action_payload[key] = value
         # Native mission-node transport must know the immutable deliverable
         # basenames. A preamble-only idle is not completion; the spool server
         # can continue the SAME session only while these files are absent.
@@ -388,6 +498,16 @@ class HermesAgentBackend:
                 )
             action_payload["execution_cwd"] = str(execution_dir.resolve())
         payload["action_payload"] = action_payload
+        # D3 (2026-11-17): session_binding merge — callers may pin the native
+        # session identity keys Hermes Agent's supervisor keys durable resume
+        # on (native_session_id, binding_id, resume, affinity_key). The
+        # runner's own run_id/role/backend identity keys stay authoritative.
+        caller_sb = options.get("session_binding")
+        if isinstance(caller_sb, dict) and caller_sb:
+            for key, value in caller_sb.items():
+                if not isinstance(key, str) or key in ("run_id", "role", "backend"):
+                    continue
+                payload["session_binding"][key] = value
 
         body = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
         if len(body) > _MAX_PAYLOAD_BYTES:
@@ -423,6 +543,7 @@ class HermesAgentBackend:
                 "workspace": str(workspace_path),
                 "transport": _ARCH_TAG,
                 "detail": "pending envelope already present; first publish is authority",
+                "spool_root": str(root),
             }
         _atomic_write_json(envelope_path, payload)
         return {
@@ -435,12 +556,13 @@ class HermesAgentBackend:
             "delegate_backend": native_backend,
             "workspace": str(workspace_path),
             "transport": _ARCH_TAG,
+            "spool_root": str(root),
         }
 
     def observed_runs(self, task_id: str, *, hermes_root: Path | None = None) -> list[dict[str, Any]]:
         if not _ATTEMPT_ID_RE.fullmatch(task_id or ""):
             return []
-        root = _spool_root(hermes_root)
+        root = _resolve_spool_root(hermes_root, self._task_root_override(task_id))
         record = self._envelope_to_observation(
             task_id, root / "results" / f"{task_id}.json"
         )
@@ -470,7 +592,7 @@ class HermesAgentBackend:
     def cancel(self, task_id: str, *, hermes_root: Path | None = None) -> dict[str, Any]:
         if not _ATTEMPT_ID_RE.fullmatch(task_id or ""):
             return {"success": False, "code": "RUNNER_JOB_NOT_FOUND", "backend": self.name}
-        root = _spool_root(hermes_root)
+        root = _resolve_spool_root(hermes_root, self._task_root_override(task_id))
         result_path = root / "results" / f"{task_id}.json"
         if result_path.exists():
             record = self._envelope_to_observation(task_id, result_path)

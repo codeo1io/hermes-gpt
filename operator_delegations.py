@@ -212,6 +212,7 @@ def _backend_ref(payload: dict[str, Any]) -> dict[str, str]:
         "node",
         "selected_node",
         "remote_backend",
+        "spool_root",
     )
     out: dict[str, str] = {}
     for key in allowed:
@@ -589,6 +590,38 @@ def _dispatched_cancel_cas_lost(row: dict[str, Any], result: dict[str, Any]) -> 
     }, ensure_ascii=False, indent=2)
 
 
+def _seed_backend_task_roots(stored: dict[str, Any]) -> None:
+    """D2 recovery (2026-11-17): hand a per-dispatch spool root to the
+    hermes_agent runner backend before observation/cancellation.
+
+    The delegation row's ``backend_ref_json`` is the durable authority for
+    which lane served the dispatch (written at the dispatch CAS via
+    ``_backend_ref``). When it carries ``spool_root``, the backend must read
+    THAT spool — the process-global env root would observe the wrong lane and
+    a sidecar restart would otherwise orphan the run's outcome. Absent
+    spool_root keeps the legacy env-root path (backwards compatible).
+    """
+    try:
+        ref = json.loads(str(stored.get("backend_ref_json") or "{}") or "{}")
+    except ValueError:
+        return
+    if not isinstance(ref, dict):
+        return
+    root = str(ref.get("spool_root") or "").strip()
+    task_id = str(stored.get("task_id") or "").strip()
+    if not root or not task_id:
+        return
+    try:
+        from operator_runners import get_backend
+
+        backend = get_backend("hermes_agent")
+    except (LookupError, ImportError):
+        return
+    seeder = getattr(backend, "seed_task_root", None)
+    if callable(seeder):
+        seeder(task_id, root)
+
+
 def _latest_observation(task_id: str, hermes_root: Path) -> dict[str, Any] | None:
     runs = contract_mod._observed_runs(task_id, hermes_root)
     if not runs:
@@ -727,6 +760,7 @@ def _invocation_unreached_backend(row: dict[str, Any], root: Path) -> bool:
     worker polled ``hermes_delegation_reconcile``, which had no recovery
     path for it.)
     """
+    _seed_backend_task_roots(row)
     phase = str(row.get("dispatch_phase") or "")
     state = str(row.get("state") or "")
     if phase == "invoking" and state in {"reserved", "reconciling"}:
@@ -1194,6 +1228,7 @@ def hermes_delegation_reconcile(
         ):
             raise ValueError("delegation validation manifest does not match lineage")
 
+        _seed_backend_task_roots(stored)
         observed = _latest_observation(stored["task_id"], root)
         stale_invocation = (
             observed is None
@@ -1585,6 +1620,7 @@ def hermes_delegation_cancel(
         # Watermark the pre-cancel observation so reconcile can distinguish a
         # terminal backend record that POSTDATES the cancellation attempt from
         # stale pre-cancel terminality (5c67834 cancellation ordering rule).
+        _seed_backend_task_roots(stored)
         watermark = _observation_sha256(_latest_observation(stored["task_id"], root))
         with _connect(path, write=True) as db:
             _init(db)

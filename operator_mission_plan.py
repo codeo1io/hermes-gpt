@@ -788,6 +788,7 @@ def hermes_plan_create(
     confirm: bool = False,
     dry_run: bool = True,
     status: str = PLAN_STATUS_DRAFT,
+    require_absent: bool = False,
     hermes_root: Path | None = None,
 ) -> str:
     """Create (or replace-version) a MissionPlan for a mission. Additive.
@@ -795,6 +796,13 @@ def hermes_plan_create(
     Never dispatches work or mutates the Mission lifecycle. If ``plan_json`` is
     empty, the plan is derived deterministically from the mission spec
     (canonical Swarm shape). ``status`` is the plan review status.
+
+    ``require_absent=True`` (cutover/native-mission-authority-20261117) turns
+    the create into a CREATE-ONLY CAS: an existing plan (any status) refuses
+    with PLAN_ALREADY_EXISTS instead of replacing it. This is the safe
+    primitive for concurrent first-dispatch probe-then-create races — both
+    racers converge on ONE plan and the loser adopts the winner's version
+    instead of silently bumping it.
     """
     policy = op.OperatorPolicy()
     try:
@@ -846,9 +854,25 @@ def hermes_plan_create(
             mission._get_row(db, mission_id)  # verify mission exists (raises LookupError)
             now = _now()
             existing = db.execute(
-                "SELECT version FROM mission_plans WHERE mission_id=?", (mission_id,)
+                "SELECT version,status,plan_sha256 FROM mission_plans WHERE mission_id=?",
+                (mission_id,),
             ).fetchone()
             if existing:
+                if require_absent:
+                    db.rollback()
+                    return json.dumps({
+                        "success": False, "schema_version": SCHEMA_VERSION,
+                        "tool": "hermes_plan_create", "mission_id": mission_id,
+                        "code": "PLAN_ALREADY_EXISTS",
+                        "safe_message": (
+                            "a MissionPlan already exists for this mission and "
+                            "require_absent=true forbids replacement (create-only CAS)"
+                        ),
+                        "existing_version": int(existing["version"]),
+                        "existing_status": str(existing["status"]),
+                        "existing_plan_sha256": str(existing["plan_sha256"]),
+                        "changed": False,
+                    })
                 _assert_replaceable(db, mission_id, hermes_root)
             new_version = int(existing["version"]) + 1 if existing else int(plan.get("version", 1))
             store_plan = dict(plan)
@@ -1689,3 +1713,136 @@ def apply_rework_patch(
 def validate_node_transition(from_state: str, to_state: str) -> bool:
     """Return whether ``from_state -> to_state`` is a legal §5.2 transition."""
     return from_state in NODE_TRANSITIONS and to_state in NODE_TRANSITIONS[from_state]
+
+
+# ---------------------------------------------------------------------------
+# Plan-node execution binding (cutover/native-mission-authority-20261117)
+# ---------------------------------------------------------------------------
+
+
+def hermes_plan_bind_delegation(
+    mission_id: str,
+    node_id: str,
+    delegation_id: str,
+    contract_sha256: str,
+    *,
+    confirm: bool = False,
+    dry_run: bool = True,
+    hermes_root: Path | None = None,
+) -> str:
+    """Bind one delegation to a plan node (P0 plan authority, 2026-11-17).
+
+    Server-side gate making the MissionPlan authoritative for execution: the
+    node's ``contract_sha256`` pins the lineage — a delegation whose contract
+    digest diverges from the bound node refuses (fail closed), and a bound
+    delegation later observed terminal moves the node to ``validated``
+    (autopilot vocabulary) so reconcile outcome gates can read plan truth.
+    Idempotent: rebinding the same (node, delegation, sha) is a no-op.
+    """
+    policy = op.OperatorPolicy()
+    try:
+        policy.require_level("workspace")
+        policy.require_mutation(dry_run)
+        if not MISSION_ID_RE.fullmatch(mission_id or ""):
+            raise ValueError("mission_id is invalid")
+        node_id = str(node_id or "").strip()
+        delegation_id = str(delegation_id or "").strip()
+        contract_sha256 = str(contract_sha256 or "").strip()
+        if not node_id or not delegation_id or not re.fullmatch(r"[0-9a-f]{64}", contract_sha256):
+            raise ValueError("node_id, delegation_id and a 64-hex contract_sha256 are required")
+
+        path = _db_path(hermes_root)
+        if not path.is_file():
+            raise LookupError(f"no plan store at {path}")
+
+        if dry_run or policy.effective_dry_run(dry_run):
+            with _connect(path, write=False) as db:
+                node = db.execute(
+                    "SELECT contract_sha256 FROM plan_nodes WHERE mission_id=? AND node_id=?",
+                    (mission_id, node_id),
+                ).fetchone()
+            return json.dumps({
+                "success": True, "schema_version": SCHEMA_VERSION,
+                "tool": "hermes_plan_bind_delegation", "mission_id": mission_id,
+                "node_id": node_id, "delegation_id": delegation_id,
+                "node_exists": node is not None, "changed": False, "dry_run": True,
+            })
+
+        if not confirm:
+            return json.dumps({
+                "success": False, "schema_version": SCHEMA_VERSION,
+                "code": "CONFIRMATION_REQUIRED",
+                "safe_message": "plan-node delegation binding requires confirm=true",
+                "changed": False,
+            })
+
+        now = _now()
+        with _replacement_lease(mission_id, hermes_root), _connect(path, write=True) as db:
+            _begin_write(db)
+            mission._get_row(db, mission_id)  # raises LookupError
+            row = db.execute(
+                "SELECT state,contract_sha256,budget FROM plan_nodes WHERE mission_id=? AND node_id=?",
+                (mission_id, node_id),
+            ).fetchone()
+            if row is None:
+                raise LookupError(f"plan node {node_id!r} not found for mission {mission_id!r}")
+            bound = json.loads(str(row["budget"] or "{}"))
+            bound_delegation = str(bound.get("bound_delegation_id") or "")
+            if bound_delegation and bound_delegation != delegation_id:
+                db.rollback()
+                return json.dumps({
+                    "success": False, "schema_version": SCHEMA_VERSION,
+                    "code": "PLAN_NODE_ALREADY_BOUND",
+                    "safe_message": f"plan node {node_id} is bound to delegation {bound_delegation}",
+                    "changed": False,
+                })
+            bound_sha = str(bound.get("bound_contract_sha256") or "")
+            if bound_sha and bound_sha != contract_sha256:
+                db.rollback()
+                return json.dumps({
+                    "success": False, "schema_version": SCHEMA_VERSION,
+                    "code": "PLAN_NODE_LINEAGE_MISMATCH",
+                    "safe_message": "delegation contract digest does not match the plan node lineage",
+                    "changed": False,
+                })
+            if bound_delegation == delegation_id and bound_sha == contract_sha256:
+                db.commit()
+                return json.dumps({
+                    "success": True, "schema_version": SCHEMA_VERSION,
+                    "tool": "hermes_plan_bind_delegation",
+                    "mission_id": mission_id, "node_id": node_id,
+                    "delegation_id": delegation_id, "changed": False,
+                    "idempotent": True,
+                })
+            state = str(row["state"] or "")
+            if state in ("validated", "succeeded", "cancelled"):
+                db.rollback()
+                return json.dumps({
+                    "success": False, "schema_version": SCHEMA_VERSION,
+                    "code": "PLAN_NODE_TERMINAL",
+                    "safe_message": f"plan node {node_id} is already {state}",
+                    "changed": False,
+                })
+            bound["bound_delegation_id"] = delegation_id
+            bound["bound_contract_sha256"] = contract_sha256
+            bound["bound_at"] = now
+            new_state = "dispatched" if state in ("", "pending", "ready") else state
+            db.execute(
+                "UPDATE plan_nodes SET budget=?,state=?,updated_at=? WHERE mission_id=? AND node_id=?",
+                (json.dumps(bound, sort_keys=True), new_state, now, mission_id, node_id),
+            )
+            db.commit()
+
+        _audit(
+            "hermes_plan_bind_delegation", policy, dry_run=False, success=True,
+            changed=True, mission_id=mission_id, node_id=node_id,
+        )
+        return json.dumps({
+            "success": True, "schema_version": SCHEMA_VERSION,
+            "tool": "hermes_plan_bind_delegation", "mission_id": mission_id,
+            "node_id": node_id, "delegation_id": delegation_id,
+            "contract_sha256": contract_sha256, "changed": True,
+            "node_state": new_state,
+        })
+    except (ValueError, LookupError, PermissionError, OSError, sqlite3.Error) as exc:
+        return _error(exc, "PLAN_BIND_FAILED", "Check mission/plan node ids and Operator write access.")

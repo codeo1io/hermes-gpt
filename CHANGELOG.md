@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Campaign controller recurrence: a manifest may declare a bounded `recurrence` block (`interval_s`, `max_generations`, `max_consecutive_failures`) and run its segment DAG as consecutive generations. Segment `mission_id` templates must carry a `{gen}` token so every generation mints its own finite Missions (duplicate-refusal makes collisions impossible); rollover is paced, capped, and stops permanently after the configured run of failing generations. State loss re-derives the current generation from the mission store. Manifests without `recurrence` are byte-identical in behavior.
+- Hermes Agent delegation backend honors two additive work-contract `execution.options` keys: `prompt` overrides the transported `phase_prompt` with the caller's authoritative phase prompt, and `instruction` rides `action_payload.instruction` ahead of legacy `options.context`. Contracts without them publish byte-identical work orders; caller-supplied `delegation_id` round-trip and idempotent re-dispatch are pinned by tests.
 
 ## 0.18.0 — Agent readiness and compatibility
 

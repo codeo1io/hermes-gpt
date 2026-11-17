@@ -701,12 +701,47 @@ def _observed_runs(task_id: str, hermes_root: Path) -> list[dict[str, Any]]:
 
     Existing Mission Control sources remain authoritative for legacy/fleet work;
     pluggable runner jobs contribute their own bounded durable state.
+    D2 (2026-11-17): seed any per-dispatch spool root from the delegations DB
+    BEFORE fan-out so dedicated-lane tasks are observed on their own lane.
     """
+    _seed_runner_task_root(task_id, hermes_root)
     return (
         _observed_kanban_runs(task_id, hermes_root)
         + _observed_delegations(task_id, hermes_root)
         + op_runners.observed_runs(task_id, hermes_root=hermes_root)
     )
+
+
+def _seed_runner_task_root(task_id: str, hermes_root: Path) -> None:
+    """D2 (2026-11-17): before observing a task, seed the hermes_agent runner
+    backend with the per-dispatch spool root recorded in the delegations DB.
+
+    Contract validation runs from the prompt-free validation manifest, which
+    deliberately strips ``execution.options`` — so the only durable record of
+    which dedicated lane (e.g. conductor maestro fastlane) served a dispatch
+    is the delegation row's ``backend_ref_json``. Without this lookup,
+    validating a fastlane task observes the process-global env spool and
+    dead-ends at UNVERIFIED (fail-closed) even though the lane holds a
+    terminal, satisfied result. Seeding is best-effort: no row, no root, or
+    backend absent all keep the legacy env-root observation path.
+    """
+    try:
+        import operator_delegations as op_delegations
+
+        path = op_delegations._db_path(hermes_root)
+        if not path.is_file():
+            return
+        with op_delegations._connect(path, write=False) as db:
+            row = db.execute(
+                "SELECT task_id, backend_ref_json FROM delegations WHERE task_id=? ORDER BY updated_at DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+        if not row:
+            return
+        stored = {"task_id": row[0], "backend_ref_json": row[1]}
+        op_delegations._seed_backend_task_roots(stored)
+    except Exception:
+        return
 
 
 def _observed_audit(
