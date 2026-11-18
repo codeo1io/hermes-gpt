@@ -46,6 +46,7 @@ from pathlib import Path
 from typing import Any
 
 import operator_mission_runtime as mission
+import operator_delegations
 import operator_policy as op
 import operator_skill_resolution as skill_resolution
 from operator_contract import artifact_constraints
@@ -1788,23 +1789,75 @@ def hermes_plan_bind_delegation(
                 raise LookupError(f"plan node {node_id!r} not found for mission {mission_id!r}")
             bound = json.loads(str(row["budget"] or "{}"))
             bound_delegation = str(bound.get("bound_delegation_id") or "")
-            if bound_delegation and bound_delegation != delegation_id:
-                db.rollback()
-                return json.dumps({
-                    "success": False, "schema_version": SCHEMA_VERSION,
-                    "code": "PLAN_NODE_ALREADY_BOUND",
-                    "safe_message": f"plan node {node_id} is bound to delegation {bound_delegation}",
-                    "changed": False,
-                })
             bound_sha = str(bound.get("bound_contract_sha256") or "")
-            if bound_sha and bound_sha != contract_sha256:
-                db.rollback()
-                return json.dumps({
-                    "success": False, "schema_version": SCHEMA_VERSION,
-                    "code": "PLAN_NODE_LINEAGE_MISMATCH",
-                    "safe_message": "delegation contract digest does not match the plan node lineage",
-                    "changed": False,
-                })
+            if bound_delegation and bound_delegation != delegation_id:
+                # One LIVE execution per node, but not one delegation FOREVER:
+                # a prior delegation that reached a TERMINAL state no longer
+                # executes — conductor's retry/replan path (a NEW attempt id,
+                # hence a NEW delegation id, same node lineage digest) must be
+                # able to supersede it or every node would be single-use and
+                # conductor retries structurally impossible. Read the prior
+                # delegation's state read-only from delegations.db (the
+                # delegations plane's own store); missing row = never
+                # dispatched = treat as superseded; non-terminal row keeps
+                # the ALREADY_BOUND refusal (no double dispatch).
+                prior_state = ""
+                try:
+                    dlg_path = operator_delegations._db_path(hermes_root)
+                    if dlg_path.is_file():
+                        with _connect(dlg_path, write=False) as dlg_db:
+                            prior = dlg_db.execute(
+                                "SELECT state FROM delegations WHERE delegation_id=?",
+                                (bound_delegation,),
+                            ).fetchone()
+                        prior_state = str(prior["state"]) if prior is not None else ""
+                except Exception:
+                    prior_state = ""
+                if prior_state:
+                    if prior_state not in operator_delegations.TERMINAL_STATES:
+                        # LIVE prior delegation: no double dispatch, ever.
+                        db.rollback()
+                        return json.dumps({
+                            "success": False, "schema_version": SCHEMA_VERSION,
+                            "code": "PLAN_NODE_ALREADY_BOUND",
+                            "safe_message": (
+                                f"plan node {node_id} is bound to LIVE delegation "
+                                f"{bound_delegation} (state={prior_state})"
+                            ),
+                            "changed": False,
+                        })
+                    # Terminal (or unknown/missing) prior: supersede it — but a
+                    # divergent contract digest on a superseded lineage still
+                    # refuses with the lineage code (the node's work identity
+                    # changed under a foreign delegation).
+                    if bound_sha and bound_sha != contract_sha256:
+                        db.rollback()
+                        return json.dumps({
+                            "success": False, "schema_version": SCHEMA_VERSION,
+                            "code": "PLAN_NODE_LINEAGE_MISMATCH",
+                            "safe_message": "delegation contract digest does not match the plan node lineage",
+                            "changed": False,
+                        })
+                    bound["superseded_delegation_id"] = bound_delegation
+                    bound["superseded_at"] = now
+                else:
+                    # No delegations row for the prior binding: the prior
+                    # delegation's liveness cannot be resolved (never
+                    # dispatched through the delegations plane, or its row
+                    # was lost). Conservative refusal — supersession only
+                    # happens on PROVEN terminal state, never on absence.
+                    db.rollback()
+                    return json.dumps({
+                        "success": False, "schema_version": SCHEMA_VERSION,
+                        "code": "PLAN_NODE_ALREADY_BOUND",
+                        "safe_message": (
+                            f"plan node {node_id} is bound to delegation "
+                            f"{bound_delegation} whose state cannot be resolved "
+                            "(no delegations row; supersession requires proven "
+                            "terminal state)"
+                        ),
+                        "changed": False,
+                    })
             if bound_delegation == delegation_id and bound_sha == contract_sha256:
                 db.commit()
                 return json.dumps({

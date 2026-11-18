@@ -506,3 +506,97 @@ def test_plan_bind_delegation_gates_node_lineage(hermes_root):
     got = _j(plan.hermes_plan_get("msn-plan", hermes_root=hermes_root))
     node_a = next(n for n in got["nodes"] if n["node_id"] == "implementation")
     assert node_a["state"] == "dispatched"
+
+
+def test_plan_bind_delegation_supersedes_terminal_prior(hermes_root, tmp_path):
+    """Cutover wiring (2026-11-18): conductor retries mint a NEW delegation id
+    for the SAME plan node (new attempt id → new delegation id, same contract
+    lineage digest). The bind gate must therefore allow superseding a prior
+    delegation that reached a TERMINAL state (failed/cancelled/succeeded)
+    while still refusing a LIVE prior — one live execution per node, not one
+    delegation forever (otherwise every conductor retry would die on
+    PLAN_NODE_ALREADY_BOUND and retries would be structurally impossible)."""
+    import hashlib as _h
+    import operator_delegations as delegations
+
+    _make_mission(hermes_root)
+    d = _j(plan.hermes_plan_decompose("msn-plan", hermes_root=hermes_root))
+    _j(plan.hermes_plan_create("msn-plan", json.dumps(d), confirm=True, dry_run=False, hermes_root=hermes_root))
+    sha = _h.sha256(b"supersession-contract").hexdigest()
+
+    # One REAL delegation row (dispatched through the public tool with the
+    # contract dispatch monkeypatched off, as test_operator_delegations does).
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    import operator_runners as runners
+    original = delegations.contract_mod.hermes_contract_dispatch
+    delegations.contract_mod.hermes_contract_dispatch = lambda *a, **k: json.dumps(
+        {"success": True, "changed": True, "state": "queued"}
+    )
+    try:
+        contract = {
+            "schema": "hermes.work-contract/v1",
+            "task_id": "supersession-task-001",
+            "assigned_agent": "coder",
+            "assigned_profile": "default",
+            "objective": "supersession probe",
+            "allowed_scope": {"workspaces": [str(workspace)], "profiles": ["default"]},
+            "forbidden_actions": [],
+            "expected_artifacts": [],
+            "tests": [],
+            "review_requirements": {},
+            "completion_criteria": {
+                "run_state": {"terminal": True, "outcome_ok": ["completed"]},
+                "artifacts_present": False,
+                "tests_pass": False,
+                "review_satisfied": False,
+                "no_forbidden_actions": True,
+            },
+            "inputs": [],
+            "constraints": [],
+            "authorization": {
+                "class": "reversible_write",
+                "approved": True,
+                "approved_by": "owner",
+                "approval_reference": "test",
+            },
+            "execution": {"backend": "pi_rpc", "options": {}},
+        }
+        out = _j(delegations.hermes_delegation_dispatch(
+            json.dumps(contract), mission_id="msn-plan",
+            delegation_id="dlg-supersede-0001", confirm=True, dry_run=False,
+            hermes_root=hermes_root))
+        assert out["success"] is True, out
+    finally:
+        delegations.contract_mod.hermes_contract_dispatch = original
+
+    # Bind node → prior delegation (same digest lineage).
+    first = _j(plan.hermes_plan_bind_delegation(
+        "msn-plan", "implementation", "dlg-supersede-0001", sha,
+        confirm=True, dry_run=False, hermes_root=hermes_root))
+    assert first["success"] is True, first
+
+    # LIVE prior (state=queued): a second delegation with the SAME lineage
+    # digest must refuse — no double dispatch, ever.
+    live = _j(plan.hermes_plan_bind_delegation(
+        "msn-plan", "implementation", "dlg-supersede-0002", sha,
+        confirm=True, dry_run=False, hermes_root=hermes_root))
+    assert live["success"] is False
+    assert live["code"] == "PLAN_NODE_ALREADY_BOUND"
+
+    # Terminal prior: supersession succeeds and records the superseded id.
+    import sqlite3
+    dlg_db = hermes_root / "delegations" / "delegations.db"
+    con = sqlite3.connect(dlg_db)
+    con.execute("UPDATE delegations SET state='failed' WHERE delegation_id='dlg-supersede-0001'")
+    con.commit()
+    con.close()
+    superseded = _j(plan.hermes_plan_bind_delegation(
+        "msn-plan", "implementation", "dlg-supersede-0002", sha,
+        confirm=True, dry_run=False, hermes_root=hermes_root))
+    assert superseded["success"] is True, superseded
+    assert superseded["changed"] is True
+
+    got = _j(plan.hermes_plan_get("msn-plan", hermes_root=hermes_root))
+    node = next(n for n in got["nodes"] if n["node_id"] == "implementation")
+    assert node["state"] == "dispatched"
