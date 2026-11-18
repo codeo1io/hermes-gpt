@@ -188,8 +188,9 @@ def test_v016_annotations_match_their_contracts(monkeypatch, wire):
 
 
 def test_default_surface_count_is_pinned(monkeypatch):
-    # 139 at v0.16.0 + hermes_plan_approve_gate (v0.16.1).
-    assert len(tool_names(_surface_server(monkeypatch))) == 140
+    # 139 at v0.16.0 + hermes_plan_approve_gate (v0.16.1)
+    # + hermes_plan_bind_delegation (P0 plan authority, cutover 2026-11-17).
+    assert len(tool_names(_surface_server(monkeypatch))) == 141
 
 
 def _surface_server(monkeypatch):

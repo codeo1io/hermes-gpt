@@ -1687,6 +1687,7 @@ def hermes_operator_status() -> str:
             "hermes_plan_decompose",
             "hermes_plan_review",
             "hermes_plan_node_transition",
+            "hermes_plan_bind_delegation",
             "hermes_plan_set_status",
             "hermes_budget_set",
             "hermes_budget_get",
@@ -2519,6 +2520,26 @@ def hermes_plan_node_transition(
     """Advance a plan node via the validated state machine (read-only re mission)."""
     return op_mission_plan.hermes_plan_node_transition(
         mission_id, node_id, target_state, reason, confirm=confirm, dry_run=dry_run, hermes_root=_default_hermes_root()
+    )
+
+
+def hermes_plan_bind_delegation(
+    mission_id: str,
+    node_id: str,
+    delegation_id: str,
+    contract_sha256: str,
+    confirm: bool = False,
+    dry_run: bool = True,
+) -> str:
+    """Bind one delegation to its plan node (P0 plan authority, cutover 2026-11-17).
+
+    Server-side lineage gate: the node's contract_sha256 pins what may
+    execute; foreign delegations refuse (fail closed). Dry run by default,
+    Owner Mode (or workspace level with confirm) for the write.
+    """
+    return op_mission_plan.hermes_plan_bind_delegation(
+        mission_id, node_id, delegation_id, contract_sha256,
+        confirm=confirm, dry_run=dry_run, hermes_root=_default_hermes_root(),
     )
 
 
@@ -3724,6 +3745,7 @@ def _plan_tools() -> list[ToolEntry]:
             hermes_plan_decompose,
             hermes_plan_review,
             hermes_plan_node_transition,
+            hermes_plan_bind_delegation,
         ),
         # Owner-only gate approval (v0.16.1): dry run by default, Owner Mode for any write.
         ToolEntry(

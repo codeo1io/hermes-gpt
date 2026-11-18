@@ -122,6 +122,7 @@ DEFAULT_TOOL_INVENTORY = [
     "hermes_placement_list",
     "hermes_placement_score",
     "hermes_plan_approve_gate",
+    "hermes_plan_bind_delegation",
     "hermes_plan_create",
     "hermes_plan_decompose",
     "hermes_plan_get",

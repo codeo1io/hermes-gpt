@@ -1587,8 +1587,9 @@ V09_CONNECTOR_ADDITIONS = [
 # tools (sibling t_167ac591) + 4 failure-semantics tools (t_49bbc143) + 4
 # supervised-mission-controller tools (t_ad1e6d07).
 # v0.15 default surface (137 + hermes_owner_inbox) plus hermes_owner_inbox_ack in v0.16,
-# plus hermes_plan_approve_gate (Owner gate approval) in v0.16.1.
-V09_CONNECTOR_TOOL_COUNT = 140
+# plus hermes_plan_approve_gate (Owner gate approval) in v0.16.1, plus
+# hermes_plan_bind_delegation (P0 plan authority, conductor cutover 2026-11-17).
+V09_CONNECTOR_TOOL_COUNT = 141
 
 
 def test_v09_connector_surface_acceptance(monkeypatch):
