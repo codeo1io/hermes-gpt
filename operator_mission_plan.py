@@ -957,6 +957,27 @@ def hermes_plan_get(mission_id: str, hermes_root: Path | None = None) -> str:
         return json.dumps(value)
     except FileNotFoundError:
         return json.dumps({"success": True, "schema_version": SCHEMA_VERSION, "mission_id": mission_id, "found": False})
+    except sqlite3.OperationalError as exc:
+        # Plan tables are additive and created lazily by the first writer
+        # (_init_plan_tables runs on write connections only). A read against
+        # a database that predates any plan write has no mission_plans
+        # table — that is ABSENCE ("no plan yet"), the same documented
+        # negative envelope as the missing-database branch, not a read
+        # failure. Any other operational error stays a hard failure.
+        if "no such table" in str(exc).lower() and "mission_plans" in str(exc).lower():
+            return json.dumps({"success": True, "schema_version": SCHEMA_VERSION, "mission_id": mission_id, "found": False})
+        return _error(exc, "PLAN_READ_FAILED", "Check mission id and Operator read access.")
+    except LookupError as exc:
+        # A mission that exists but has no plan row yet is ABSENCE, not a
+        # read failure — _get_plan_row raises LookupError("mission plan
+        # 'X' not found"). Answering with the same negative envelope as the
+        # missing-database branch keeps the documented public contract
+        # (found:false == "no plan yet") and lets idempotent first-dispatch
+        # probes distinguish absence from unreadable state. The mission row
+        # itself may or may not exist; either way there is no plan to read.
+        if "not found" in str(exc).lower():
+            return json.dumps({"success": True, "schema_version": SCHEMA_VERSION, "mission_id": mission_id, "found": False})
+        return _error(exc, "PLAN_READ_FAILED", "Check mission id and Operator read access.")
     except (ValueError, LookupError, PermissionError, OSError, sqlite3.Error) as exc:
         return _error(exc, "PLAN_READ_FAILED", "Check mission id and Operator read access.")
 

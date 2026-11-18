@@ -173,6 +173,23 @@ def test_plan_requires_existing_mission(hermes_root):
     assert out["success"] is False
 
 
+def test_plan_get_planless_mission_is_found_false(hermes_root):
+    """2026-11-18 cutover defect: a mission with NO plan row must answer
+    found:false (the documented negative envelope), not the operator
+    PLAN_READ_FAILED error — conductor's idempotent first-dispatch probe
+    distinguishes absence from unreadable state on exactly this field.
+    Regression for the LookupError branch in hermes_plan_get."""
+    _make_mission(hermes_root)  # mission exists, plan never created
+    got = _j(plan.hermes_plan_get("msn-plan", hermes_root=hermes_root))
+    assert got["success"] is True
+    assert got["found"] is False
+    assert got["mission_id"] == "msn-plan"
+    # totally unknown mission is the same absence shape (no plan to read)
+    got2 = _j(plan.hermes_plan_get("msn-never-created", hermes_root=hermes_root))
+    assert got2["success"] is True
+    assert got2["found"] is False
+
+
 def test_operator_provided_plan_accepted(hermes_root):
     _make_mission(hermes_root)
     out = _j(plan.hermes_plan_create("msn-plan", _operator_plan_dag(), confirm=True, dry_run=False, hermes_root=hermes_root))
