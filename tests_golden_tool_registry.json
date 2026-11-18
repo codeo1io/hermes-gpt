@@ -1,6 +1,6 @@
 {
  "captured_under": {
-  "mcp-2.3.0": true
+  "mcp-2.2.0": true
  },
  "combos": {
   "all_but:attention_delivery": {
@@ -172,7 +172,7 @@
     "hermes_codex_job_result",
     "hermes_codex_cancel"
    ],
-   "sha256": "1c27d4b936a2d2f21e532b97d3f1dacce93851cade852eafaacc186116e2095a"
+   "sha256": "c9f2359765731b6d329b6e692b1c80ae8d58bfb45d5c06c7f0fb06dcb67f3b46"
   },
   "all_but:autopilot": {
    "auth": "noauth",
@@ -340,7 +340,7 @@
     "hermes_codex_job_result",
     "hermes_codex_cancel"
    ],
-   "sha256": "75026784d7e61b0e9dc04251943305f57681b50b2008cec132f6b978f8f5c852"
+   "sha256": "147e47384263b203463709fae24bfce13caa45711a4ba8905676d8d5438c80de"
   },
   "all_but:finance": {
    "auth": "noauth",
@@ -511,7 +511,7 @@
     "hermes_codex_job_result",
     "hermes_codex_cancel"
    ],
-   "sha256": "58a73364bf86d5c6fe4555c1bb12b7e1f1e93d6586e4e428a8a8cf26da2594e3"
+   "sha256": "b91d45cdfd08e9caab7d4e9fb4fea08456a860b772e7e282caf85e89f9e72ae2"
   },
   "all_but:jev": {
    "auth": "noauth",
@@ -679,7 +679,7 @@
     "hermes_codex_job_result",
     "hermes_codex_cancel"
    ],
-   "sha256": "4889574c144aed3b5966274e47af8d9a1798391fa936580c2feb70d12d80a3d2"
+   "sha256": "1c90fb00394a580d9f9aa14c68856ce9019f59395924355f94f93466df1549b7"
   },
   "all_but:memory_write": {
    "auth": "noauth",
@@ -851,7 +851,7 @@
     "hermes_codex_job_result",
     "hermes_codex_cancel"
    ],
-   "sha256": "f374126a8fb51461ef98bf638a35947da805ee55bb661567aa858219719dd608"
+   "sha256": "e314b09c5d53b13ddb3abcad3fdd63ef098724edcc423209d15aa797ca8d7bd4"
   },
   "all_but:review_assist": {
    "auth": "noauth",
@@ -1022,7 +1022,7 @@
     "hermes_codex_job_result",
     "hermes_codex_cancel"
    ],
-   "sha256": "c407f1fb1afb62be5d7af4e69f18058b7d41d84dfeba09ba2722369d50e9bcc8"
+   "sha256": "4cdbaf849cf8951980b3d27331a29649d2a0d1fa012abe9c23e24592351e5258"
   },
   "all_but:session_control": {
    "auth": "noauth",
@@ -1189,7 +1189,7 @@
     "hermes_codex_job_result",
     "hermes_codex_cancel"
    ],
-   "sha256": "b462660c228a20ad1ace71d4823118d97aea72a6a008b7659199761d184bfcb7"
+   "sha256": "8ecdcc2ed9a14fa38a23fc16249ca262f3286b41c23e8703bf97d1d900de480b"
   },
   "all_but:session_search": {
    "auth": "noauth",
@@ -1355,7 +1355,7 @@
     "hermes_codex_job_result",
     "hermes_codex_cancel"
    ],
-   "sha256": "20babe540ac25a7329170bb0fbac2acf7516dbc1c5644091229825514009bccd"
+   "sha256": "1505a27232ccc5a85df9d48e413062979687d0a159987d8cf23d3bc3bc1808bd"
   },
   "all_but:terminal": {
    "auth": "noauth",
@@ -1526,7 +1526,7 @@
     "hermes_codex_job_result",
     "hermes_codex_cancel"
    ],
-   "sha256": "0708859e78a0ee9a60e8979c254c855860223f4772a616dad2a02f64d519cddf"
+   "sha256": "a143328ef22641825587a476d3c3b30891b2be53ca930329eda3d6b9c212e30b"
   },
   "all_but:vision": {
    "auth": "noauth",
@@ -1697,7 +1697,7 @@
     "hermes_codex_job_result",
     "hermes_codex_cancel"
    ],
-   "sha256": "4acd4f1badbb849f397b914e4d6b0f04b445b464bd864b98747c9a916eabc8d6"
+   "sha256": "af88e6f48caa5409458fcdc4f9cabf1ff32146cb122bf29ff1e2baf5f6b3cb80"
   },
   "all_but:web": {
    "auth": "noauth",
@@ -1867,7 +1867,7 @@
     "hermes_codex_job_result",
     "hermes_codex_cancel"
    ],
-   "sha256": "1e5a788cf60f3c5fafeeab2b228b1c8c071288cce79090a7dd7566626ec97ff2"
+   "sha256": "8014d6d091413cdb5b782866d5775269a440094e80a2a174d8965ce8fca76e7c"
   },
   "all_but:write": {
    "auth": "noauth",
@@ -2037,7 +2037,7 @@
     "hermes_codex_job_result",
     "hermes_codex_cancel"
    ],
-   "sha256": "696649a393c0fd1c59ca6d7e62242c5a49063d740f0acc3fd8590c922a490ddb"
+   "sha256": "a0b83f187359c92a65eebb5779db85ef5ab914f92f9cab067c09af33971f3b08"
   },
   "all_on": {
    "auth": "noauth",
@@ -2209,7 +2209,7 @@
     "hermes_codex_job_result",
     "hermes_codex_cancel"
    ],
-   "sha256": "f374126a8fb51461ef98bf638a35947da805ee55bb661567aa858219719dd608"
+   "sha256": "e314b09c5d53b13ddb3abcad3fdd63ef098724edcc423209d15aa797ca8d7bd4"
   },
   "bearer": {
    "auth": "bearer",
@@ -2355,7 +2355,7 @@
     "hermes_codex_job_result",
     "hermes_codex_cancel"
    ],
-   "sha256": "b7695769f8a0f32e68feefef015e2503c6918ebfa2784eac6dcd6bb6cd8ceb91"
+   "sha256": "bcc26bc5193477446245ebe6dbd4de042bb5de02d2973186bbee27ed2e87be0d"
   },
   "bearer+all_on": {
    "auth": "bearer",
@@ -2527,7 +2527,7 @@
     "hermes_codex_job_result",
     "hermes_codex_cancel"
    ],
-   "sha256": "6fef1a2ec4e5a6127411c3decf52a91878234a7d4bac69f2c6b6add738d12859"
+   "sha256": "b874276eddf3d162c1f22ecc6f8d2217682ef118409f84d079ec4a8618c17dc9"
   },
   "finance_marker_file": {
    "auth": "noauth",
@@ -2674,7 +2674,7 @@
     "hermes_codex_job_result",
     "hermes_codex_cancel"
    ],
-   "sha256": "d6fc54b5865b8e306cd55ada1cdb2a6f27fecadc9340bf2fc07f825c92a73848"
+   "sha256": "c7655accacd2faa36175cc4acbb2153932a64b61edcf8a6159eae8c8a3193cc8"
   },
   "none": {
    "auth": "noauth",
@@ -2820,7 +2820,7 @@
     "hermes_codex_job_result",
     "hermes_codex_cancel"
    ],
-   "sha256": "b0f4eb9806ebb7a4de0eede99bf141e09947cda0421fe164b11d5e9f44e0b723"
+   "sha256": "2b038b7725107397eb49e0a04a2776f539490a036c85ba28529c3d29d6b422b7"
   },
   "only:attention_delivery": {
    "auth": "noauth",
@@ -2967,7 +2967,7 @@
     "hermes_codex_job_result",
     "hermes_codex_cancel"
    ],
-   "sha256": "7906b9b2f31b81144f7f5171928647f342c269696a83fc50c16e543309e1978d"
+   "sha256": "84590fd63f9d62f69abc42e58beb314d2551090dedaf19bdb5a77998bcc14271"
   },
   "only:autopilot": {
    "auth": "noauth",
@@ -3117,7 +3117,7 @@
     "hermes_codex_job_result",
     "hermes_codex_cancel"
    ],
-   "sha256": "ea8df3945089cd7cc55de5c19a6c8b9185d09b56629cc0c14adc144f4de87bde"
+   "sha256": "eb27a4cdb4e00a32817202bea4b04c6f4b07aaddb25da12e4fadb40ab7fb30a6"
   },
   "only:finance": {
    "auth": "noauth",
@@ -3264,7 +3264,7 @@
     "hermes_codex_job_result",
     "hermes_codex_cancel"
    ],
-   "sha256": "d6fc54b5865b8e306cd55ada1cdb2a6f27fecadc9340bf2fc07f825c92a73848"
+   "sha256": "c7655accacd2faa36175cc4acbb2153932a64b61edcf8a6159eae8c8a3193cc8"
   },
   "only:jev": {
    "auth": "noauth",
@@ -3413,7 +3413,7 @@
     "hermes_codex_job_result",
     "hermes_codex_cancel"
    ],
-   "sha256": "ea930333abe0678fb40d1f9fc6261f5cd2c8a5e897ab44a917d4452097442b38"
+   "sha256": "2959486139f40adf39e9786c1e4714f4b5182e0901d339fe626ce3a9bd47bf50"
   },
   "only:jev+review_assist": {
    "auth": "noauth",
@@ -3563,7 +3563,7 @@
     "hermes_codex_job_result",
     "hermes_codex_cancel"
    ],
-   "sha256": "eaa7200d632bdace062fba1db2f7f3c54994264823311bd7ccf6e2aa738972e5"
+   "sha256": "bca35f698eac8e14c057621b0136684aa57804c6897ed277f9f5682d44d752ef"
   },
   "only:memory_write": {
    "auth": "noauth",
@@ -3709,7 +3709,7 @@
     "hermes_codex_job_result",
     "hermes_codex_cancel"
    ],
-   "sha256": "b0f4eb9806ebb7a4de0eede99bf141e09947cda0421fe164b11d5e9f44e0b723"
+   "sha256": "2b038b7725107397eb49e0a04a2776f539490a036c85ba28529c3d29d6b422b7"
   },
   "only:review_assist": {
    "auth": "noauth",
@@ -3855,7 +3855,7 @@
     "hermes_codex_job_result",
     "hermes_codex_cancel"
    ],
-   "sha256": "b0f4eb9806ebb7a4de0eede99bf141e09947cda0421fe164b11d5e9f44e0b723"
+   "sha256": "2b038b7725107397eb49e0a04a2776f539490a036c85ba28529c3d29d6b422b7"
   },
   "only:session_control": {
    "auth": "noauth",
@@ -4005,7 +4005,7 @@
     "hermes_codex_job_result",
     "hermes_codex_cancel"
    ],
-   "sha256": "a81bf61d8045a2325426341e8dbd19ca81823a3e0cf40b4687fa4d158846c9f6"
+   "sha256": "e67acfdadb725473c3dcc409bfb208262674bca2554dcfe22ecf782af02edefc"
   },
   "only:session_search": {
    "auth": "noauth",
@@ -4156,7 +4156,7 @@
     "hermes_codex_job_result",
     "hermes_codex_cancel"
    ],
-   "sha256": "9a1c515eab8ee860a3e8c319decb935d613b55f072bb1bccb7abc4547107bc61"
+   "sha256": "a3c312babaf2b2fe8381da4f12fa017b8a41e4485f5e3a8a655abd962fa22807"
   },
   "only:session_search+session_control": {
    "auth": "noauth",
@@ -4312,7 +4312,7 @@
     "hermes_codex_job_result",
     "hermes_codex_cancel"
    ],
-   "sha256": "4d4877a49791405bb00178ac3d7a460b2195c445360b30fc8d0e8a5a32051a4e"
+   "sha256": "8e8d9183f17b15262495850c1858480c03a08bb41590bc132661c92e64f28490"
   },
   "only:terminal": {
    "auth": "noauth",
@@ -4459,7 +4459,7 @@
     "hermes_codex_job_result",
     "hermes_codex_cancel"
    ],
-   "sha256": "9cf11d412878629fad5f629dcd7a1355a26821d0f84e3f5b78825ee17c8a92ac"
+   "sha256": "87520df9824307657d594bc48d218f0b6408da9df568c914bf0d07e23bb2ce6f"
   },
   "only:vision": {
    "auth": "noauth",
@@ -4606,7 +4606,7 @@
     "hermes_codex_job_result",
     "hermes_codex_cancel"
    ],
-   "sha256": "eeb8fb5119258b15e0d357260c9eaefee52ab2bc8cab63b2cad1d3b33d4d0144"
+   "sha256": "0ae3f6b5a9eb86eca71de5e3e850f8b4604843cb38196ab6176412a26afa05dc"
   },
   "only:web": {
    "auth": "noauth",
@@ -4754,7 +4754,7 @@
     "hermes_codex_job_result",
     "hermes_codex_cancel"
    ],
-   "sha256": "a04ab50a3dfadd1b699c28bd7930970ce74335fa55e50f889a2cbb063ef46b6d"
+   "sha256": "729eb5aa3256c2f60788f51240144c188c33b6138b2bfa65749b5cbdac645ab2"
   },
   "only:write": {
    "auth": "noauth",
@@ -4902,7 +4902,7 @@
     "hermes_codex_job_result",
     "hermes_codex_cancel"
    ],
-   "sha256": "b317dd83c4c8a2f7f6376782a8c6698c5189e75f10a195290031290fb9d06074"
+   "sha256": "8d6389ba35e54e0102bc10debc534cd5654350b24bca8de265ef2c851bfad2b2"
   },
   "profile:chat-lean": {
    "auth": "noauth",
@@ -5135,7 +5135,7 @@
     "hermes_codex_job_result",
     "hermes_codex_cancel"
    ],
-   "sha256": "b0f4eb9806ebb7a4de0eede99bf141e09947cda0421fe164b11d5e9f44e0b723"
+   "sha256": "2b038b7725107397eb49e0a04a2776f539490a036c85ba28529c3d29d6b422b7"
   },
   "profile:full+all_on": {
    "auth": "noauth",
@@ -5307,7 +5307,7 @@
     "hermes_codex_job_result",
     "hermes_codex_cancel"
    ],
-   "sha256": "f374126a8fb51461ef98bf638a35947da805ee55bb661567aa858219719dd608"
+   "sha256": "e314b09c5d53b13ddb3abcad3fdd63ef098724edcc423209d15aa797ca8d7bd4"
   },
   "profile:operator": {
    "auth": "noauth",
@@ -5450,7 +5450,7 @@
     "hermes_codex_job_result",
     "hermes_codex_cancel"
    ],
-   "sha256": "239f634c03cebb7cf545dd9835c5bf68a60ff9b4da4337864217b50095d64717"
+   "sha256": "ff147e4c7046f4885cdab0f0856ee0149da7d1b1492536bad415450dbe736e3e"
   },
   "profile:operator+all_on": {
    "auth": "noauth",
@@ -5616,7 +5616,7 @@
     "hermes_codex_job_result",
     "hermes_codex_cancel"
    ],
-   "sha256": "d6a1e4f9ff3d698bf937725ab37a3566ded5dceff98b43b5361490c00529d754"
+   "sha256": "fd06175651091127ccc0c56c84329fdc0e54b65f1b874c053db3c2098f5acb12"
   }
  },
  "schema": "tool_registry_golden/v1",
@@ -5736,7 +5736,7 @@
    "hermes_placement_score": "3a5b6d34f6812001b4af0246db229dc6425547fab8920984ede3bf8f33b6ccde",
    "hermes_plan_approve_gate": "6a77df0e32b7b7d8d81bd460d0cde2d581e57087ff41721e3216e297716d85a4",
    "hermes_plan_bind_delegation": "92a33e6e34d26becf49aba4eca44492c55e1ec66439720a70eeeb8cd82dc3022",
-   "hermes_plan_create": "2445d3b3df2512fdcef420019f73776c025b6a4ddc9ad3db34726196f7a30182",
+   "hermes_plan_create": "d0c6b07e9fdaf01f6be833370e1d168453059c6fb9fb48b69f08210f3171bde9",
    "hermes_plan_decompose": "2f172784beb66405832e6051b50400aa084e0c01f767b9a4d863bb7c1e540873",
    "hermes_plan_get": "9a8c856a3f6ef4c0220f81311584d854d0df07ccc17369856ff7534021e0aeac",
    "hermes_plan_list": "470f9a43d2f88e6fa53f42f1430c93b4f9b09cd102536d3619ebd46f9b2af91e",
@@ -5904,7 +5904,7 @@
    "hermes_placement_score": "84c9d229553e07d5ecfde5a233929743b3af1f03ef06ee990d15e57c16e15ada",
    "hermes_plan_approve_gate": "786ffc7ace1afc859447771100b54fa4c925221a2d41c49c91def72f58920b14",
    "hermes_plan_bind_delegation": "996c1b58b07fef2f3befa7795a36440fa5e3a5843ac8afcaa0973474d90020a2",
-   "hermes_plan_create": "4ddfaed4c4df3b7ab1d9dbb684a30d5b7d80d5f109efda3c31f7669f0852dcef",
+   "hermes_plan_create": "b112d7864634930e359f365ab5069c6082048d58f8f666e22aef3b9706ea6128",
    "hermes_plan_decompose": "9b7ec23c7ae26498baea7eba9af5487748d179505f69a821a1caf2eb70ad9c8b",
    "hermes_plan_get": "254dd1045ed2cae3b7d1dc5d4731732d90d5e8c6836831d8af589282b360b6fc",
    "hermes_plan_list": "ca898ae5c37459a546bb4707ad075bc48c3d8b5b034c72373439f890f6af5b8f",

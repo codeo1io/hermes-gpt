@@ -602,10 +602,38 @@ def test_plan_bind_delegation_supersedes_terminal_prior(hermes_root, tmp_path):
     assert live["code"] == "PLAN_NODE_ALREADY_BOUND"
 
     # Terminal prior: supersession succeeds and records the superseded id.
+    # Fix D (2026-11-18): the superseding delegation is lineage-verified
+    # against the PLANE — a delegations row for THIS id carrying THIS
+    # mission must exist (conductor's retry path dispatches first, so the
+    # row is durable state before the re-bind; byte sha-equality is no
+    # longer the lineage test since every retry mints a new contract).
     import sqlite3
     dlg_db = hermes_root / "delegations" / "delegations.db"
     con = sqlite3.connect(dlg_db)
-    con.execute("UPDATE delegations SET state='failed' WHERE delegation_id='dlg-supersede-0001'")
+    # Terminalize the prior via the same UPDATE the real reconcile path
+    # uses (both state AND terminal_at — the gate reads prior_state only,
+    # but keep the row honest).
+    con.execute(
+        "UPDATE delegations SET state='failed', terminal_at='2026-01-01T00:05:00+00:00' "
+        "WHERE delegation_id='dlg-supersede-0001'"
+    )
+    con.commit()
+    con.close()
+    # Terminal prior + no row yet for the superseding id: conservative
+    # plane-verified lineage refusal (never bind blind).
+    norow = _j(plan.hermes_plan_bind_delegation(
+        "msn-plan", "implementation", "dlg-supersede-0002", sha,
+        confirm=True, dry_run=False, hermes_root=hermes_root))
+    assert norow["success"] is False, norow
+    assert norow["code"] == "PLAN_NODE_LINEAGE_MISMATCH"
+    # Dispatch the superseding delegation through the same plane (durable
+    # row, same mission) — then supersession succeeds.
+    con = sqlite3.connect(dlg_db)
+    con.execute(
+        "INSERT INTO delegations(delegation_id,schema,mission_id,task_id,contract_sha256,backend,state,backend_state,outcome,backend_ref_json,validation_verdict,cancel_requested,dispatch_phase,created_at,dispatched_at,updated_at,terminal_at) "
+        "VALUES ('dlg-supersede-0002','hermes.delegation/v1','msn-plan','task-supersede-0002',?, 'pi','succeeded','completed','completed','{}','SATISFIED',0,'dispatched','2026-01-01T00:00:00+00:00','2026-01-01T00:01:00+00:00','2026-01-01T00:02:00+00:00','2026-01-01T00:02:00+00:00')",
+        (sha,),
+    )
     con.commit()
     con.close()
     superseded = _j(plan.hermes_plan_bind_delegation(

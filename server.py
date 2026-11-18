@@ -2477,10 +2477,20 @@ def hermes_plan_create(
     confirm: bool = False,
     dry_run: bool = True,
     status: str = "draft",
+    require_absent: bool = False,
 ) -> str:
-    """Create (or replace-version) a MissionPlan for a mission (additive, read-only re mission)."""
+    """Create (or replace-version) a MissionPlan for a mission (additive, read-only re mission).
+
+    ``require_absent=True`` (cutover/native-mission-authority-20261117,
+    fix C 2026-11-18) turns the create into the CREATE-ONLY CAS: an
+    existing plan refuses with PLAN_ALREADY_EXISTS instead of being
+    replaced. Forwarded verbatim to the operator function — the earlier
+    wrapper silently DROPPED the flag, voiding the race protection the
+    conductor linker relies on.
+    """
     return op_mission_plan.hermes_plan_create(
-        mission_id, plan_json, confirm=confirm, dry_run=dry_run, status=status, hermes_root=_default_hermes_root()
+        mission_id, plan_json, confirm=confirm, dry_run=dry_run, status=status,
+        require_absent=require_absent, hermes_root=_default_hermes_root(),
     )
 
 

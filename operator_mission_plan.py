@@ -1742,6 +1742,29 @@ def validate_node_transition(from_state: str, to_state: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _delegation_row_matches_mission(dlg_path, delegation_id: str, mission_id: str) -> bool:
+    """Plane-verified lineage for supersession (fix D, 2026-11-18).
+
+    True ONLY when delegations.db holds a row for ``delegation_id`` whose
+    mission_id equals ``mission_id`` — durable proof the superseding
+    delegation belongs to this mission's plan node lineage. Any read
+    failure or missing row is False (conservative: supersession refuses).
+    """
+    if not delegation_id or delegation_id == "dlg-":
+        return False
+    try:
+        if dlg_path is None or not dlg_path.is_file():
+            return False
+        with _connect(dlg_path, write=False) as dlg_db:
+            row = dlg_db.execute(
+                "SELECT mission_id FROM delegations WHERE delegation_id=?",
+                (delegation_id,),
+            ).fetchone()
+        return row is not None and str(row["mission_id"]) == mission_id
+    except Exception:
+        return False
+
+
 def hermes_plan_bind_delegation(
     mission_id: str,
     node_id: str,
@@ -1823,8 +1846,8 @@ def hermes_plan_bind_delegation(
                 # dispatched = treat as superseded; non-terminal row keeps
                 # the ALREADY_BOUND refusal (no double dispatch).
                 prior_state = ""
+                dlg_path = operator_delegations._db_path(hermes_root)
                 try:
-                    dlg_path = operator_delegations._db_path(hermes_root)
                     if dlg_path.is_file():
                         with _connect(dlg_path, write=False) as dlg_db:
                             prior = dlg_db.execute(
@@ -1847,16 +1870,27 @@ def hermes_plan_bind_delegation(
                             ),
                             "changed": False,
                         })
-                    # Terminal (or unknown/missing) prior: supersede it — but a
-                    # divergent contract digest on a superseded lineage still
-                    # refuses with the lineage code (the node's work identity
-                    # changed under a foreign delegation).
-                    if bound_sha and bound_sha != contract_sha256:
+                    # Terminal (or unknown/missing) prior: supersede it —
+                    # the superseding contract is lineage-verified against
+                    # the PLANE, not the byte digest (fix D, 2026-11-18):
+                    # conductor's contract task_id IS the attempt id, so a
+                    # legitimate retry/replan mints a NEW contract sha per
+                    # attempt and byte-equality would make every node
+                    # single-use (PLAN_NODE_LINEAGE_MISMATCH on all
+                    # retries — the live 09:52Z failure class). Lineage =
+                    # the same mission owns a delegations row for THIS new
+                    # delegation id (proven state, not an ack). No row:
+                    # conservative refusal (never bind blind).
+                    if not _delegation_row_matches_mission(dlg_path, delegation_id, mission_id):
                         db.rollback()
                         return json.dumps({
                             "success": False, "schema_version": SCHEMA_VERSION,
                             "code": "PLAN_NODE_LINEAGE_MISMATCH",
-                            "safe_message": "delegation contract digest does not match the plan node lineage",
+                            "safe_message": (
+                                f"superseding delegation {delegation_id} has no proven "
+                                f"delegations row for mission {mission_id} "
+                                "(plane-verified lineage required)"
+                            ),
                             "changed": False,
                         })
                     bound["superseded_delegation_id"] = bound_delegation
