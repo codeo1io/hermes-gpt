@@ -198,7 +198,10 @@ def test_dependencies_gate_ordering(hermes_root: Path, monkeypatch: pytest.Monke
     assert _phase(two, "s2") == "pending"
     assert next(s for s in two["segments"] if s["seq"] == "s2")["next_action"] == "wait_dependencies"
     # s2 must NOT have a plan yet
-    assert json.loads(plan_store.hermes_plan_get("msn-c2", hermes_root=hermes_root)).get("success") is False
+    # d98ca65e6f: a planless mission answers success:true with found:false
+    # (not the legacy success:false envelope) — pin the new public shape.
+    got = json.loads(plan_store.hermes_plan_get("msn-c2", hermes_root=hermes_root))
+    assert got.get("success") is True and got.get("found") is False
 
 
 def test_failed_dependency_fails_dependents(hermes_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -545,7 +545,6 @@ def test_plan_bind_delegation_supersedes_terminal_prior(hermes_root, tmp_path):
     # contract dispatch monkeypatched off, as test_operator_delegations does).
     workspace = tmp_path / "ws"
     workspace.mkdir()
-    import operator_runners as runners
     original = delegations.contract_mod.hermes_contract_dispatch
     delegations.contract_mod.hermes_contract_dispatch = lambda *a, **k: json.dumps(
         {"success": True, "changed": True, "state": "queued"}
