@@ -506,7 +506,33 @@ def test_plan_bind_delegation_gates_node_lineage(hermes_root):
     assert again["success"] is True and again["changed"] is False
     assert again.get("idempotent") is True
 
-    # divergent lineage refuses
+    # A prior bound WITHOUT any plane row (abandoned prebind reservation,
+    # fix E) is freely superseded — it never dispatched, so it executes
+    # nothing; the node is not single-use across dead reservations. This
+    # MUST run while dlg-bindtest0000001 still has no row (prebind shape).
+    freed = _j(plan.hermes_plan_bind_delegation(
+        "msn-plan", "implementation", "dlg-bindtest0000003", good_sha,
+        confirm=True, dry_run=False, hermes_root=hermes_root))
+    assert freed["success"] is True, freed
+    assert freed["changed"] is True
+
+    # divergent lineage refuses when the prior is LIVE (has a plane row):
+    # give dlg-bindtest0000003 a live row via the delegations table, then
+    # a different id + bad sha must refuse on the live prior.
+    import sqlite3
+    dlg_db = hermes_root / "delegations" / "delegations.db"
+    dlg_db.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(dlg_db)
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS delegations(delegation_id TEXT PRIMARY KEY, schema TEXT, mission_id TEXT, task_id TEXT, contract_sha256 TEXT, backend TEXT, state TEXT, backend_state TEXT, outcome TEXT, backend_ref_json TEXT, validation_verdict TEXT, cancel_requested INTEGER, dispatch_phase TEXT, created_at TEXT, dispatched_at TEXT, updated_at TEXT, terminal_at TEXT)"
+    )
+    con.execute(
+        "INSERT INTO delegations(delegation_id,schema,mission_id,task_id,contract_sha256,backend,state,backend_state,outcome,backend_ref_json,validation_verdict,cancel_requested,dispatch_phase,created_at,dispatched_at,updated_at,terminal_at) "
+        "VALUES ('dlg-bindtest0000003','hermes.delegation/v1','msn-plan','task-bindtest-0003',?, 'pi','queued','queued','','{}','',0,'dispatched','2026-01-01T00:00:00+00:00','2026-01-01T00:01:00+00:00','2026-01-01T00:02:00+00:00',NULL)",
+        (good_sha,),
+    )
+    con.commit()
+    con.close()
     mismatch = _j(plan.hermes_plan_bind_delegation(
         "msn-plan", "implementation", "dlg-bindtest0000002", bad_sha,
         confirm=True, dry_run=False, hermes_root=hermes_root))
@@ -618,13 +644,41 @@ def test_plan_bind_delegation_supersedes_terminal_prior(hermes_root, tmp_path):
     )
     con.commit()
     con.close()
-    # Terminal prior + no row yet for the superseding id: conservative
-    # plane-verified lineage refusal (never bind blind).
-    norow = _j(plan.hermes_plan_bind_delegation(
+    # Terminal prior + no row yet for the superseding id: ACCEPTED as a
+    # fresh prebind reservation (fix E, 2026-11-20). Conductor's #464
+    # order binds BEFORE dispatch, so the superseding delegation's row
+    # cannot exist at bind time; requiring one deadlocked every retry
+    # (live 21:17-21:58Z PLAN_NODE_LINEAGE_MISMATCH storm on run
+    # f6774639 — the row can only be minted by the dispatch the refusal
+    # prevents). The bind itself is the plane's durable reservation; a
+    # bind whose dispatch never follows leaves the node bound to an id
+    # with no row, which a later supersession resolves through this same
+    # missing-row branch (no live execution to double-dispatch).
+    prebind = _j(plan.hermes_plan_bind_delegation(
         "msn-plan", "implementation", "dlg-supersede-0002", sha,
         confirm=True, dry_run=False, hermes_root=hermes_root))
-    assert norow["success"] is False, norow
-    assert norow["code"] == "PLAN_NODE_LINEAGE_MISMATCH"
+    assert prebind["success"] is True, prebind
+    assert prebind["changed"] is True
+    # Idempotent rebind of the same (node, id, sha) still a no-op.
+    rebind = _j(plan.hermes_plan_bind_delegation(
+        "msn-plan", "implementation", "dlg-supersede-0002", sha,
+        confirm=True, dry_run=False, hermes_root=hermes_root))
+    assert rebind["success"] is True and rebind.get("idempotent") is True, rebind
+    # A FOREIGN delegation (row exists under a DIFFERENT mission) must
+    # still refuse — the node cannot be stolen across missions.
+    con = sqlite3.connect(dlg_db)
+    con.execute(
+        "INSERT INTO delegations(delegation_id,schema,mission_id,task_id,contract_sha256,backend,state,backend_state,outcome,backend_ref_json,validation_verdict,cancel_requested,dispatch_phase,created_at,dispatched_at,updated_at,terminal_at) "
+        "VALUES ('dlg-foreign-steal','hermes.delegation/v1','msn-other-mission','task-foreign',?, 'pi','succeeded','completed','completed','{}','SATISFIED',0,'dispatched','2026-01-01T00:00:00+00:00','2026-01-01T00:01:00+00:00','2026-01-01T00:02:00+00:00','2026-01-01T00:02:00+00:00')",
+        (sha,),
+    )
+    con.commit()
+    con.close()
+    foreign = _j(plan.hermes_plan_bind_delegation(
+        "msn-plan", "implementation", "dlg-foreign-steal", sha,
+        confirm=True, dry_run=False, hermes_root=hermes_root))
+    assert foreign["success"] is False, foreign
+    assert foreign["code"] == "PLAN_NODE_LINEAGE_MISMATCH"
     # Dispatch the superseding delegation through the same plane (durable
     # row, same mission) — then supersession succeeds.
     con = sqlite3.connect(dlg_db)
@@ -638,8 +692,10 @@ def test_plan_bind_delegation_supersedes_terminal_prior(hermes_root, tmp_path):
     superseded = _j(plan.hermes_plan_bind_delegation(
         "msn-plan", "implementation", "dlg-supersede-0002", sha,
         confirm=True, dry_run=False, hermes_root=hermes_root))
+    # The prebind reservation (fix E) already bound this (node, id, sha):
+    # the post-dispatch rebind is the idempotent no-op.
     assert superseded["success"] is True, superseded
-    assert superseded["changed"] is True
+    assert superseded.get("idempotent") is True, superseded
 
     got = _j(plan.hermes_plan_get("msn-plan", hermes_root=hermes_root))
     node = next(n for n in got["nodes"] if n["node_id"] == "implementation")
