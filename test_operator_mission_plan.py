@@ -560,6 +560,7 @@ def test_plan_bind_delegation_supersedes_terminal_prior(hermes_root, tmp_path):
     delegation forever (otherwise every conductor retry would die on
     PLAN_NODE_ALREADY_BOUND and retries would be structurally impossible)."""
     import hashlib as _h
+
     import operator_delegations as delegations
 
     _make_mission(hermes_root)
@@ -700,3 +701,96 @@ def test_plan_bind_delegation_supersedes_terminal_prior(hermes_root, tmp_path):
     got = _j(plan.hermes_plan_get("msn-plan", hermes_root=hermes_root))
     node = next(n for n in got["nodes"] if n["node_id"] == "implementation")
     assert node["state"] == "dispatched"
+
+def _seed_verified_delegation(root: Path, mid: str, did: str, sha: str,
+                              state: str = "succeeded", verdict: str = "SATISFIED") -> None:
+    """Hermetic only: project a terminal plane record into a temporary DB."""
+    dlg = plan.operator_delegations
+    path = dlg._db_path(root)
+    with dlg._connect(path, write=True) as db:
+        dlg._init(db)
+        stamp = dlg._now()
+        db.execute(
+            "INSERT INTO delegations (delegation_id,schema,mission_id,task_id,"
+            "contract_sha256,backend,state,validation_verdict,created_at,"
+            "dispatched_at,updated_at,terminal_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (did, dlg.DELEGATION_SCHEMA, mid, "task-sync-" + did, sha, "hermes_agent",
+             state, verdict, stamp, stamp, stamp,
+             stamp if state in dlg.TERMINAL_STATES else None),
+        )
+        db.commit()
+
+
+def test_verified_terminal_delegation_advances_bound_plan_node(hermes_root):
+    _make_mission(hermes_root)
+    _j(plan.hermes_plan_create("msn-plan", _operator_plan_dag(),
+                              confirm=True, dry_run=False, hermes_root=hermes_root))
+    did = "dlg-terminal-sync-case01"
+    sha = "a" * 64
+    bound = _j(plan.hermes_plan_bind_delegation(
+        "msn-plan", "a", did, sha, confirm=True, dry_run=False,
+        hermes_root=hermes_root))
+    assert bound["success"] and bound["node_state"] == "dispatched"
+    _seed_verified_delegation(hermes_root, "msn-plan", did, sha)
+    first = plan._sync_bound_node_from_verified_delegation(did, hermes_root=hermes_root)
+    assert first["success"] and first["changed"] and first["result"] == "validated"
+    with sqlite3.connect(plan._db_path(hermes_root)) as db:
+        assert db.execute(
+            "SELECT state FROM plan_nodes WHERE mission_id='msn-plan' AND node_id='a'"
+        ).fetchone()[0] == "validated"
+    second = plan._sync_bound_node_from_verified_delegation(did, hermes_root=hermes_root)
+    assert second["success"] and not second["changed"]
+
+
+def test_unverified_delegation_cannot_advance_plan_node(hermes_root):
+    _make_mission(hermes_root)
+    _j(plan.hermes_plan_create("msn-plan", _operator_plan_dag(),
+                              confirm=True, dry_run=False, hermes_root=hermes_root))
+    did = "dlg-terminal-sync-case02"
+    sha = "b" * 64
+    _j(plan.hermes_plan_bind_delegation(
+        "msn-plan", "a", did, sha, confirm=True, dry_run=False,
+        hermes_root=hermes_root))
+    _seed_verified_delegation(hermes_root, "msn-plan", did, sha,
+                              state="running", verdict="")
+    out = plan._sync_bound_node_from_verified_delegation(did, hermes_root=hermes_root)
+    assert out["success"] and not out["changed"]
+    with sqlite3.connect(plan._db_path(hermes_root)) as db:
+        assert db.execute(
+            "SELECT state FROM plan_nodes WHERE mission_id='msn-plan' AND node_id='a'"
+        ).fetchone()[0] == "dispatched"
+
+
+def test_foreign_bound_digest_cannot_claim_terminal_plan_node(hermes_root):
+    _make_mission(hermes_root)
+    _j(plan.hermes_plan_create("msn-plan", _operator_plan_dag(),
+                              confirm=True, dry_run=False, hermes_root=hermes_root))
+    did = "dlg-terminal-sync-case03"
+    _j(plan.hermes_plan_bind_delegation(
+        "msn-plan", "a", did, "c" * 64, confirm=True, dry_run=False,
+        hermes_root=hermes_root))
+    _seed_verified_delegation(hermes_root, "msn-plan", did, "d" * 64)
+    with pytest.raises(ValueError, match="digest"):
+        plan._sync_bound_node_from_verified_delegation(did, hermes_root=hermes_root)
+    with sqlite3.connect(plan._db_path(hermes_root)) as db:
+        assert db.execute(
+            "SELECT state FROM plan_nodes WHERE mission_id='msn-plan' AND node_id='a'"
+        ).fetchone()[0] == "dispatched"
+
+def test_owner_approval_node_is_never_auto_validated_from_worker_success(hermes_root):
+    _make_mission(hermes_root)
+    _j(plan.hermes_plan_create("msn-plan", _operator_plan_dag(),
+                              confirm=True, dry_run=False, hermes_root=hermes_root))
+    did = "dlg-owner-gate-sync01"
+    sha = "e" * 64
+    bound = _j(plan.hermes_plan_bind_delegation(
+        "msn-plan", "c", did, sha, confirm=True, dry_run=False,
+        hermes_root=hermes_root))
+    assert bound["success"]
+    _seed_verified_delegation(hermes_root, "msn-plan", did, sha)
+    out = plan._sync_bound_node_from_verified_delegation(did, hermes_root=hermes_root)
+    assert out["success"] and not out["changed"] and out["result"] == "held_approval"
+    with sqlite3.connect(plan._db_path(hermes_root)) as db:
+        assert db.execute(
+            "SELECT state FROM plan_nodes WHERE mission_id='msn-plan' AND node_id='c'"
+        ).fetchone()[0] == "dispatched"

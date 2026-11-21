@@ -1501,6 +1501,30 @@ def hermes_delegation_reconcile(
         if not mission_synced:
             _audit(tool="hermes_delegation_reconcile", policy=policy, dry_run=False, success=False, changed=changed, delegation_id=delegation_id, task_id=row["task_id"], backend=row["backend"])
             return _mission_sync_failure("reconciliation", row, changed=changed, extra={"applied": True, "observed": observed})
+        # A Conductor-owned MissionPlan node must reflect terminal, contract-
+        # validated truth from this Hermes-GPT delegation, NOT stay dispatched
+        # after successful execution. Keep this on the plane side so Conductor
+        # cannot invent completion from spool results or its own attempts.
+        if row.get("mission_id") and row["state"] == "succeeded" and row.get("validation_verdict") == "SATISFIED":
+            try:
+                import operator_mission_plan as mission_plan
+                mission_plan._sync_bound_node_from_verified_delegation(
+                    delegation_id, hermes_root=root,
+                )
+            except (ValueError,TypeError,LookupError,PermissionError,OSError,sqlite3.Error):
+                _audit(tool="hermes_delegation_reconcile", policy=policy, dry_run=False,
+                       success=False, changed=changed, delegation_id=delegation_id,
+                       task_id=row["task_id"], backend=row["backend"])
+                return json.dumps({
+                    "success": False, "schema_version": SCHEMA_VERSION,
+                    "code": "PLAN_NODE_SYNC_FAILED",
+                    "safe_message": (
+                        "Verified delegation is terminal, but MissionPlan node "
+                        "reconciliation failed; retry applied reconcile"
+                    ),
+                    "delegation_id": delegation_id,
+                    "changed": changed, "applied": True,
+                }, ensure_ascii=False)
         _audit(tool="hermes_delegation_reconcile", policy=policy, dry_run=False, success=True, changed=changed, delegation_id=delegation_id, task_id=row["task_id"], backend=row["backend"])
         return json.dumps({"success": True, "schema_version": SCHEMA_VERSION, "changed": changed, "applied": True, "delegation": _surface(row), "observed": observed, "legacy_lineage": legacy_lineage, "invocation_recovered": stale_invocation, "evidence_ref": f"contract:{row['contract_sha256']}" if verified_success else ""}, ensure_ascii=False, indent=2)
     except (ValueError, TypeError, LookupError, PermissionError, OSError, sqlite3.Error) as exc:

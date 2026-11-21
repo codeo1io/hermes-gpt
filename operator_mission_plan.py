@@ -45,8 +45,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import operator_mission_runtime as mission
 import operator_delegations
+import operator_mission_runtime as mission
 import operator_policy as op
 import operator_skill_resolution as skill_resolution
 from operator_contract import artifact_constraints
@@ -940,6 +940,90 @@ def _read_spec(mission_id: str, hermes_root: Path | None) -> str:
     with mission._connect(_db_path(hermes_root), write=False) as db:
         row = mission._get_row(db, mission_id)
         return row["spec_json"]
+
+
+def _sync_bound_node_from_verified_delegation(
+    delegation_id: str, *, hermes_root: Path | None = None,
+) -> dict[str, Any]:
+    """Project terminal Work Contract proof into the authoritative MissionPlan.
+
+    Called ONLY by hermes_delegation_reconcile(apply=True), after the
+    delegation's terminal verdict and Mission attachment are committed.
+    Re-read the delegation plane, then CAS the bound plan node. Never
+    infer completion from a worker's claim, and never approve a Mission.
+    A superseded (old) delegation cannot advance a successor's node.
+    """
+    dlg_path = operator_delegations._db_path(hermes_root)
+    with operator_delegations._connect(dlg_path, write=False) as source:
+        row = source.execute(
+            "SELECT delegation_id,mission_id,contract_sha256,state,"
+            "validation_verdict,terminal_at FROM delegations "
+            "WHERE delegation_id=?", (delegation_id,),
+        ).fetchone()
+    if row is None:
+        raise LookupError("delegation absent from authoritative plane")
+    if row["state"] != "succeeded" or row["validation_verdict"] != "SATISFIED" or not row["terminal_at"]:
+        return {"success": True, "changed": False, "reason": "not_verified_terminal"}
+    mid = str(row["mission_id"] or "")
+    sha = str(row["contract_sha256"] or "")
+    if not mid or not SHA_RE.fullmatch(sha):
+        raise ValueError("verified delegation has invalid mission/contract identity")
+
+    with _connect(_db_path(hermes_root), write=True) as db:
+        _begin_write(db)
+        plan_row = db.execute(
+            "SELECT plan_json FROM mission_plans WHERE mission_id=?", (mid,),
+        ).fetchone()
+        if plan_row is None:
+            db.commit()
+            return {"success": True, "changed": False, "reason": "no_mission_plan"}
+        plan_doc = json.loads(str(plan_row["plan_json"] or "{}"))
+        approval_nodes = {
+            str(n.get("node_id")) for n in plan_doc.get("nodes", [])
+            if isinstance(n, dict) and n.get("kind") == KIND_APPROVAL
+        }
+        nodes = db.execute(
+            "SELECT node_id,state,budget FROM plan_nodes WHERE mission_id=?", (mid,),
+        ).fetchall()
+        matched = False
+        changed = False
+        held_approval = False
+        last_node = ""
+        for node in nodes:
+            budget = json.loads(str(node["budget"] or "{}"))
+            if str(budget.get("bound_delegation_id") or "") != delegation_id:
+                continue
+            matched = True
+            last_node = str(node["node_id"])
+            if str(budget.get("bound_contract_sha256") or "") != sha:
+                raise ValueError("MissionPlan binding digest differs from verified Work Contract")
+            if last_node in approval_nodes:
+                held_approval = True
+                continue  # never auto-approve a human/owner gate
+            state = str(node["state"] or "")
+            if state in ("validated", "awaiting_approval", "completed"):
+                continue
+            chain = ("dispatched", "running", "awaiting_review", "validated")
+            if state not in chain:
+                raise ValueError(f"verified delegation cannot advance plan node from {state}")
+            for new_state in chain[chain.index(state)+1:]:
+                if new_state not in NODE_TRANSITIONS[state]:
+                    raise ValueError(f"illegal verified node transition {state}->{new_state}")
+                now = _now()
+                count = db.execute(
+                    "UPDATE plan_nodes SET state=?,lease_lock='',lease_expires='',updated_at=? "
+                    "WHERE mission_id=? AND node_id=? AND state=?",
+                    (new_state,now,mid,last_node,state),
+                ).rowcount
+                if count != 1:
+                    raise ValueError("plan-node CAS failed during terminal reconciliation")
+                state = new_state
+                changed = True
+        db.commit()
+    return {"success": True, "changed": changed, "matched": matched,
+            "mission_id": mid, "node_id": last_node,
+            "result": ("held_approval" if held_approval
+                       else "validated" if matched else "no_current_binding")}
 
 
 def hermes_plan_get(mission_id: str, hermes_root: Path | None = None) -> str:
@@ -1882,7 +1966,6 @@ def hermes_plan_bind_delegation(
                 # delegations plane's own store); non-terminal row keeps
                 # the ALREADY_BOUND refusal (no double dispatch).
                 prior_state = ""
-                prior_missing = False
                 dlg_path = operator_delegations._db_path(hermes_root)
                 try:
                     if dlg_path.is_file():
@@ -1891,9 +1974,7 @@ def hermes_plan_bind_delegation(
                                 "SELECT state FROM delegations WHERE delegation_id=?",
                                 (bound_delegation,),
                             ).fetchone()
-                        if prior is None:
-                            prior_missing = True
-                        else:
+                        if prior is not None:
                             prior_state = str(prior["state"])
                 except Exception:
                     prior_state = ""
