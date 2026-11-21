@@ -794,3 +794,95 @@ def test_owner_approval_node_is_never_auto_validated_from_worker_success(hermes_
         assert db.execute(
             "SELECT state FROM plan_nodes WHERE mission_id='msn-plan' AND node_id='c'"
         ).fetchone()[0] == "dispatched"
+
+
+def test_verified_intermediate_node_can_rebind_for_bounded_workflow_retry(hermes_root):
+    """Late native Work Contract success may arrive after Conductor phase lease."""
+    _make_mission(hermes_root)
+    created = _j(plan.hermes_plan_create(
+        "msn-plan", _operator_plan_dag(), confirm=True, dry_run=False,
+        hermes_root=hermes_root))
+    assert created["success"], created
+    old_did, new_did = "dlg-validated-retry-old", "dlg-validated-retry-new"
+    old_sha, new_sha = "a" * 64, "b" * 64
+    bound = _j(plan.hermes_plan_bind_delegation(
+        "msn-plan", "a", old_did, old_sha, confirm=True,
+        dry_run=False, hermes_root=hermes_root))
+    assert bound["success"], bound
+    _seed_verified_delegation(hermes_root, "msn-plan", old_did, old_sha)
+    synced = plan._sync_bound_node_from_verified_delegation(
+        old_did, hermes_root=hermes_root)
+    assert synced["result"] == "validated", synced
+    retried = _j(plan.hermes_plan_bind_delegation(
+        "msn-plan", "a", new_did, new_sha, confirm=True,
+        dry_run=False, hermes_root=hermes_root))
+    assert retried["success"] and retried["node_state"] == "dispatched", retried
+    with sqlite3.connect(plan._db_path(hermes_root)) as db:
+        state, budget = db.execute(
+            "SELECT state,budget FROM plan_nodes WHERE mission_id='msn-plan' AND node_id='a'"
+        ).fetchone()
+    b = json.loads(budget)
+    assert state == "dispatched"
+    assert b["validation_retry_of"] == old_did
+    assert b["superseded_delegation_id"] == old_did
+    assert b["bound_delegation_id"] == new_did
+    assert b["bound_contract_sha256"] == new_sha
+    # Repeated submit on this attempt adopts its reservation without new work.
+    adopted = _j(plan.hermes_plan_bind_delegation(
+        "msn-plan", "a", new_did, new_sha, confirm=True,
+        dry_run=False, hermes_root=hermes_root))
+    assert adopted["success"] and adopted["idempotent"], adopted
+
+
+@pytest.mark.parametrize("corruption", [
+    "unverified", "wrong_mission", "wrong_sha", "not_terminal"
+])
+def test_validated_node_retry_denies_unverifiable_prior(hermes_root, corruption):
+    _make_mission(hermes_root)
+    _j(plan.hermes_plan_create(
+        "msn-plan", _operator_plan_dag(), confirm=True, dry_run=False,
+        hermes_root=hermes_root))
+    old_did, new_did = "dlg-retry-denial-old", "dlg-retry-denial-new"
+    sha = "a" * 64
+    _j(plan.hermes_plan_bind_delegation(
+        "msn-plan", "a", old_did, sha, confirm=True,
+        dry_run=False, hermes_root=hermes_root))
+    _seed_verified_delegation(hermes_root, "msn-plan", old_did, sha)
+    plan._sync_bound_node_from_verified_delegation(old_did, hermes_root=hermes_root)
+    with sqlite3.connect(plan.operator_delegations._db_path(hermes_root)) as db:
+        if corruption == "unverified":
+            db.execute("UPDATE delegations SET validation_verdict='' WHERE delegation_id=?",(old_did,))
+        elif corruption == "wrong_mission":
+            db.execute("UPDATE delegations SET mission_id=? WHERE delegation_id=?",("msn-foreign",old_did))
+        elif corruption == "wrong_sha":
+            db.execute("UPDATE delegations SET contract_sha256=? WHERE delegation_id=?",("e"*64,old_did))
+        elif corruption == "not_terminal":
+            db.execute("UPDATE delegations SET terminal_at=NULL WHERE delegation_id=?",(old_did,))
+        db.commit()
+    out = _j(plan.hermes_plan_bind_delegation(
+        "msn-plan", "a", new_did, "b"*64, confirm=True,
+        dry_run=False, hermes_root=hermes_root))
+    assert out["success"] is False and out["code"] == "PLAN_NODE_TERMINAL", out
+    with sqlite3.connect(plan._db_path(hermes_root)) as db:
+        state, budget = db.execute(
+            "SELECT state,budget FROM plan_nodes WHERE mission_id='msn-plan' AND node_id='a'"
+        ).fetchone()
+    assert state=="validated" and json.loads(budget)["bound_delegation_id"]==old_did
+
+
+def test_owner_approval_node_cannot_be_reopened_from_validated(hermes_root):
+    _make_mission(hermes_root)
+    _j(plan.hermes_plan_create("msn-plan", _operator_plan_dag(),
+                              confirm=True,dry_run=False,hermes_root=hermes_root))
+    old_did = "dlg-owner-gate-validated-old"
+    sha = "c" * 64
+    _j(plan.hermes_plan_bind_delegation(
+        "msn-plan","c",old_did,sha,confirm=True,dry_run=False,hermes_root=hermes_root))
+    _seed_verified_delegation(hermes_root,"msn-plan",old_did,sha)
+    with sqlite3.connect(plan._db_path(hermes_root)) as db:
+        db.execute("UPDATE plan_nodes SET state='validated' WHERE mission_id='msn-plan' AND node_id='c'")
+        db.commit()
+    out=_j(plan.hermes_plan_bind_delegation(
+        "msn-plan","c","dlg-owner-gate-validated-new","d"*64,
+        confirm=True,dry_run=False,hermes_root=hermes_root))
+    assert not out["success"] and out["code"]=="PLAN_NODE_TERMINAL",out

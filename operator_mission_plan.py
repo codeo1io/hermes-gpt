@@ -1945,7 +1945,7 @@ def hermes_plan_bind_delegation(
         now = _now()
         with _replacement_lease(mission_id, hermes_root), _connect(path, write=True) as db:
             _begin_write(db)
-            mission._get_row(db, mission_id)  # raises LookupError
+            mission_row = mission._get_row(db, mission_id)  # raises LookupError
             row = db.execute(
                 "SELECT state,contract_sha256,budget FROM plan_nodes WHERE mission_id=? AND node_id=?",
                 (mission_id, node_id),
@@ -1955,6 +1955,11 @@ def hermes_plan_bind_delegation(
             bound = json.loads(str(row["budget"] or "{}"))
             bound_delegation = str(bound.get("bound_delegation_id") or "")
             bound_sha = str(bound.get("bound_contract_sha256") or "")
+            prior_state = ""
+            prior_verdict = ""
+            prior_terminal = ""
+            prior_mission = ""
+            prior_sha = ""
             if bound_delegation and bound_delegation != delegation_id:
                 # One LIVE execution per node, but not one delegation FOREVER:
                 # a prior delegation that reached a TERMINAL state no longer
@@ -1965,17 +1970,21 @@ def hermes_plan_bind_delegation(
                 # delegation's state read-only from delegations.db (the
                 # delegations plane's own store); non-terminal row keeps
                 # the ALREADY_BOUND refusal (no double dispatch).
-                prior_state = ""
                 dlg_path = operator_delegations._db_path(hermes_root)
                 try:
                     if dlg_path.is_file():
                         with _connect(dlg_path, write=False) as dlg_db:
                             prior = dlg_db.execute(
-                                "SELECT state FROM delegations WHERE delegation_id=?",
+                                "SELECT state,validation_verdict,terminal_at,mission_id,contract_sha256 "
+                                "FROM delegations WHERE delegation_id=?",
                                 (bound_delegation,),
                             ).fetchone()
                         if prior is not None:
                             prior_state = str(prior["state"])
+                            prior_verdict = str(prior["validation_verdict"] or "")
+                            prior_terminal = str(prior["terminal_at"] or "")
+                            prior_mission = str(prior["mission_id"] or "")
+                            prior_sha = str(prior["contract_sha256"] or "")
                 except Exception:
                     prior_state = ""
                 if prior_state and prior_state not in operator_delegations.TERMINAL_STATES:
@@ -2039,7 +2048,43 @@ def hermes_plan_bind_delegation(
                     "idempotent": True,
                 })
             state = str(row["state"] or "")
-            if state in ("validated", "succeeded", "cancelled"):
+            retry_after_validation = state == "validated"
+            if retry_after_validation:
+                # A Work Contract can validate AFTER Conductor's bounded
+                # workflow attempt has expired; Conductor then legitimately
+                # needs a NEW attempt even though the old worker's late
+                # result met native contract checks. 'validated' is an
+                # INTERMEDIATE plan state, not mission completion. Permit
+                # a fresh bound retry ONLY with immutable proof that the old
+                # delegation really terminated successfully, validation was
+                # SATISFIED, and contract+mission SHA match. Completion or
+                # owner approval gates never reopen automatically.
+                verified_prior = (
+                    bound_delegation and bound_delegation != delegation_id
+                    and prior_state == "succeeded" and prior_verdict == "SATISFIED"
+                    and bool(prior_terminal) and prior_mission == mission_id
+                    and prior_sha == bound_sha
+                )
+                plan_doc_row = db.execute(
+                    "SELECT plan_json FROM mission_plans WHERE mission_id=?", (mission_id,)
+                ).fetchone()
+                plan_doc = json.loads(plan_doc_row["plan_json"]) if plan_doc_row else {}
+                approval_node = any(
+                    n.get("node_id") == node_id and n.get("kind") == KIND_APPROVAL
+                    for n in plan_doc.get("nodes", []) if isinstance(n, dict)
+                )
+                if not verified_prior or str(mission_row["status"]) == "completed" or approval_node:
+                    db.rollback()
+                    return json.dumps({
+                        "success": False, "schema_version": SCHEMA_VERSION,
+                        "code": "PLAN_NODE_TERMINAL",
+                        "safe_message": "validated node retry requires verified terminal Work Contract "
+                                        "and open non-approval Mission",
+                        "changed": False,
+                    })
+                bound["validation_retry_of"] = bound_delegation
+                bound["validation_retry_at"] = now
+            elif state in ("succeeded", "cancelled", "completed", "awaiting_approval"):
                 db.rollback()
                 return json.dumps({
                     "success": False, "schema_version": SCHEMA_VERSION,
@@ -2050,7 +2095,7 @@ def hermes_plan_bind_delegation(
             bound["bound_delegation_id"] = delegation_id
             bound["bound_contract_sha256"] = contract_sha256
             bound["bound_at"] = now
-            new_state = "dispatched" if state in ("", "pending", "ready") else state
+            new_state = "dispatched" if state in ("", "pending", "ready", "validated") else state
             db.execute(
                 "UPDATE plan_nodes SET budget=?,state=?,updated_at=? WHERE mission_id=? AND node_id=?",
                 (json.dumps(bound, sort_keys=True), new_state, now, mission_id, node_id),
