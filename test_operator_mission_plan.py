@@ -874,7 +874,8 @@ def test_owner_approval_node_cannot_be_reopened_from_validated(hermes_root):
     _make_mission(hermes_root)
     _j(plan.hermes_plan_create("msn-plan", _operator_plan_dag(),
                               confirm=True,dry_run=False,hermes_root=hermes_root))
-    old_did="dlg-owner-gate-validated-old";sha="c"*64
+    old_did = "dlg-owner-gate-validated-old"
+    sha = "c" * 64
     _j(plan.hermes_plan_bind_delegation(
         "msn-plan","c",old_did,sha,confirm=True,dry_run=False,hermes_root=hermes_root))
     _seed_verified_delegation(hermes_root,"msn-plan",old_did,sha)
