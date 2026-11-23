@@ -52,6 +52,7 @@ _PRE_BACKEND_REFUSAL_CODES = frozenset({
     "RUNNER_BACKEND_UNKNOWN",
     "RUNNER_BACKEND_NOT_ALLOWED",
     "RUNNER_UNAVAILABLE",
+    "OWNER_ESTOP_ACTIVE",  # proven no-mutation Hermes Agent admission refusal
 })
 DELEGATION_ID_RE = re.compile(r"^dlg-[A-Za-z0-9][A-Za-z0-9._-]{0,59}$")
 STATES = frozenset({"reserved", "queued", "running", "reconciling", "succeeded", "failed", "cancelled"})

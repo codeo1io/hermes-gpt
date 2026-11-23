@@ -600,6 +600,94 @@ def test_observation_running_from_pending_envelope(tmp_path, monkeypatch):
     assert rows[0]["delegate_backend"] == "pi"
 
 
+def _owner_held_ack(tmp_path: Path, *, active_count: int = 0, stale_pid: bool = False):
+    """Fenced admission evidence: matching live PID, nonce and zero futures."""
+    import os
+    import time
+    control = tmp_path / "spool" / "control"
+    control.mkdir(exist_ok=True)
+    pid = os.getpid() + 100000 if stale_pid else os.getpid()
+    (tmp_path / "ESTOP").touch()
+    (control / "promotion-quiesce.json").write_text(json.dumps({
+        "schema_version": 1, "purpose": "conductor-release-promotion",
+        "server_pid": pid, "expires_at": time.time() + 1800,
+        "nonce": "owner-fenced-test",
+    }))
+    (control / "promotion-quiesce-ack.json").write_text(json.dumps({
+        "server_pid": pid, "nonce": "owner-fenced-test",
+        "active_count": active_count,
+    }))
+    (control / "promotion-quiesce-capabilities.json").write_text(json.dumps({
+        "protocol": "promotion-quiesce-ack-v1", "server_pid": pid,
+    }))
+
+
+def test_owner_estop_refuses_new_hermes_agent_order_without_side_effect(tmp_path, monkeypatch):
+    be = _backend(monkeypatch, tmp_path)
+    (tmp_path / "ESTOP").touch()
+    out = be.dispatch(_contract(tmp_path), confirm=True, dry_run=False, timeout=900)
+    assert out["success"] is False
+    assert out["code"] == "OWNER_ESTOP_ACTIVE"
+    assert out["changed"] is False
+    assert list((tmp_path / "spool" / "pending").iterdir()) == []
+    assert "OWNER_ESTOP_ACTIVE" in delegations._PRE_BACKEND_REFUSAL_CODES
+
+
+def test_owner_hold_reports_unstarted_pending_as_queued(tmp_path, monkeypatch):
+    be = _backend(monkeypatch, tmp_path)
+    be.dispatch(_contract(tmp_path), confirm=True, dry_run=False, timeout=900)
+    _owner_held_ack(tmp_path)
+    observation = be.observed_runs("attempt0000000001")
+    assert len(observation) == 1
+    assert observation[0]["status"] == "queued"
+    assert observation[0]["owner_held"] is True
+    assert observation[0]["started_at"] is None
+
+
+def test_owner_quarantine_survives_observation_without_republish(tmp_path, monkeypatch):
+    be = _backend(monkeypatch, tmp_path)
+    be.dispatch(_contract(tmp_path), confirm=True, dry_run=False, timeout=900)
+    source = tmp_path / "spool/pending/attempt0000000001.json"
+    _owner_held_ack(tmp_path)
+    quarantine = tmp_path / "spool/control/owner-held-pending-20261123"
+    quarantine.mkdir()
+    source.rename(quarantine / source.name)
+    assert not source.exists()
+    observed = be.observed_runs("attempt0000000001")
+    assert observed[0]["status"] == "queued"
+    assert observed[0]["scope"] == "runner:hermes_agent"
+    assert observed[0]["started_at"] is None
+    assert not source.exists()
+    # Still fail closed against new dispatches even for the same attempt.
+    out = be.dispatch(_contract(tmp_path), confirm=True, dry_run=False, timeout=900)
+    assert out["code"] == "OWNER_ESTOP_ACTIVE"
+    assert not source.exists()
+
+
+@pytest.mark.parametrize("ack_workers,stale_pid", [(1, False), (0, True)])
+def test_owner_hold_never_downgrades_pending_with_unproven_drain(
+    tmp_path, monkeypatch, ack_workers, stale_pid
+):
+    be = _backend(monkeypatch, tmp_path)
+    be.dispatch(_contract(tmp_path), confirm=True, dry_run=False, timeout=900)
+    _owner_held_ack(tmp_path, active_count=ack_workers, stale_pid=stale_pid)
+    assert be.observed_runs("attempt0000000001")[0]["status"] == "running"
+
+
+def test_verified_terminal_result_precedes_owner_quarantine(tmp_path, monkeypatch):
+    be = _backend(monkeypatch, tmp_path)
+    be.dispatch(_contract(tmp_path), confirm=True, dry_run=False, timeout=900)
+    _owner_held_ack(tmp_path)
+    result = tmp_path / "spool/results/attempt0000000001.json"
+    result.write_text(json.dumps({
+        "attempt_id": "attempt0000000001", "status": "succeeded",
+        "session_id": "s-1",
+    }))
+    observed = be.observed_runs("attempt0000000001")
+    assert observed[0]["outcome"] == "completed"
+    assert observed[0].get("owner_held") is not True
+
+
 def test_observation_empty_for_unknown_attempt(tmp_path, monkeypatch):
     be = _backend(monkeypatch, tmp_path)
     assert be.observed_runs("attempt0000000009") == []
