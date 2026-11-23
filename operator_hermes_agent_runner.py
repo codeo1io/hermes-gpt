@@ -166,6 +166,56 @@ def _resolve_spool_root(hermes_root: Path | None = None, options: dict[str, Any]
     return root
 
 
+def _owner_held_spool(spool: Path) -> bool:
+    """Prove that the owner has stopped all new admissions, not just posted a lease.
+
+    The pending envelope is *not* an execution start: it stays on disk while
+    workers run. Only a live zero-future ACK from the same spool process plus
+    global ESTOP proves that work is queued (or owner-quarantined) rather than
+    actively executing. Unknown/stale signals must not downgrade running work.
+    """
+    if not (spool.parent / "ESTOP").is_file():
+        return False
+    control = spool / "control"
+    try:
+        lease = _read_json(control / "promotion-quiesce.json") or {}
+        ack = _read_json(control / "promotion-quiesce-ack.json") or {}
+        capabilities = _read_json(control / "promotion-quiesce-capabilities.json") or {}
+        pid = lease.get("server_pid")
+        if (lease.get("schema_version") != 1
+            or lease.get("purpose") != "conductor-release-promotion"
+            or not isinstance(pid, int) or pid <= 0
+            or not isinstance(lease.get("expires_at"), (int, float))
+            or lease["expires_at"] <= time.time()
+            or not isinstance(lease.get("nonce"), str) or not lease["nonce"]
+            or ack.get("nonce") != lease["nonce"]
+            or ack.get("server_pid") != pid
+            or ack.get("active_count") != 0
+            or capabilities.get("server_pid") != pid
+            or capabilities.get("protocol") != "promotion-quiesce-ack-v1"):
+            return False
+        os.kill(pid, 0)  # a retired server's stale ACK is never authority
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def _owner_held_envelope(spool: Path, task_id: str) -> Path | None:
+    """Find the unchanged owner-quarantined order only during an ACKed hold."""
+    if not _owner_held_spool(spool):
+        return None
+    control = spool / "control"
+    for directory in control.glob("owner-held-pending-*"):
+        if not directory.is_dir() or directory.is_symlink():
+            continue
+        candidate = directory / f"{task_id}.json"
+        if candidate.is_file() and not candidate.is_symlink():
+            payload = _read_json(candidate)
+            if payload and payload.get("attempt_id") == task_id:
+                return candidate
+    return None
+
+
 def _atomic_write_json(path: Path, value: dict[str, Any]) -> None:
     """Durably create-or-replace ``path`` (same discipline as the spool layout:
     exclusive temp, payload fsync BEFORE rename, directory fsync AFTER)."""
@@ -366,6 +416,16 @@ class HermesAgentBackend:
             )
         result_path = results / f"{task_id}.json"
         envelope_path = pending / f"{task_id}.json"
+        # Owner-global stop is stronger than a short-lived spool lease:
+        # no NEW runner submission or idempotent re-publish is permitted
+        # while the user explicitly requires all work stopped. This typed
+        # no-mutation refusal cannot be confused with a transport failure.
+        # Keep terminal result re-reads available for honest completion.
+        if not result_path.exists() and (root.parent / "ESTOP").is_file():
+            return _refusal(
+                "OWNER_ESTOP_ACTIVE",
+                "Owner emergency stop active: no Hermes Agent spool work can be submitted",
+            )
         if result_path.exists():
             # Duplicate dispatch after a crash: the terminal envelope is
             # already on disk; fold it instead of re-queueing the work.
@@ -568,23 +628,38 @@ class HermesAgentBackend:
         )
         if record is not None:
             return [record]
-        # Still in flight? A durable pending envelope proves dispatch crossed
-        # the boundary (outcome unknown, never dispatch unknown).
+        # A pending work-order proves durable acceptance, not execution:
+        # the file remains in pending even WHILE the worker is running.
+        # The owner stop adds independent proof (live zero-future spool
+        # ACK + ESTOP) that it is NOT executing. Only then report queued.
+        # Outside this proven fence, retain the existing conservative
+        # "running" classification so live workers are never downgraded.
         envelope = root / "pending" / f"{task_id}.json"
-        if envelope.is_file():
-            meta = _read_json(envelope) or {}
+        held = _owner_held_envelope(root, task_id)
+        if envelope.is_file() or held is not None:
+            selected = envelope if envelope.is_file() else held
+            assert selected is not None
+            meta = _read_json(selected) or {}
+            if meta.get("attempt_id") != task_id:
+                return []  # corrupted/foreign order is never authority
+            confirmed_queued = _owner_held_spool(root)
             return [
                 {
                     "task_id": task_id,
-                    "status": "running",
+                    "status": "queued" if confirmed_queued else "running",
                     "outcome": "",
                     "error": None,
-                    "started_at": time.strftime(
-                        "%Y-%m-%dT%H:%M:%SZ", time.gmtime(envelope.stat().st_mtime)
+                    # An accepted timestamp is not a backend started_at.
+                    "started_at": None if confirmed_queued else time.strftime(
+                        "%Y-%m-%dT%H:%M:%SZ", time.gmtime(selected.stat().st_mtime)
+                    ),
+                    "dispatched_at": time.strftime(
+                        "%Y-%m-%dT%H:%M:%SZ", time.gmtime(selected.stat().st_mtime)
                     ),
                     "ended_at": None,
                     "scope": f"runner:{self.name}",
                     "delegate_backend": meta.get("backend_hint") or "",
+                    "owner_held": confirmed_queued,
                 }
             ]
         return []
