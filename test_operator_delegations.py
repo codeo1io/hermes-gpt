@@ -4,11 +4,13 @@ import json
 import os
 import sqlite3
 import threading
+import time
 from pathlib import Path
 
 import pytest
 
 import operator_delegations as delegations
+import operator_hermes_agent_runner as hab
 import operator_mission_runtime as missions
 import operator_policy as op
 import operator_runners as runners
@@ -637,6 +639,89 @@ def test_reconcile_backend_success_uses_durable_validation_manifest(tmp_path: Pa
     attachment = next(item for item in mission["attachments"] if item["ref"] == "dlg-reconcile")
     assert attachment["state"] == "succeeded"
     assert attachment["verified"]
+
+
+def test_reconcile_maps_stalled_worker_observation_to_failed_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """End-to-end corpse-class repair (dlg-d073c612…, 2026-11-25): a dead
+    hermes-agent delegate worker (pending envelope, no events stream, no
+    result envelope, stalled beyond the ceiling) must terminalize the
+    delegation row as failed with a terminal_at — never eternal running."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    root = tmp_path / "hermes"
+    _enable_workspace(monkeypatch, workspace)
+    mission_id = _mission(root)
+    task_id = "stalled-worker-attempt-0001"
+    monkeypatch.setattr(
+        delegations.contract_mod,
+        "hermes_contract_dispatch",
+        lambda *args, **kwargs: json.dumps({
+            "success": True, "changed": True, "backend": "hermes_agent", "state": "queued",
+        }),
+    )
+    spool = tmp_path / "agent-spool"
+    (spool / "pending").mkdir(parents=True)
+    (spool / "results").mkdir(parents=True)
+    monkeypatch.setenv(hab.SPOOL_ROOT_ENV, str(spool))
+    contract = _contract(workspace, task_id=task_id, backend="hermes_agent")
+    created = json.loads(
+        delegations.hermes_delegation_dispatch(
+            json.dumps(contract),
+            mission_id=mission_id,
+            delegation_id="dlg-stalled-worker",
+            confirm=True,
+            dry_run=False,
+            hermes_root=root,
+        )
+    )
+    assert created["success"] is True
+    # Corpse shape: orphaned pending work order, no events stream, no result.
+    envelope = spool / "pending" / f"{task_id}.json"
+    envelope.write_text(json.dumps({
+        "schema": 1,
+        "interface": "delegate_session",
+        "attempt_id": task_id,
+        "backend_hint": "pi",
+    }))
+    stalled_at = time.time() - 7 * 3600.0
+    os.utime(envelope, (stalled_at, stalled_at))
+    reconciled = json.loads(
+        delegations.hermes_delegation_reconcile(
+            "dlg-stalled-worker", apply=True, hermes_root=root,
+        )
+    )
+    assert reconciled["success"] is True
+    assert reconciled["applied"] is True
+    assert reconciled["delegation"]["state"] == "failed"
+    assert reconciled["delegation"]["outcome"] == "failed"
+    assert reconciled["observed"]["error"]
+    assert "stalled beyond ceiling" in reconciled["observed"]["error"]
+    durable = json.loads(
+        delegations.hermes_delegation_get("dlg-stalled-worker", hermes_root=root)
+    )["delegation"]
+    assert durable["state"] == "failed"
+    assert durable["terminal_at"]
+    # Idempotent second pass: the corpse shape persists on disk, so the
+    # derivation re-fires — the row must STAY terminal (no reopen, no
+    # re-stamped terminal_at), pinning the dlg-c51c61e4 oscillation class.
+    second = json.loads(
+        delegations.hermes_delegation_reconcile(
+            "dlg-stalled-worker", apply=True, hermes_root=root,
+        )
+    )
+    assert second["success"] is True and second["applied"] is True
+    assert second["delegation"]["state"] == "failed"
+    assert second["delegation"]["terminal_at"] == durable["terminal_at"]
+    preview = json.loads(
+        delegations.hermes_delegation_reconcile(
+            "dlg-stalled-worker", apply=False, hermes_root=root,
+        )
+    )
+    assert preview["success"] is True and preview["applied"] is False
+    assert preview["delegation"]["state"] == "failed"
 
 
 def test_reconcile_cas_preserves_concurrently_confirmed_cancellation(

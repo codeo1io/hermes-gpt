@@ -81,6 +81,50 @@ _MAX_PAYLOAD_BYTES = 256 * 1024
 _MIN_TURN_BUDGET_SECONDS = 900.0
 _MAX_TURN_BUDGET_SECONDS = 14400.0
 
+#: Stall ceiling for deriving dead delegate workers (2026-11-25, corpse
+#: class dlg-d073c612…/census 20261125T0310Z): a host reboot killed
+#: in-flight hermes-agent workers whose pending work orders then never
+#: received a terminal result envelope, and "pending + no result" alone
+#: reports ``running`` FOREVER — freezing the delegation row and pinning
+#: every conductor attempt on it open eternally. When no durable activity
+#: for the attempt (neither a row in the spool progress stream nor a newer
+#: signal) lies within the ceiling, the worker is derived dead and the
+#: observation reports ``failed`` with a typed stall error. The ceiling
+#: must strictly exceed the maximum legal TURN budget above — no live
+#: legal turn may be misread as dead (live Pi turns observed up to ~2h) —
+#: so configured values are clamped up to that budget plus a 30-minute
+#: terminal-envelope write margin. Default 6h.
+STALL_CEILING_ENV = "HERMES_GPT_HERMES_AGENT_STALL_CEILING_SECONDS"
+_DEFAULT_STALL_CEILING_SECONDS = 6 * 3600
+
+#: Typed observation error for the derived-death verdict. Deliberately not
+#: "cancelled" (cancellation keeps its own authority path) and never a
+#: fabricated success.
+_STALL_ERROR = (
+    "runner worker died without terminal envelope (stalled beyond ceiling)"
+)
+
+_MAX_PLAUSIBLE_EPOCH = 4102444800  # 2100-01-01 UTC — same bound as the
+#: sibling timestamp parser in operator_delegations
+#: (_observation_is_fresh_for_cancellation): a corrupt row can never pin
+#: the reference clock to the far future and mask corpse detection.
+
+#: Sentinel returned by _last_progress_stamp when the progress stream is
+#: PRESENT (stat succeeded, size > 0) but its tail could not be read
+#: (EMFILE/EACCES/transient EIO): liveness evidence that exists but is
+#: unreadable must suppress the death derivation, never feed it.
+_UNREADABLE = object()
+
+#: Bounded tail window when scanning an attempt's progress stream for its
+#: last activity stamp (mirrors the spool server's own bounded reads).
+_PROGRESS_TAIL_BYTES = 65536
+
+#: The ceiling must STRICTLY exceed the maximum legal TURN budget (the gap
+#: between budget exhaustion and the terminal envelope write belongs to a
+#: turn that is legally still concluding), so the effective floor is the
+#: max turn budget plus this margin.
+_FLOOR_MARGIN_SECONDS = 1800
+
 
 def _bounded_turn_budget(pinned: Any, invocation_timeout: Any) -> float:
     """Resolve the delegated TURN budget, never the invocation timeout.
@@ -198,6 +242,85 @@ def _owner_held_spool(spool: Path) -> bool:
         return True
     except (OSError, TypeError, ValueError):
         return False
+
+
+def _stall_ceiling_seconds() -> float:
+    """Effective stall ceiling: ops-tunable, never below the max turn budget."""
+    raw = os.environ.get(STALL_CEILING_ENV, "")
+    try:
+        configured = float(raw) if raw else float(_DEFAULT_STALL_CEILING_SECONDS)
+    except ValueError:
+        logger.warning(
+            "ignoring non-numeric %s=%r (using default %ss)",
+            STALL_CEILING_ENV, raw, _DEFAULT_STALL_CEILING_SECONDS,
+        )
+        configured = float(_DEFAULT_STALL_CEILING_SECONDS)
+    if configured <= 0 or math.isnan(configured) or math.isinf(configured):
+        # An infinite or non-positive ceiling would silently disable corpse
+        # detection entirely (the exact bug class this module repairs), so
+        # every invalid value falls back to the default and says so.
+        logger.warning(
+            "ignoring invalid %s=%r (using default %ss)",
+            STALL_CEILING_ENV, raw, _DEFAULT_STALL_CEILING_SECONDS,
+        )
+        configured = float(_DEFAULT_STALL_CEILING_SECONDS)
+    return max(configured, _MAX_TURN_BUDGET_SECONDS + _FLOOR_MARGIN_SECONDS)
+
+
+def _last_progress_stamp(stream_path: Path) -> float | None | object:
+    """Newest ``written_at`` in the attempt's progress stream, or ``None``.
+
+    Any event row is activity evidence — ``delegate_turn_*`` progress rows,
+    digest revalidation, phase repair: the spool server only writes rows for
+    attempts it is still working, so the newest stamp is the honest
+    last-activity clock (2026-11-25 corpse census: all 9 corpses had NO
+    stream at all — the worker never even started a turn). Unparseable or
+    torn tail lines from a concurrently-appending writer are skipped, never
+    fatal; a stream with no usable stamp is indistinguishable from absent.
+    A stream that EXISTS but cannot be read (open/read OSError after a
+    successful size stat) returns the ``_UNREADABLE`` sentinel instead —
+    present liveness evidence must never be conflated with a missing
+    stream, which would bias the verdict toward death.
+    The read is bounded to the file's tail.  Stamps outside a plausible
+    epoch window — non-numeric, non-positive, NaN, infinity, or later
+    than 2100 — are skipped, so a single corrupt row can never pin the
+    last-activity clock to the far future and mask corpse detection.
+    """
+    try:
+        size = stream_path.stat().st_size
+    except OSError:
+        return None
+    if size <= 0:
+        return None
+    try:
+        with stream_path.open("rb") as fh:
+            if size > _PROGRESS_TAIL_BYTES:
+                fh.seek(max(0, size - _PROGRESS_TAIL_BYTES))
+                fh.readline()  # drop the torn line at the window edge
+            window = fh.read()
+    except OSError:
+        return _UNREADABLE
+    stamp: float | None = None
+    for raw in window.splitlines():
+        line = raw.decode("utf-8", "replace").strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        written = row.get("written_at")
+        if isinstance(written, bool) or not isinstance(written, (int, float)):
+            continue
+        candidate = float(written)
+        if candidate <= 0 or math.isnan(candidate) or math.isinf(candidate):
+            continue
+        if candidate > _MAX_PLAUSIBLE_EPOCH:
+            continue
+        stamp = candidate if stamp is None else max(stamp, candidate)
+    return stamp
 
 
 def _owner_held_envelope(spool: Path, task_id: str) -> Path | None:
@@ -632,8 +755,9 @@ class HermesAgentBackend:
         # the file remains in pending even WHILE the worker is running.
         # The owner stop adds independent proof (live zero-future spool
         # ACK + ESTOP) that it is NOT executing. Only then report queued.
-        # Outside this proven fence, retain the existing conservative
-        # "running" classification so live workers are never downgraded.
+        # Outside this proven fence, "running" holds only within the bounded
+        # stall ceiling (worker-death derivation below); live workers inside
+        # the ceiling are never downgraded.
         envelope = root / "pending" / f"{task_id}.json"
         held = _owner_held_envelope(root, task_id)
         if envelope.is_file() or held is not None:
@@ -642,7 +766,26 @@ class HermesAgentBackend:
             meta = _read_json(selected) or {}
             if meta.get("attempt_id") != task_id:
                 return []  # corrupted/foreign order is never authority
+            try:
+                accepted_mtime = selected.stat().st_mtime
+            except OSError:
+                # The spool server retires the pending envelope right after
+                # publishing the result envelope; losing that interleaving
+                # means this pass observes nothing — the next pass folds
+                # the fresh result envelope through the normal path.
+                return []
             confirmed_queued = _owner_held_spool(root)
+            if not confirmed_queued:
+                # Worker-death truth (2026-11-25): outside the proven owner
+                # fence, "running" holds only while some durable activity
+                # for the attempt lies within the stall ceiling; beyond it
+                # the worker is derived dead (typed failure, never
+                # cancelled, never success).
+                stalled = self._stalled_worker_observation(
+                    task_id, root, selected, meta
+                )
+                if stalled is not None:
+                    return [stalled]
             return [
                 {
                     "task_id": task_id,
@@ -651,10 +794,10 @@ class HermesAgentBackend:
                     "error": None,
                     # An accepted timestamp is not a backend started_at.
                     "started_at": None if confirmed_queued else time.strftime(
-                        "%Y-%m-%dT%H:%M:%SZ", time.gmtime(selected.stat().st_mtime)
+                        "%Y-%m-%dT%H:%M:%SZ", time.gmtime(accepted_mtime)
                     ),
                     "dispatched_at": time.strftime(
-                        "%Y-%m-%dT%H:%M:%SZ", time.gmtime(selected.stat().st_mtime)
+                        "%Y-%m-%dT%H:%M:%SZ", time.gmtime(accepted_mtime)
                     ),
                     "ended_at": None,
                     "scope": f"runner:{self.name}",
@@ -663,6 +806,58 @@ class HermesAgentBackend:
                 }
             ]
         return []
+
+    def _stalled_worker_observation(
+        self, task_id: str, root: Path, order_path: Path, meta: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Derive worker death from durable inactivity beyond the ceiling.
+
+        The pending envelope proves durable acceptance, never execution.
+        When the newest durable activity for the attempt — the work order's
+        acceptance mtime, or the progress stream's last row if the worker
+        ever wrote one — is older than the stall ceiling, the worker is dead
+        (rebooted host, killed fleet process) and will never write a
+        terminal envelope: report ``failed`` with the typed stall error so
+        reconcile can terminalize the row and the conductor's
+        native-terminal fold can settle the attempt. Fail-closed in every
+        ambiguous shape: a pending cancel marker keeps cancellation
+        semantics (that authority owns the attempt's verdict), a global
+        owner ESTOP keeps deliberately frozen work running, liveness
+        evidence that exists but cannot be read derives nothing,
+        an unstatable order derives nothing, and the verdict is never
+        ``cancelled`` and never a success.
+        """
+        if (root / "pending" / f"{task_id}.cancel.json").is_file():
+            return None
+        if (root.parent / "ESTOP").is_file():
+            # A global owner ESTOP is deliberately frozen work — posture,
+            # not death — even when its live quiesce lease has expired
+            # (dispatch refuses new work under the same file).
+            return None
+        try:
+            accepted = order_path.stat().st_mtime
+        except OSError:
+            return None
+        progress = _last_progress_stamp(root / "events" / f"{task_id}.jsonl")
+        if progress is _UNREADABLE:
+            # Liveness evidence exists but cannot be read: deriving death
+            # from a transient read failure (EMFILE under the reconcile
+            # fan-out, EACCES, EIO) would terminally kill a live
+            # delegation. Fail closed — derive nothing, stay running.
+            return None
+        reference = accepted if progress is None else max(accepted, progress)
+        if time.time() - reference <= _stall_ceiling_seconds():
+            return None
+        return {
+            "task_id": task_id,
+            "status": "failed",
+            "outcome": "failed",
+            "error": _STALL_ERROR,
+            "started_at": None,
+            "ended_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "scope": f"runner:{self.name}",
+            "delegate_backend": meta.get("backend_hint") or "",
+        }
 
     def cancel(self, task_id: str, *, hermes_root: Path | None = None) -> dict[str, Any]:
         if not _ATTEMPT_ID_RE.fullmatch(task_id or ""):
