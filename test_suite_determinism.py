@@ -57,6 +57,11 @@ _EXPECTED_SKIPIF_COUNTS = {
     # differ — platform conditions on 4 tests in upstream
     # test_operator_agent_readiness.py:82/94/242/256.
     "test_operator_agent_readiness.py": 4,
+    # 2026-11-25 stall-ceiling corpse repair: the unreadable-liveness-
+    # evidence simulation chmods the progress stream 0o000 — meaningful
+    # only on a filesystem that enforces mode bits against the runner
+    # (root ignores them), so the test skips under root CIs.
+    "test_operator_hermes_agent_runner.py": 1,
 }
 
 _SKIP_PATTERN = re.compile(r"\bskipif\b")
