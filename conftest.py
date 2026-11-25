@@ -48,6 +48,9 @@ _ISOLATED_ENV_VARS = (
     "HERMES_GPT_OAUTH_SCOPE",
     "HERMES_GPT_OAUTH_GEMINI_ENABLE",
     "HERMES_GPT_OAUTH_GEMINI_CLIENT_ID",
+    # Ops-tunable corpse-detection knob (hermes_agent runner stall
+    # ceiling); an ambient export would flip the stall tests' verdicts.
+    "HERMES_GPT_HERMES_AGENT_STALL_CEILING_SECONDS",
     "HERMES_GPT_OAUTH_GEMINI_CLIENT_SECRET",
     "HERMES_GPT_OAUTH_GEMINI_REDIRECT_URI",
     "HERMES_GPT_BEARER_TOKEN",

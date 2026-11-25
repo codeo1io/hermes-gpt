@@ -18,7 +18,9 @@ hermes-gpt-owned process trees. These pins hold the transport contract:
 from __future__ import annotations
 
 import json
+import os
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -53,6 +55,10 @@ def _contract(tmp_path: Path, *, backend: str = "hermes_agent", delegate: str = 
 
 def _backend(monkeypatch, tmp_path: Path) -> hab.HermesAgentBackend:
     monkeypatch.setenv(hab.SPOOL_ROOT_ENV, str(_spool(tmp_path)))
+    # Hermetic default ceiling: the knob is ops-tunable on real hosts, and
+    # an ambient export (e.g. a 12h soak posture) would flip the stall
+    # verdicts; tests that exercise the knob setenv after this.
+    monkeypatch.delenv(hab.STALL_CEILING_ENV, raising=False)
     return hab.HermesAgentBackend()
 
 
@@ -712,6 +718,270 @@ def test_cancel_records_intent_and_respects_terminal(tmp_path, monkeypatch):
     out2 = be.cancel("attempt0000000001")
     assert out2["success"] is False and out2["proven_terminal"] is True
     assert results.is_file()
+
+
+def _age_hours(path: Path, hours: float) -> None:
+    """Plant a durable-acceptance timestamp ``hours`` in the past (the
+    corpse class: the pending envelope's mtime IS the acceptance clock)."""
+    when = time.time() - hours * 3600.0
+    os.utime(path, (when, when))
+
+
+def _turn_event(task_id: str, *, event: str = "delegate_turn_progress", age_s: float) -> str:
+    return json.dumps({
+        "attempt_id": task_id,
+        "event": event,
+        "written_at": time.time() - age_s,
+    }) + "\n"
+
+
+def test_stalled_pending_worker_reports_failed_with_typed_error(tmp_path, monkeypatch):
+    """Corpse class (dlg-d073c612…, 2026-11-25): worker death must derive
+    from durable inactivity. Pending + no result + no events stream + age
+    beyond the ceiling reports failed with the typed stall error — never
+    cancelled, never success, never eternal running."""
+    be = _backend(monkeypatch, tmp_path)
+    be.dispatch(_contract(tmp_path), confirm=True, dry_run=False, timeout=900)
+    envelope = tmp_path / "spool" / "pending" / "attempt0000000001.json"
+    _age_hours(envelope, hours=7)
+    rows = be.observed_runs("attempt0000000001")
+    assert len(rows) == 1
+    assert rows[0]["status"] == "failed"
+    assert rows[0]["outcome"] == "failed"
+    assert "stalled beyond ceiling" in rows[0]["error"]
+    assert rows[0]["scope"] == "runner:hermes_agent"
+    assert rows[0]["ended_at"]  # terminal-ranked observation
+
+
+def test_pending_within_ceiling_stays_running(tmp_path, monkeypatch):
+    """A worker merely slow to start (queue starvation observed 2h+) is
+    never misread as dead while inside the ceiling."""
+    be = _backend(monkeypatch, tmp_path)
+    be.dispatch(_contract(tmp_path), confirm=True, dry_run=False, timeout=900)
+    _age_hours(tmp_path / "spool" / "pending" / "attempt0000000001.json", hours=5)
+    rows = be.observed_runs("attempt0000000001")
+    assert rows and rows[0]["status"] == "running"
+    assert rows[0]["error"] is None
+
+
+def test_recent_turn_progress_prevents_stall_verdict(tmp_path, monkeypatch):
+    """Live turn rows in events/<task_id>.jsonl are worker-liveness truth:
+    an old pending envelope with a fresh delegate_turn row stays running."""
+    be = _backend(monkeypatch, tmp_path)
+    be.dispatch(_contract(tmp_path), confirm=True, dry_run=False, timeout=900)
+    envelope = tmp_path / "spool" / "pending" / "attempt0000000001.json"
+    _age_hours(envelope, hours=7)
+    events = tmp_path / "spool" / "events"
+    events.mkdir()
+    (events / "attempt0000000001.jsonl").write_text(
+        _turn_event("attempt0000000001", event="delegate_turn_started", age_s=7 * 3600)
+        + _turn_event("attempt0000000001", age_s=20 * 60)
+    )
+    rows = be.observed_runs("attempt0000000001")
+    assert rows and rows[0]["status"] == "running"
+
+
+def test_stale_turn_progress_reports_failed(tmp_path, monkeypatch):
+    """A worker that started but went silent beyond the ceiling is dead —
+    the reference clock is the LAST activity stamp, not acceptance."""
+    be = _backend(monkeypatch, tmp_path)
+    be.dispatch(_contract(tmp_path), confirm=True, dry_run=False, timeout=900)
+    _age_hours(tmp_path / "spool" / "pending" / "attempt0000000001.json", hours=8)
+    events = tmp_path / "spool" / "events"
+    events.mkdir()
+    (events / "attempt0000000001.jsonl").write_text(
+        _turn_event("attempt0000000001", event="delegate_turn_started", age_s=8 * 3600)
+        + _turn_event("attempt0000000001", age_s=7 * 3600 + 60)
+    )
+    rows = be.observed_runs("attempt0000000001")
+    assert len(rows) == 1 and rows[0]["status"] == "failed"
+    assert "stalled beyond ceiling" in rows[0]["error"]
+
+
+def test_terminal_result_envelope_precedes_stall_classification(tmp_path, monkeypatch):
+    """A real terminal envelope always maps through the normal fold — the
+    stall ceiling can never override transport-terminal truth."""
+    be = _backend(monkeypatch, tmp_path)
+    be.dispatch(_contract(tmp_path), confirm=True, dry_run=False, timeout=900)
+    _age_hours(tmp_path / "spool" / "pending" / "attempt0000000001.json", hours=7)
+    result = tmp_path / "spool" / "results" / "attempt0000000001.json"
+    result.write_text(json.dumps({
+        "attempt_id": "attempt0000000001", "status": "succeeded", "session_id": "s1",
+    }))
+    rows = be.observed_runs("attempt0000000001")
+    assert rows[0]["outcome"] == "completed"
+    assert rows[0]["error"] is None
+
+
+def test_pending_cancel_marker_keeps_cancellation_semantics(tmp_path, monkeypatch):
+    """A pending cancellation owns the attempt: the stall ceiling must
+    never convert it to failed (cancel keeps its own verdict authority)."""
+    be = _backend(monkeypatch, tmp_path)
+    be.dispatch(_contract(tmp_path), confirm=True, dry_run=False, timeout=900)
+    envelope = tmp_path / "spool" / "pending" / "attempt0000000001.json"
+    _age_hours(envelope, hours=7)
+    out = be.cancel("attempt0000000001")
+    assert out["success"] is True and out["state"] == "cancelling"
+    assert (tmp_path / "spool" / "pending" / "attempt0000000001.cancel.json").is_file()
+    rows = be.observed_runs("attempt0000000001")
+    assert rows and rows[0]["status"] == "running"
+    assert rows[0]["error"] is None
+
+
+def test_owner_hold_is_exempt_from_stall_ceiling(tmp_path, monkeypatch):
+    """A proven owner quarantine (live zero-future ACK) is deliberate
+    stopped work, not a corpse: aged pending stays queued."""
+    be = _backend(monkeypatch, tmp_path)
+    be.dispatch(_contract(tmp_path), confirm=True, dry_run=False, timeout=900)
+    _age_hours(tmp_path / "spool" / "pending" / "attempt0000000001.json", hours=7)
+    _owner_held_ack(tmp_path)
+    observation = be.observed_runs("attempt0000000001")
+    assert len(observation) == 1
+    assert observation[0]["status"] == "queued"
+    assert observation[0]["owner_held"] is True
+
+
+def test_stall_ceiling_env_is_tunable_but_floored_at_turn_budget(tmp_path, monkeypatch):
+    """The ceiling is ops-tunable but floored at the max legal turn budget
+    (4h): a misconfigured low value can never fail a live legal turn."""
+    be = _backend(monkeypatch, tmp_path)
+    be.dispatch(_contract(tmp_path), confirm=True, dry_run=False, timeout=900)
+    envelope = tmp_path / "spool" / "pending" / "attempt0000000001.json"
+    _age_hours(envelope, hours=2)
+    monkeypatch.setenv(hab.STALL_CEILING_ENV, "60")  # far below the floor
+    assert be.observed_runs("attempt0000000001")[0]["status"] == "running"
+    monkeypatch.setenv(hab.STALL_CEILING_ENV, str(30 * 24 * 3600))
+    _age_hours(envelope, hours=7)
+    assert be.observed_runs("attempt0000000001")[0]["status"] == "running"
+    # Tunable middle range: a 5h ceiling sits above the floor and below
+    # the 6h default, so only a true floor-at-turn-budget implementation
+    # honors it (a clamp-to-default regression keeps the corpse running).
+    _age_hours(envelope, hours=5.5)
+    monkeypatch.setenv(hab.STALL_CEILING_ENV, str(5 * 3600))
+    assert be.observed_runs("attempt0000000001")[0]["status"] == "failed"
+    # Strictly-exceeding floor: a configured 4h value clamps to the max
+    # turn budget PLUS the 30-minute terminal-envelope write margin, so an
+    # order aged 4.4h (between budget and budget+margin) stays running —
+    # a bare max(configured, budget) floor would derive it dead.
+    _age_hours(envelope, hours=4.4)
+    monkeypatch.setenv(hab.STALL_CEILING_ENV, str(4 * 3600))
+    assert be.observed_runs("attempt0000000001")[0]["status"] == "running"
+
+
+def test_invalid_ceiling_env_falls_back_to_default(tmp_path, monkeypatch):
+    """Invalid ops values (garbage, 0, NaN, Infinity, 1e999) must fall
+    back to the 6h default — never silently disable corpse detection."""
+    be = _backend(monkeypatch, tmp_path)
+    be.dispatch(_contract(tmp_path), confirm=True, dry_run=False, timeout=900)
+    envelope = tmp_path / "spool" / "pending" / "attempt0000000001.json"
+    for raw in ("garbage", "0", "-60", "nan", "inf", "1e999"):
+        _age_hours(envelope, hours=7)  # beyond the 6h default ceiling
+        monkeypatch.setenv(hab.STALL_CEILING_ENV, raw)
+        rows = be.observed_runs("attempt0000000001")
+        assert rows[0]["status"] == "failed", raw
+        assert "stalled beyond ceiling" in rows[0]["error"], raw
+    # The default ceiling itself still holds for a 5h-old live order.
+    _age_hours(envelope, hours=5)
+    monkeypatch.setenv(hab.STALL_CEILING_ENV, "1e999")
+    assert be.observed_runs("attempt0000000001")[0]["status"] == "running"
+
+
+def test_future_envelope_mtime_fails_closed_to_running(tmp_path, monkeypatch):
+    """A future-dated envelope (clock skew / restored backup) keeps the
+    worker running: fail-closed — never a false corpse from skew."""
+    be = _backend(monkeypatch, tmp_path)
+    be.dispatch(_contract(tmp_path), confirm=True, dry_run=False, timeout=900)
+    envelope = tmp_path / "spool" / "pending" / "attempt0000000001.json"
+    _age_hours(envelope, hours=-1)  # 1h in the future
+    rows = be.observed_runs("attempt0000000001")
+    assert rows and rows[0]["status"] == "running"
+    assert rows[0]["error"] is None
+
+
+def test_tail_window_finds_fresh_row_through_oversized_stream(tmp_path, monkeypatch):
+    """The bounded tail read must find the freshest stamp through a stream
+    larger than _PROGRESS_TAIL_BYTES: a multi-hour live turn accumulates
+    more delegate_turn rows than one window, and dropping the fresh tail
+    would derive a FALSE corpse for a live worker."""
+    be = _backend(monkeypatch, tmp_path)
+    be.dispatch(_contract(tmp_path), confirm=True, dry_run=False, timeout=900)
+    envelope = tmp_path / "spool" / "pending" / "attempt0000000001.json"
+    _age_hours(envelope, hours=7)
+    events = tmp_path / "spool" / "events"
+    events.mkdir()
+    filler = "x" * 200
+    lines = [
+        json.dumps({
+            "attempt_id": "attempt0000000001",
+            "event": "delegate_turn_progress",
+            "written_at": time.time() - 6 * 3600,
+            "pad": filler,
+        })
+        for _ in range(400)  # >64KiB of older, stamp-bearing rows
+    ]
+    lines.append(_turn_event("attempt0000000001", age_s=20 * 60))
+    (events / "attempt0000000001.jsonl").write_text("\n".join(lines) + "\n")
+    rows = be.observed_runs("attempt0000000001")
+    assert rows and rows[0]["status"] == "running"
+
+
+def test_owner_estop_freezes_stall_derivation(tmp_path, monkeypatch):
+    """A global owner ESTOP is deliberately frozen work — posture, not
+    death — so the ceiling must not derive failure for it even when the
+    live quiesce lease has expired (dispatch refuses new work under the
+    same file)."""
+    be = _backend(monkeypatch, tmp_path)
+    be.dispatch(_contract(tmp_path), confirm=True, dry_run=False, timeout=900)
+    envelope = tmp_path / "spool" / "pending" / "attempt0000000001.json"
+    _age_hours(envelope, hours=7)
+    # Dispatch and observation share the convention: the global ESTOP lives
+    # one level above the spool root.
+    (tmp_path / "ESTOP").write_text("owner stop\n")
+    rows = be.observed_runs("attempt0000000001")
+    assert rows and rows[0]["status"] == "running"
+    assert rows[0]["error"] is None
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "geteuid") or os.geteuid() == 0,
+    reason="unreadable-file simulation requires a non-root runner",
+)
+def test_present_but_unreadable_stream_suppresses_stall_derivation(
+    tmp_path, monkeypatch
+):
+    """Liveness evidence that exists but cannot be read (EMFILE/EACCES/EIO)
+    must derive nothing: a transient read failure never terminalizes a
+    live worker (fail closed to running)."""
+    be = _backend(monkeypatch, tmp_path)
+    be.dispatch(_contract(tmp_path), confirm=True, dry_run=False, timeout=900)
+    envelope = tmp_path / "spool" / "pending" / "attempt0000000001.json"
+    _age_hours(envelope, hours=7)
+    events = tmp_path / "spool" / "events"
+    events.mkdir()
+    stream = events / "attempt0000000001.jsonl"
+    stream.write_text(_turn_event("attempt0000000001", age_s=30))
+    stream.chmod(0o000)
+    rows = be.observed_runs("attempt0000000001")
+    assert rows and rows[0]["status"] == "running"
+    assert rows[0]["error"] is None
+
+
+def test_corrupt_progress_stream_falls_back_to_envelope_clock(tmp_path, monkeypatch):
+    """Unparseable progress rows are skipped (never fatal); the acceptance
+    mtime remains the reference clock."""
+    be = _backend(monkeypatch, tmp_path)
+    be.dispatch(_contract(tmp_path), confirm=True, dry_run=False, timeout=900)
+    _age_hours(tmp_path / "spool" / "pending" / "attempt0000000001.json", hours=7)
+    events = tmp_path / "spool" / "events"
+    events.mkdir()
+    (events / "attempt0000000001.jsonl").write_text(
+        "{not json\n"
+        + json.dumps({"attempt_id": "attempt0000000001", "event": "no_stamp"}) + "\n"
+        + "{\"partial\": "  # torn tail line from a concurrent appender
+    )
+    rows = be.observed_runs("attempt0000000001")
+    assert len(rows) == 1 and rows[0]["status"] == "failed"
+    assert "stalled beyond ceiling" in rows[0]["error"]
 
 
 def test_registration_first_wins_and_module_imports_clean():
