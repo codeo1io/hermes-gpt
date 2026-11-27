@@ -381,6 +381,85 @@ class TestStallDetection:
         assert rec.value["pending_open_episodes"] == 0
         assert rec.denominator == 1
 
+    def test_transient_open_blip_at_head_does_not_hold_clean_window(self) -> None:
+        """Transient-blip exclusion (rm-172): a single-tick stall blip still
+        open at the journal head is NOT right-edge pending — the deployed
+        hysteresis deliberately ignores 1-tick blips, so a scored-clean
+        window must keep its PASS verdict and the pending count must stay
+        zero. Pre-fix this flipped PASS -> UNKNOWN via the pending-open
+        hold."""
+        lines = [
+            watchdog_line(ts_at(0), {"semantic_healthy": True}),
+            # stall run: IDLE, nothing working the backlog
+            watchdog_line(
+                ts_at(60),
+                {"supervisor": {"semantic_healthy": False, "execution_state": "IDLE"}},
+            ),
+            watchdog_line(
+                ts_at(120),
+                {"supervisor": {"semantic_healthy": False, "execution_state": "IDLE"}},
+            ),
+            # engagement tick (CYCLING, execution_healthy) closes the run:
+            # detected and handled, latency 120s <= 5m
+            watchdog_line(
+                ts_at(180),
+                {"supervisor": {"semantic_healthy": False, "execution_state": "CYCLING", "execution_healthy": True}},
+            ),
+            watchdog_line(ts_at(240), {"semantic_healthy": True}),
+            watchdog_line(ts_at(1500), {"semantic_healthy": True}),
+            # single-tick stall blip, still open at the journal head
+            watchdog_line(ts_at(1560), {"semantic_healthy": False}),
+        ]
+        rec = slo.probe_stall_detection(lines)
+        assert rec.verdict == slo.PASS, (rec.verdict, rec.value, rec.notes)
+        assert rec.value["pending_open_episodes"] == 0
+        assert rec.value["transient_episodes"] == 1
+        assert rec.value["persistent_episodes"] == 1
+        assert rec.value["within_5m"] == 1
+        assert rec.value["undetected"] == 0
+
+    def test_transient_open_blip_alone_stays_transient_unknown(self) -> None:
+        """A window whose only episode is a single-tick open blip at the head
+        keeps the pre-existing all-transient semantics: nothing to handle,
+        UNKNOWN with the transient-blip note — the blip is counted as
+        transient (not pending, not undetected) and cannot alone hold a
+        judged window open."""
+        lines = [
+            watchdog_line(ts_at(0), {"semantic_healthy": True}),
+            watchdog_line(ts_at(60), {"semantic_healthy": False}),
+        ]
+        rec = slo.probe_stall_detection(lines)
+        assert rec.verdict == slo.UNKNOWN, (rec.verdict, rec.value)
+        assert rec.value["pending_open_episodes"] == 0
+        assert rec.value["transient_episodes"] == 1
+        assert rec.value["undetected"] == 0
+        assert rec.denominator == 0
+        assert any(
+            "only transient blips" in n for n in rec.notes
+        )
+
+    def test_pending_open_forensics_fields(self) -> None:
+        """Soak-hold forensics (rm-172): a held window carries a bounded
+        pending-open breakdown — episode start, age at the journal head,
+        tick count — plus the journal-head timestamp itself, so "why is the
+        canary holding" is a one-read diagnosis."""
+        lines = [
+            watchdog_line(ts_at(0), {"semantic_healthy": True}),
+            watchdog_line(ts_at(60), {"semantic_healthy": False}),
+            watchdog_line(ts_at(120), {"semantic_healthy": False}),
+            watchdog_line(ts_at(180), {"semantic_healthy": False}),
+        ]
+        rec = slo.probe_stall_detection(lines)
+        assert rec.verdict == slo.UNKNOWN, rec.value
+        assert rec.value["pending_open_episodes"] == 1
+        detail = rec.value["pending_open_detail"]
+        assert isinstance(detail, list) and len(detail) == 1
+        entry = detail[0]
+        assert entry["ticks"] == 3
+        assert entry["age_s"] == 120.0
+        head_ts = rec.value["journal_head_ts"]
+        assert head_ts - entry["start"] == 120.0
+
     def test_pending_open_holds_a_scored_clean_window(self) -> None:
         """Closed episode handled in time + a young open episode at the
         head: the scored set is clean, but the open right edge withholds

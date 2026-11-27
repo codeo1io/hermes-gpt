@@ -2,11 +2,17 @@ import json
 import os
 from pathlib import Path
 
+import pytest
+
 import operator_codex as oc
 
 
-def _fake_codex(path: Path, version: str = "0.50.0", *, exit_code: int = 0) -> Path:
-    """Create a platform-appropriate fake `codex` command that answers --version."""
+def _fake_codex(path: Path, version: str = "0.172.0", *, exit_code: int = 0) -> Path:
+    """Create a platform-appropriate fake `codex` command that answers --version.
+
+    Default version sits ABOVE the launch floor (rm-173) so tests of other
+    gates exercise their own refusals, not the version floor; the floor's own
+    refusal semantics are pinned by the test_version_floor_* tests."""
     path.parent.mkdir(parents=True, exist_ok=True)
     if os.name == "nt":
         path = path.with_suffix(".cmd")
@@ -87,7 +93,7 @@ def test_nolo_job_metadata_and_audit(monkeypatch, tmp_path):
     monkeypatch.setattr(oc, "resolve_codex_exe", lambda: {
         "path": str(exe.resolve()),
         "source": "env",
-        "version": "codex 0.50.0",
+        "version": "codex 0.172.0",
         "reason": None,
         "skipped": [],
     })
@@ -245,3 +251,76 @@ def test_status_reports_missing_codex(monkeypatch, tmp_path):
     assert status["codex_available"] is False
     assert status["codex_path"] is None
     assert status["codex_reason"]
+
+
+def test_version_floor_refuses_old_cli(monkeypatch, tmp_path):
+    """rm-173: a resolved Codex CLI older than the minimum version is
+    refused with a typed CODEX_VERSION_TOO_OLD error before any launch
+    argv is built. The version is already probed at resolution today and
+    silently discarded; the floor makes the delegated-worker surface
+    refuse loudly instead of failing later with opaque protocol errors."""
+    enable(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        oc,
+        "resolve_codex_exe",
+        lambda: {"path": "/fake/codex", "source": "path",
+                 "version": "codex-cli 0.150.0", "reason": None, "skipped": []},
+    )
+    monkeypatch.delenv(oc.CODEX_MIN_VERSION_ENV, raising=False)
+    plan = oc.hermes_codex_plan("inspect", str(tmp_path))
+    assert plan["code"] == "CODEX_VERSION_TOO_OLD"
+
+
+def test_version_floor_allows_current_cli_and_reports_status(monkeypatch, tmp_path):
+    """A CLI at or above the floor launches normally, and hermes_codex_status
+    reports the effective floor plus the version-vs-floor verdict so
+    operators can see the gate before a launch fails."""
+    enable(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        oc,
+        "resolve_codex_exe",
+        lambda: {"path": "/fake/codex", "source": "path",
+                 "version": "codex-cli 0.172.0", "reason": None, "skipped": []},
+    )
+    monkeypatch.delenv(oc.CODEX_MIN_VERSION_ENV, raising=False)
+    plan = oc.hermes_codex_plan("inspect", str(tmp_path))
+    assert plan["success"] is True
+    status = oc.hermes_codex_status(tmp_path)
+    assert status["codex_version"] == "codex-cli 0.172.0"
+    assert status["codex_version_ok"] is True
+    assert status["codex_min_version"] == oc.CODEX_MIN_VERSION_DEFAULT
+
+
+def test_version_floor_env_override_and_invalid_fallback(monkeypatch, tmp_path):
+    """The floor is env-tunable (HERMES_GPT_CODEX_MIN_VERSION); an invalid
+    value falls back to the default WITH a warning — the stall-ceiling env
+    pattern — instead of bricking the runner or silently ignoring it."""
+    enable(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        oc,
+        "resolve_codex_exe",
+        lambda: {"path": "/fake/codex", "source": "path",
+                 "version": "codex-cli 0.150.0", "reason": None, "skipped": []},
+    )
+    monkeypatch.setenv(oc.CODEX_MIN_VERSION_ENV, "0.140.0")
+    assert oc.hermes_codex_plan("inspect", str(tmp_path))["success"] is True
+    with pytest.warns(UserWarning, match="CODEX_MIN_VERSION"):
+        monkeypatch.setenv(oc.CODEX_MIN_VERSION_ENV, "not-a-version")
+        plan = oc.hermes_codex_plan("inspect", str(tmp_path))
+    assert plan["code"] == "CODEX_VERSION_TOO_OLD"
+
+
+def test_version_floor_skips_unparseable_version(monkeypatch, tmp_path):
+    """A probe result that launches but does not parse (custom builds,
+    unexpected banner) is not blocked: the floor gates versions it can
+    read, and an unreadable one degrades to an un-floored launch rather
+    than bricking a working CLI installation."""
+    enable(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        oc,
+        "resolve_codex_exe",
+        lambda: {"path": "/fake/codex", "source": "path",
+                 "version": "some-custom-build", "reason": None, "skipped": []},
+    )
+    monkeypatch.delenv(oc.CODEX_MIN_VERSION_ENV, raising=False)
+    assert oc.hermes_codex_plan("inspect", str(tmp_path))["success"] is True

@@ -13,6 +13,56 @@
 
 ## Open items
 
+### Ride out transient SQLITE_BUSY on dispatch-critical SQLite writes
+- id: `rm-165` | track: reliability | priority: 112.0 | status: candidate
+- acceptance: every writable sqlite3.connect site (operator_delegations.py:93, operator_mission_runtime.py:133, hermes_state.py:90, operator_mission_plan.py, operator_mission_budget.py) sets a bounded busy_timeout (token_store.py:376 PRAGMA busy_timeout=15000 precedent) with bounded retry on sqlite3.OperationalError for dispatch-critical writes (delegation state commits, mission runtime progress); reads that today collapse OperationalError into absence (operator_mission_budget.py:441-442 — agent-reported, verify at implement) distinguish locked-vs-absent and retry instead of reporting wrong state; retries are bounded and fail closed with a typed error, never fabricating success; regression tests hold a competing writer and assert the retry and the locked-vs-absent distinction; full suite green on both SDK lanes
+- evidence: research 70b8a4343faa4df585767320b3b03722 candidates.md rm-165 (sibling hermes-agent 58957b1f8f + 6288139749 fixed this exact class 2026-11-25/27 — transient lock contention produced wrong verdicts and lost ticks); busy_timeout census re-verified live at 081a083462 by roadmap cad700e4c4b949ec9c975c536f91fe5b (12 non-test connect modules; token_store.py:376 the only busy_timeout site); proven by new retry/locked-vs-absent tests + full suite green + conductor validation digest recorded in the shipping PR
+
+### Delegation liveness observability: age, bounded progress tail, stall inbox source, scheduled read-only derivation
+- id: `rm-167` | track: operator-experience | priority: 111.0 | status: candidate
+- acceptance: hermes_delegation_list/get surfaces expose seconds-since-last-activity (max of progress-stream row ts and work-order acceptance mtime — the runner's own liveness reference, operator_hermes_agent_runner.py:830-861); a bounded read-only progress tail (event kind + timestamp only, no prompt/content bodies) is operator-reachable; the owner inbox gains a delegation-stall source for rows running past a warning threshold (bounded, anti-noise, distinct from work_contract_review which covers succeeded-pending-acceptance only — operator_owner_inbox.py:61,19); an opt-in scheduled read-only (apply=False) observation pass exists so dead-worker derivation no longer waits for a manual apply-authority reconcile; no bodies persisted or exposed (delegation data boundary intact); full suite green
+- evidence: research 70b8a4343faa4df585767320b3b03722 candidates.md rm-167; derivation-only-on-manual-reconcile + surface gaps re-verified live at 081a083462 (operator_delegations.py:255-273 exposes no age/staleness); proven by new surface/inbox tests + full suite green + conductor validation digest recorded in the shipping PR
+
+### Operator first-run self-service: hermes-gpt doctor + smoke console commands
+- id: `rm-168` | track: operator-experience | priority: 110.0 | status: candidate
+- acceptance: [project.scripts] gains doctor and smoke entry points (pyproject.toml:60-63 today registers three); doctor runs the operator_diagnostics.py:233-554 check library against the local Hermes root, prints a human-readable report, exits non-zero on failure, and prints no secrets; doctor also reports the resolved effective value of every HERMES_GPT_* behavior gate with unset-vs-default distinguished (today ~15 gates scattered across README/docs and unreported by /api/me or the env-readable doctor check); smoke launches the server over stdio, performs the MCP handshake, calls safe read tools (hermes_skill_list, hermes_operator_doctor), asserts bounded latency, and exits non-zero with a pointed failure message; README quickstart gains a verification step and docs/operator-mode.md cross-references both commands; tests cover both commands
+- evidence: research 70b8a4343faa4df585767320b3b03722 candidates.md rm-168 (diagnostics are MCP-tools-only — docs/operator-mode.md:484-509; a broken install must stand up a working MCP client, the broken thing, to learn why); check-library + scripts entries re-verified live at 081a083462; proven by new CLI tests + full suite green + conductor validation digest recorded in the shipping PR
+
+### Campaign observability: read-only campaign/generation status surface + owner-inbox sources
+- id: `rm-171` | track: operator-experience | priority: 109.0 | status: candidate
+- acceptance: a read-only status surface (MCP tool and/or Flight Deck page) reports registered campaigns, current generation/segment phase, parked_owner_gate / parked_autopilot_gate stalls (operator_campaign_controller.py:95-96) with park age, consecutive-failure counts vs max_consecutive_failures, and permanently-stopped campaigns; the owner inbox gains parked and stopped sources (bounded, anti-noise); the surface carries no resume or mutation authority (owner-approval invariant intact); tests pin the surfaced fields against a fixture campaign tree; docs/campaigns.md and docs/README.md campaigns row updated
+- evidence: research 70b8a4343faa4df585767320b3b03722 candidates.md rm-171 (docs/README.md:48 verbatim 'no MCP tools or server wiring'; zero attention/spool emission in the controller; owner inbox has no campaign source); re-verified live at 081a083462; proven by new surface tests + full suite green + conductor validation digest recorded in the shipping PR
+
+### Pin the plan-node cutover decision lattice as a golden + stateful property lane
+- id: `rm-166` | track: reliability | priority: 108.0 | status: candidate
+- acceptance: the supersession/prebind/late-success/bind decision if-chains (operator_mission_plan.py:1895-2117 hermes_plan_bind_delegation, :1832-1866 _delegation_row_for_mission three-state, :950-1020 plan-node CAS) are extracted into a declarative decision table — inputs (prior-bound delegation state, lineage row check, node state, terminal/verdict/SHA match) to outcomes (PLAN_NODE_ALREADY_BOUND / PLAN_NODE_LINEAGE_MISMATCH / PLAN_NODE_TERMINAL / superseded / validated_retry) — pinned by a golden JSON in the tests_golden_tool_registry.json pattern with a deliberate-regeneration rule; a RuleBasedStateMachine hypothesis lane over bind/dispatch/terminal-verdict/reconcile(apply)/retry/foreign-steal interleavings asserts: at most one LIVE delegation per node, a foreign-mission delegation never binds, approval nodes never auto-advance on worker success, states move only along NODE_TRANSITIONS (:100-112), a superseded delegation never advances a successor node, and CAS mismatch raises; both land before the next cutover batch touches operator_mission_plan.py
+- evidence: research 70b8a4343faa4df585767320b3b03722 candidates.md rm-166; churn evidence fresh at 081a083462 (+596 lines / 7 commits / 8 days into a 2,117-line module — assess run de0e2aed0d96 attempt ce426e18515f4862a2b705a145c4e31c finding F2); property-lane precedent test_delegation_lifecycle_properties.py:18-196; proven by the golden + hypothesis lane red-green on a seeded invariant break + full suite green on both SDK lanes
+
+### Frontier drift-guard family: loader-pin staleness sentinel + dependency-floors audit + frontier canary
+- id: `rm-169` | track: reliability | priority: 107.0 | status: candidate
+- acceptance: tools/check_dependency_floors.py (sibling to tools/check_package_hygiene.py) audits pyproject floors vs the installed venv vs the CI exact-pin matrix vs live registry latest, emits JSON consumable by doctor/autopilot, and degrades loudly when offline; a nightly sentinel compares the frozen agent-loader pin (ci.yml:148 cca83848ec79, frozen 2026-10-22) against the sibling release-tag frontier and warns visibly when more than N releases behind; an optional non-required nightly frontier-canary job installs the frontier set (mcp 2.3.0, starlette 1.10.0) and runs core + loader-contract tests as warning-not-gate; the sentinel is proven by a test seeding a fake stale pin; plugin-sourced skill-metadata contract tests (operator_skill_resolution.py:239-251 bare-except silent degradation) fold in as a unit with a pinned plugin fixture
+- evidence: research 70b8a4343faa4df585767320b3b03722 candidates.md rm-169 (CI exact pins mcp 1.28.1/2.0.0/1.30.0/2.2.0 under a research-2026-09-20 comment while SDK 2.3.0 shipped 2026-10-02 and the fleet venv already runs 2.3.0; the 2026-10-22 pip-unsatisfiability window was caught only as a red required lane — PR #67); re-verified live at 081a083462; proven by the seeded-pin test + audit output snapshot + full suite green
+
+### Soak-hold forensics: pending-episode breakdown + transient-blip exclusion
+- id: `rm-172` | track: reliability | priority: 106.0 | status: candidate
+- acceptance: probe_stall_detection_ticks held-window records carry a bounded breakdown (pending episode ids, ages, tick counts, journal-head ts) so 'why is the canary holding' is a one-read diagnosis; the right-edge-pending hold excludes single-tick transient episodes (operator_slo_probe.py:883-888 gains the ticks>1 filter the module's own doctrine :705-707 already applies to the scored denominator) so a self-resolving blip at the journal head no longer flips an otherwise-PASS window to UNKNOWN (:944-948); persistent-episode fail-closed semantics unchanged; a new test covers the single-tick-open-at-head window (either PASS, or a documented decision to keep holding with the rationale in the docstring); the forensics fields are pinned by tests
+- evidence: assess run de0e2aed0d96 attempt ce426e18515f4862a2b705a145c4e31c finding F1 (live 2026-11-27, same tree — all four current right-edge tests use >=2-tick episodes) absorbed via research 70b8a4343faa4df585767320b3b03722 candidates.md rm-172; live 23:45:00Z window burn documented in CHANGELOG Unreleased; proven by the new blip test + forensics field tests + full suite green
+
+### Verification-ritual automation bundle: tools/verify.py + golden capture-stamp matrix + doc tool-count guard
+- id: `rm-170` | track: operator-experience | priority: 105.0 | status: candidate
+- acceptance: tools/verify.py runs the AGENTS.md verification ceremony as one command (smallest-first ordering, full suite under BOTH .venv and .venv-sdk2, tool-inventory + registry-neutrality checks, single summary verdict, golden-regeneration instructions on drift); capture_golden() stamps every interpreter lane it ran under and a meta-test fails when the currently-installed SDK family is absent from captured_under (today the golden records {mcp-2.2.0: true} only, so two-lane regeneration is unprovable — agent-reported, verify at implement); a guard test computes tool counts from tests_golden_tool_registry.json ordered_names and cross-checks every live-doc numeric claim (README.md, docs/autopilot.md, docs/daily-operations.md, docs/mcp-compatibility.md), excluding release notes as historical artifacts
+- evidence: research 70b8a4343faa4df585767320b3b03722 candidates.md rm-170 (ceremony lives in prose; tools/ holds exactly one script; hand-maintained counts in four live docs); re-verified live at 081a083462 (tools/ listing, neutrality-test docstring); proven by the meta-test + count-guard test + full suite green
+
+### Codex CLI minimum-version floor at launch + doctor field
+- id: `rm-173` | track: reliability | priority: 102.0 | status: candidate
+- acceptance: operator_codex.py gains a declarative CODEX_MIN_VERSION with a typed CODEX_VERSION_TOO_OLD refusal in the launch path (today _probe_codex_version :136-146 returns the version string and it is never compared; resolve_codex_exe :169-215 gates only on path); the floor is env-tunable with invalid values falling back to no-floor with a warning (the stall-ceiling env pattern HERMES_GPT_HERMES_AGENT_STALL_CEILING_SECONDS); doctor reports version-vs-floor; tests use fake version probes for both sides of the floor; docs/codex.md notes the floor and its bump cadence (folded into the rm-169 audit output)
+- evidence: research 70b8a4343faa4df585767320b3b03722 candidates.md rm-173 (codex CLI 0.163.0 -> 0.172.0 in ~6 weeks, npm 2026-11-27; no floor anywhere in ROADMAP.md); probe/gating lines re-verified live at 081a083462; proven by the fake-probe tests + full suite green
+
+### pi client profile: compat smoke + setup guide (Gemini-profile pattern)
+- id: `rm-174` | track: operator-experience | priority: 96.0 | status: candidate
+- acceptance: an opt-in pi client profile with a compat test mirroring test_gemini_compat.py (against a pinned pi-coding-agent revision — the loader-pin lesson) and a verified setup guide for running the Operator as an MCP server inside pi-coding-agent; default surfaces unchanged and the read-only/dry-run ladder intact; docs gain the profile page alongside gemini-spark.md / codex.md / windows-chatgpt-codex.md; profile-aware session-history guidance where applicable; acceptance mirrors the open Gemini CLI profile item's shape
+- evidence: research 70b8a4343faa4df585767320b3b03722 candidates.md rm-174 (docs/ maintains the per-client profile pattern; the roadmap already minted the same pattern for Gemini CLI; pi-coding-agent npm 1.3.0 -> 1.7.0 since October; the surrounding delegation fleet runs inside pi with no profile, compat test, or doc); profile-file pattern re-verified live at 081a083462; proven by the compat test + full suite green
+
 ### Adopt upstream skill-loader hardening trio (upstream issue #74 full half)
 - id: `rm-081` | track: operator-experience | priority: 115.0 | status: candidate
 - acceptance: merged tree reconciles fork+upstream halves into a single resolution authority; loader failure is fail-closed with a test proving a required-but-unloadable skill blocks dispatch; probes use preprocess=False with a test asserting inline_shell side effects never run during validation; fork surfaces (plan create/validate/placement) keep enforcement at parity with upstream's breadth (work contracts/swarm); full suite + upstream's new tests green on both SDK lanes
@@ -112,6 +162,7 @@
 
 ### Ship-or-de-reference README-referenced docs; add a shipped-docs guard test
 - id: `rm-046` | track: docs | priority: 60.0 | status: in_progress
+- rider (2026-11-27, run de0e2aed0d96411bb35b77e9c18f4074 roadmap cad700e4c4b949ec9c975c536f91fe5b, from research 70b8a4343faa4df585767320b3b03722): extend the guard from README references to the docs/README.md authority map itself — docs/solutions/ (four incident write-ups) and maintenance-cycle-log.md exist on disk but appear in no map row, and release-notes-v0.16.2.md exists with no v0.16.1/v0.16.2 table row; the guard asserts every docs/ file is mapped (or explicitly historical) and per-row version pins are consistent with pyproject and the on-disk release-notes set
 - acceptance: both docs either added to data-files or de-referenced from README/docs map; NEW guard test asserts every docs/*.md link target in README.md and docs/README.md is in data-files (explicit allowlist for intentionally-unshipped historical docs); runtime-checkout.md refreshed or re-labeled as historical; `python -m build` + `twine check dist/*` + tools/check_package_hygiene.py dist/* run with the two docs present
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
 
@@ -137,6 +188,7 @@
 
 ### Branch protection on codeo1io master (extends rm-008 with red-master evidence)
 - id: `rm-038` | track: reliability | priority: 55.0 | status: candidate
+- rider (2026-11-27, run de0e2aed0d96411bb35b77e9c18f4074 roadmap cad700e4c4b949ec9c975c536f91fe5b, from research 70b8a4343faa4df585767320b3b03722): channel authorization verifies required checks via check-runs on the exact merge/tag commit, tolerating an unavailable or Pro-gated branch-protection rules endpoint with an explicit unverified state instead of assumed green (sibling pattern hermes-agent 622985bff6) — pairs naturally with this item's protection gap and the gh wrong-repo hazard (always -R codeo1io/hermes-gpt)
 - acceptance: master branch protection requires the CI test+lint jobs with linear history; direct pushes restricted to admins; a red push/PR is observed to be rejected once
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
 
@@ -219,6 +271,7 @@
 
 ### Docs/CHANGELOG truthfulness bundle (rm-027 semantics + walk-bound docstring)
 - id: `rm-056` | track: docs | priority: 45.0 | status: in_progress
+- rider (2026-11-27, run de0e2aed0d96411bb35b77e9c18f4074 roadmap cad700e4c4b949ec9c975c536f91fe5b, from research 70b8a4343faa4df585767320b3b03722): README quickstart-first restructure — move 'Choose the path you need' and 'Local quickstart' (today ~line 208 of a 506-line file, buried under twelve per-version narrative sections) above the release narrative and compress the narrative into a release-history index; information-architecture only, no behavior change
 - acceptance: CHANGELOG Unreleased entry documents the fail-closed semantics with an upgrade note for plans referencing unresolvable skills; the shipped-docs guard (rm-046 remainder) covers any new docs; the F8 docstring corrected to describe directory-count semantics (or the counter fixed to count entries, with a test); AGENTS.md "behavior changes → CHANGELOG" rule satisfied for this and future validation-gate landings
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
 
@@ -234,11 +287,13 @@
 
 ### Updater must verify it found a hermes-gpt checkout before fast-forwarding
 - id: `rm-042` | track: reliability | priority: 42.0 | status: in_progress
+- rider (2026-11-27, run de0e2aed0d96411bb35b77e9c18f4074 roadmap cad700e4c4b949ec9c975c536f91fe5b, from research 70b8a4343faa4df585767320b3b03722): post-condition half of the same gate — after fast-forwarding, run test_tool_inventory.py plus a doctor probe against the new tree before restarting, reusing the existing fetch-rollback step machinery (updater.py:435-441); on smoke failure roll back and report a typed failure (verify-the-merge at the fleet's single code-entry point; _source_update today reports applied=True with no post-apply checks, updater.py:93-167)
 - acceptance: candidate roots are verified as hermes-gpt checkouts (pyproject name / package marker / remote URL) with a loud refusal otherwise; regression test using a foreign git-root fixture
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
 
 ### Single peer_main: dedupe the dead entry point and test the packaged peer CLI
 - id: `rm-037` | track: operator-experience | priority: 40.0 | status: candidate
+- rider (2026-11-27, run de0e2aed0d96411bb35b77e9c18f4074 roadmap cad700e4c4b949ec9c975c536f91fe5b, from research 70b8a4343faa4df585767320b3b03722): same legacy-surface family — retire the legacy SSE transport path (server.py:4224-4328 --sse flag + _run_legacy_server, reachable only via the legacy CLI dispatch) via a dry-run-first deletion lane: prove no operator/client depends on SSE (audit + dry-run census first), then remove the flag, branch, and its tests; shrinks the surface both SDK lanes and the neutrality combos must carry
 - acceptance: one canonical peer_main (dead one removed or repointed with a rationale comment); the packaged entry (g4c peer_main / its serve stack, port 4780) covered by at least one test exercising require-secure-transport and the CLI surface
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
 
@@ -299,6 +354,7 @@
 
 ### Own the environment-dependent skips plus an autouse audit-override reset
 - id: `rm-101` | track: security | priority: 25.0 | status: candidate
+- rider (2026-11-27, run de0e2aed0d96411bb35b77e9c18f4074 roadmap cad700e4c4b949ec9c975c536f91fe5b, from research 70b8a4343faa4df585767320b3b03722): timing-bound companions to the skips — desensitize wall-clock-bound tests on hosted runners (acceptance windows, monotonic clocks, right-edge-pending-style holds; 17 test files use sleeps; sibling precedent hermes-agent a797f55204; the live 23:45:00Z journald flush-lag window burn was this class — see rm-172)
 - acceptance: each environment-dependent skip carries an owner note or becomes a hard condition; an autouse fixture resets audit-log override state between tests; full suite green with the fixture in place and no ordering-dependent failures
 - evidence: campaign-recorded in hermes-gpt ROADMAP.md
 

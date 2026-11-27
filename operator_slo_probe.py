@@ -707,7 +707,8 @@ def _stall_episodes(
     ignores), and ``open_pending`` (True only for an episode still OPEN
     at the journal head — its last stall tick IS the final element of
     the whole tick list — with no action tick anywhere yet; the probe
-    scores such an episode as right-edge pending rather than undetected).
+    scores such an episode as right-edge pending rather than undetected,
+    except single-tick transient blips which are never pending).
 
     Returns (episodes, productive_exemptions, explicit_pacing_exemptions,
     operator_lane_latch_exemptions). Every excluded semantic-unhealthy
@@ -798,7 +799,9 @@ def probe_stall_detection(
     Episodes with no action tick count as undetected against both bounds —
     EXCEPT an episode still open at the journal head with no action yet:
     younger than the 15m bound it is right-edge pending (verdict UNKNOWN,
-    reported as ``pending_open_episodes``), not undetected.
+    reported as ``pending_open_episodes``), not undetected. Single-tick
+    transient blips are never pending (the deployed hysteresis ignores
+    them by design), so a self-resolving blip cannot hold a window.
     """
     return probe_stall_detection_ticks(
         parse_watchdog_journal(journal_lines),
@@ -831,6 +834,18 @@ def probe_stall_detection_ticks(
     window); closed episodes are scored exactly as before. A FAIL
     scored from other episodes still dominates (a genuine detection
     failure is never softened by an unrelated pending episode).
+
+    Transient-blip exclusion (rm-172, 2026-11-27): single-tick open
+    episodes at the head are NOT pending — the deployed hysteresis
+    deliberately ignores 1-tick blips — so they are counted only in
+    ``transient_episodes`` and cannot flip a scored-clean PASS window
+    to UNKNOWN. A window whose only episodes are transient blips keeps
+    the long-standing all-transient UNKNOWN (nothing to handle).
+
+    Soak-hold forensics (rm-172): held records carry a bounded
+    ``pending_open_detail`` breakdown (per-episode ``start``, ``age_s``
+    at the journal head, ``ticks``) plus ``journal_head_ts``, making a
+    hold diagnosable in one read instead of re-deriving the journal.
     """
     rec = SloRecord(
         slo_id="stall_detection",
@@ -877,11 +892,18 @@ def probe_stall_detection_ticks(
     # (fail-closed hold: never PASS, never a reset). At/beyond the bound
     # the deployed watchdog had its full SLO window and still never
     # acted: undetected, exactly as before. Closed episodes unaffected.
+    # Transient-blip exclusion (rm-172, 2026-11-27): a single-tick open
+    # episode is NEVER pending — the deployed hysteresis deliberately
+    # ignores 1-tick blips (they are counted transient, excluded from
+    # the judged denominator, and cannot hold a window) — so a
+    # self-resolving blip at the head no longer flips a scored-clean
+    # PASS window to UNKNOWN.
     head_ts = ticks[-1]["__ts"]
     pending_open = [
         ep
         for ep in episodes
         if ep.get("open_pending")
+        and ep["ticks"] > 1
         and (head_ts - ep["start"]) < SLO_STALL_DETECT_MAX_BOUND_MIN * 60.0
     ]
     pending_ids = {id(ep) for ep in pending_open}
@@ -907,6 +929,20 @@ def probe_stall_detection_ticks(
         "within_5m": within5,
         "undetected": undetected,
         "pending_open_episodes": len(pending_open),
+        # Soak-hold forensics (rm-172): a bounded breakdown of the held
+        # window's pending episodes plus the journal-head timestamp, so
+        # "why is the canary holding" is a one-read diagnosis. By
+        # construction at most ONE episode is open at the head; the [:5]
+        # slice is a defensive bound, not an expected truncation.
+        "pending_open_detail": [
+            {
+                "start": ep["start"],
+                "age_s": round(head_ts - ep["start"], 1),
+                "ticks": ep["ticks"],
+            }
+            for ep in pending_open[:5]
+        ],
+        "journal_head_ts": head_ts,
         "excused_productive_ticks": excused_productive,
         "excused_pacing_ticks": excused_pacing,
         "excused_operator_lane_ticks": excused_operator_lane,
@@ -943,9 +979,10 @@ def probe_stall_detection_ticks(
         PASS if pct >= SLO_STALL_DETECT_PCT_WITHIN_5M and bounded else FAIL
     )
     if rec.verdict == PASS and pending_open:
-        # Fail-closed right edge: a scored-clean window with an episode
-        # still in flight is not judgeable yet — hold (UNKNOWN), never
-        # promote off an open right edge.
+        # Fail-closed right edge: a scored-clean window with a PERSISTENT
+        # episode still in flight is not judgeable yet — hold (UNKNOWN),
+        # never promote off an open right edge. (Transient single-tick
+        # blips are excluded above and can never trigger this hold.)
         rec.verdict = UNKNOWN
     rec.notes.append(
         "persistent = multi-tick semantic-unhealthy runs; single-tick "

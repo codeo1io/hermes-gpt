@@ -726,3 +726,56 @@ def test_ui_cron_dispatch_check_declares_in_process_scope():
     assert result["code"] == "UI_CRON_DISPATCH_OK"
     assert result["scope"] == "in-process"
     assert "this process" in result["message"]
+
+
+def test_doctor_codex_version_below_floor_warns(monkeypatch, hermes_root, clean_env, audit_override):
+    """rm-173: with the codex runner armed and a below-floor CLI resolved,
+    doctor reports WARN CODEX_VERSION_BELOW_FLOOR carrying the probed
+    version and the effective floor, so the gate is visible before a
+    launch is refused."""
+    import operator_codex as oc
+
+    monkeypatch.setenv(oc.ENABLE_CODEX_RUNNER_ENV, "1")
+    monkeypatch.setattr(
+        od.op_codex,
+        "resolve_codex_exe",
+        lambda: {"path": "/fake/codex", "source": "path",
+                 "version": "codex-cli 0.150.0", "reason": None, "skipped": []},
+    )
+    out = od.hermes_operator_doctor(profile="default", hermes_root=hermes_root)
+    parsed = json.loads(out)
+    check = parsed["checks"]["codex_version"]
+    assert check["status"] == "WARN"
+    assert check["code"] == "CODEX_VERSION_BELOW_FLOOR"
+    assert check["codex_version"] == "codex-cli 0.150.0"
+    assert check["codex_min_version"] == oc.CODEX_MIN_VERSION_DEFAULT
+
+
+def test_doctor_codex_version_floor_satisfied_passes(monkeypatch, hermes_root, clean_env, audit_override):
+    """rm-173: an at-floor CLI passes the doctor check with the floor in
+    the payload."""
+    import operator_codex as oc
+
+    monkeypatch.setenv(oc.ENABLE_CODEX_RUNNER_ENV, "1")
+    monkeypatch.setattr(
+        od.op_codex,
+        "resolve_codex_exe",
+        lambda: {"path": "/fake/codex", "source": "path",
+                 "version": f"codex-cli {oc.CODEX_MIN_VERSION_DEFAULT}", "reason": None, "skipped": []},
+    )
+    out = od.hermes_operator_doctor(profile="default", hermes_root=hermes_root)
+    parsed = json.loads(out)
+    check = parsed["checks"]["codex_version"]
+    assert check["status"] == "PASS"
+    assert check["code"] == "CODEX_VERSION_OK"
+
+
+def test_doctor_codex_version_check_disabled_is_unsupported(hermes_root, clean_env, audit_override):
+    """rm-173: with the codex runner disabled (the default read-only
+    posture), the check is UNSUPPORTED — informational, never a failure,
+    and no codex probe is attempted."""
+    out = od.hermes_operator_doctor(profile="default", hermes_root=hermes_root)
+    parsed = json.loads(out)
+    check = parsed["checks"]["codex_version"]
+    assert check["status"] == "UNSUPPORTED"
+    assert check["code"] == "CODEX_RUNNER_DISABLED"
