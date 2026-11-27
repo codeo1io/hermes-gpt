@@ -456,9 +456,14 @@ def _vacuous_unknown_ids(doc: dict[str, Any] | None) -> list[str]:
         if val.get("coverage_complete") is not True:
             continue
         if rec["slo_id"] == "stall_detection":
+            # Right-edge pending (2026-11-27): an episode still OPEN at
+            # the journal head is UNJUDGEABLE, not measured-zero — it
+            # must stay a gap-UNKNOWN so the soak HOLDS the window
+            # instead of verifying a window measured over a live episode.
             measured_zero = (
                 val.get("persistent_episodes", 0) == 0
                 and val.get("episodes", 0) == 0
+                and val.get("pending_open_episodes", 0) == 0
             )
         else:  # auto_recovery
             measured_zero = val.get("restarts") == 0

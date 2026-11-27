@@ -345,6 +345,105 @@ class TestStallDetection:
         assert rec.verdict == slo.FAIL
         assert rec.value["undetected"] == 1
 
+    def test_pending_open_younger_than_bound_is_unknown(self) -> None:
+        """Right-edge pending (2026-11-27 23:45:00Z live soak FAIL, receipt
+        soak-stall-probe-right-edge-race-20261127T0022Z.json): a stall run
+        still OPEN at the journal head with no action tick yet, younger
+        than the 15m bound, is PENDING — not undetected. Excluded from
+        ``undetected`` and from the judged denominator; verdict UNKNOWN
+        (fail-closed hold: never PASS, never a reset-driving FAIL)."""
+        lines = [
+            watchdog_line(ts_at(0), {"semantic_healthy": True}),
+            watchdog_line(ts_at(60), {"semantic_healthy": False}),
+            watchdog_line(ts_at(120), {"semantic_healthy": False}),
+        ]
+        rec = slo.probe_stall_detection(lines)
+        assert rec.verdict == slo.UNKNOWN, rec.value
+        assert rec.value["pending_open_episodes"] == 1
+        assert rec.value["undetected"] == 0
+        assert rec.denominator == 0
+        assert any(
+            "pending open episode" in n for n in rec.notes
+        )
+
+    def test_pending_open_at_bound_is_undetected_fail(self) -> None:
+        """An episode still open at the journal head but at/beyond the 15m
+        bound had the watchdog's full SLO window with no action ever fired:
+        undetected -> FAIL, exactly as before the right-edge fix."""
+        lines = [
+            watchdog_line(ts_at(0), {"semantic_healthy": False}),
+            watchdog_line(ts_at(60), {"semantic_healthy": False}),
+            watchdog_line(ts_at(900), {"semantic_healthy": False}),
+        ]
+        rec = slo.probe_stall_detection(lines)
+        assert rec.verdict == slo.FAIL, rec.value
+        assert rec.value["undetected"] == 1
+        assert rec.value["pending_open_episodes"] == 0
+        assert rec.denominator == 1
+
+    def test_pending_open_holds_a_scored_clean_window(self) -> None:
+        """Closed episode handled in time + a young open episode at the
+        head: the scored set is clean, but the open right edge withholds
+        PASS — UNKNOWN with pending=1, the scored episode still reported
+        (so the soak evaluator holds instead of promoting)."""
+        lines = [
+            watchdog_line(ts_at(0), {"semantic_healthy": True}),
+            watchdog_line(ts_at(60), {"semantic_healthy": False}),
+            watchdog_line(
+                ts_at(240),
+                {"semantic_healthy": False, "restarted": True},
+            ),
+            watchdog_line(ts_at(300), {"semantic_healthy": True}),
+            watchdog_line(ts_at(360), {"semantic_healthy": False}),
+            watchdog_line(ts_at(420), {"semantic_healthy": False}),
+        ]
+        rec = slo.probe_stall_detection(lines)
+        assert rec.verdict == slo.UNKNOWN, rec.value
+        assert rec.value["pending_open_episodes"] == 1
+        assert rec.value["within_5m"] == 1
+        assert rec.value["undetected"] == 0
+        assert rec.denominator == 1
+
+    def test_right_edge_race_live_2345_flip(self) -> None:
+        """The live 23:45:00Z soak FAIL reproduced: identical tick prefix,
+        only the right edge differs. Sampled at the stale journal head
+        (episode run start +120s, engagement tick not yet flushed to
+        journald) the open episode is pending-UNKNOWN instead of FAIL;
+        with the engagement tick present the SAME episode is handled in
+        254s (engagement IS the handling under the KTD4 model) and the
+        window PASSes."""
+        prefix = [
+            watchdog_line(ts_at(0), {"semantic_healthy": True}),
+            watchdog_line(
+                ts_at(60),
+                {"supervisor": {"semantic_healthy": False, "execution_state": "IDLE"}},
+            ),
+            watchdog_line(
+                ts_at(180),
+                {"supervisor": {"semantic_healthy": False, "execution_state": "IDLE"}},
+            ),
+        ]
+        stale = slo.probe_stall_detection(prefix)
+        assert stale.verdict == slo.UNKNOWN, stale.value
+        assert stale.value["pending_open_episodes"] == 1
+        assert stale.value["undetected"] == 0
+
+        engaged = slo.probe_stall_detection(
+            prefix
+            + [
+                watchdog_line(
+                    ts_at(314),
+                    {"supervisor": {"semantic_healthy": False, "execution_state": "CYCLING", "execution_healthy": True}},
+                ),
+                watchdog_line(ts_at(374), {"semantic_healthy": True}),
+            ]
+        )
+        assert engaged.verdict == slo.PASS, engaged.value
+        assert engaged.value["within_5m"] == 1
+        assert engaged.value["worst_latency_s"] == 254.0
+        assert engaged.value["undetected"] == 0
+        assert engaged.value["pending_open_episodes"] == 0
+
     def test_idle_stall_engaged_within_bound_is_detected(self) -> None:
         """The 2026-11-08 18:04:34Z live shape: two IDLE semantic-unhealthy
         ticks (nothing working the backlog), then the supervisor ENGAGES

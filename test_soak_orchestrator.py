@@ -428,6 +428,42 @@ def test_vacuous_classification_requires_proven_zero(store):
     assert r["action"] == "reset"
 
 
+def test_pending_open_stall_unknown_is_not_vacuous_it_holds(store):
+    # right-edge pending (2026-11-27, live 23:45:00Z soak reset): a
+    # stall_detection UNKNOWN with an episode still OPEN at the journal
+    # head is UNJUDGEABLE, not measured-zero — even with proven coverage
+    # it must stay a gap-UNKNOWN so the soak HOLDS the window instead of
+    # verifying (and promoting on) a window measured over a live episode.
+    doc = {
+        "summary": {"pass": 6, "fail": 0, "unknown": 2,
+                    "failed_ids": [],
+                    "unknown_ids": ["stall_detection", "auto_recovery"]},
+        "records": [
+            {"slo_id": "false_success", "verdict": "PASS"},
+            {"slo_id": "duplicate_dispatch", "verdict": "PASS"},
+            {"slo_id": "double_claim", "verdict": "PASS"},
+            {"slo_id": "routine_completion", "verdict": "PASS"},
+            {"slo_id": "continuity", "verdict": "PASS"},
+            {"slo_id": "disk_free", "verdict": "PASS"},
+            {"slo_id": "stall_detection", "verdict": "UNKNOWN",
+             "value": {"persistent_episodes": 0, "episodes": 0,
+                       "pending_open_episodes": 1, "undetected": 0,
+                       "coverage_complete": True}},
+            {"slo_id": "auto_recovery", "verdict": "UNKNOWN",
+             "value": {"restarts": 0, "coverage_complete": True}},
+        ],
+    }
+    assert soak._vacuous_unknown_ids(doc) == ["auto_recovery"]
+    started(store, now=0.0, window_s=100.0)
+    r = soak.run_soak_tick(store, now=100.0, probe_runner=lambda: doc)
+    assert r["probe_verdict"] == slo.UNKNOWN
+    assert r["tick"]["probe_gap_unknown_ids"] == ["stall_detection"]
+    # the pending episode holds the window: no promotion, no reset
+    assert r["action"] == "hold", r["reason"]
+    assert store.load_state()["stage"] == "A"
+    assert store.load_state().get("promotions", 0) == 0
+
+
 def test_tick_violation_resets_canary(store):
     started(store, now=0.0, window_s=1000.0)
     r = soak.run_soak_tick(store, now=10.0, probe_runner=pass_doc,
