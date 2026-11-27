@@ -704,7 +704,10 @@ def _stall_episodes(
     (first action tick minus start; None when no action ever fired in
     the episode — undetected, counted against the target), ``ticks`` (run
     length; 1 = transient blip the deployed hysteresis deliberately
-    ignores).
+    ignores), and ``open_pending`` (True only for an episode still OPEN
+    at the journal head — its last stall tick IS the final element of
+    the whole tick list — with no action tick anywhere yet; the probe
+    scores such an episode as right-edge pending rather than undetected).
 
     Returns (episodes, productive_exemptions, explicit_pacing_exemptions,
     operator_lane_latch_exemptions). Every excluded semantic-unhealthy
@@ -724,6 +727,7 @@ def _stall_episodes(
                     action_ts - first_ts if action_ts is not None else None
                 ),
                 "ticks": len(run),
+                "open_pending": False,
             }
         )
 
@@ -763,6 +767,15 @@ def _stall_episodes(
                 following.append(tick)
     if cur:
         close(cur)
+        # Right-edge pending (2026-11-27): this run's last stall tick IS
+        # the final element of the whole tick list — the episode is still
+        # OPEN at the journal head, and the lookahead ``following`` is
+        # empty by construction (reset when the run's last stall tick was
+        # appended), so latency None means no action has fired anywhere
+        # yet. The episode's outcome is not yet decided; the probe scores
+        # it as pending rather than undetected.
+        if episodes[-1]["latency_s"] is None:
+            episodes[-1]["open_pending"] = True
     return episodes, excused, pacing_excused, operator_lane_excused
 
 
@@ -782,7 +795,10 @@ def probe_stall_detection(
 
     Latency uses the journal's own line timestamps. Ticks without usable
     timestamps yield UNKNOWN (approximating latency would be gaming).
-    Episodes with no action tick count as undetected against both bounds.
+    Episodes with no action tick count as undetected against both bounds —
+    EXCEPT an episode still open at the journal head with no action yet:
+    younger than the 15m bound it is right-edge pending (verdict UNKNOWN,
+    reported as ``pending_open_episodes``), not undetected.
     """
     return probe_stall_detection_ticks(
         parse_watchdog_journal(journal_lines),
@@ -800,6 +816,21 @@ def probe_stall_detection_ticks(
     ``collect_all`` passes pre-merged ticks (journal + rolling archive,
     window-filtered); the public line-based API delegates here after
     parsing, so both entry points share one verdict arithmetic.
+
+    Right-edge pending (2026-11-27): an episode still OPEN at the head
+    of ``ticks`` (its last stall tick is the final element of the list)
+    with no action tick yet has not had its full chance to be handled —
+    a soak tick sampling a young live episode, or a journald flush lag
+    of a couple of minutes, used to score it undetected and FAIL a
+    healthy window. Younger than the 15m bound (newest tick ts − episode
+    start) it is excluded from ``undetected`` and from the judged
+    denominator, counted in ``pending_open_episodes``, and the verdict
+    is UNKNOWN — fail-closed: withhold promotion, never PASS, never a
+    FAIL that resets a soak window. At/beyond the bound the old
+    undetected→FAIL semantics stand (the watchdog had its whole SLO
+    window); closed episodes are scored exactly as before. A FAIL
+    scored from other episodes still dominates (a genuine detection
+    failure is never softened by an unrelated pending episode).
     """
     rec = SloRecord(
         slo_id="stall_detection",
@@ -835,10 +866,31 @@ def probe_stall_detection_ticks(
     persistent = [ep for ep in episodes if ep["ticks"] > 1]
     transient = len(episodes) - len(persistent)
 
+    # Right-edge pending (2026-11-27, live 23:45:00Z soak FAIL): an
+    # episode still OPEN at the journal head with no action tick has
+    # not yet had its full chance to be handled — a 15-min soak tick
+    # sampling a young live episode (or a ~2min journald flush lag)
+    # used to score it undetected and burn a canary window reset on a
+    # healthy system. Younger than the 15m SLO bound measured from the
+    # episode start to the newest observed tick: pending — excluded
+    # from undetected and from the judged denominator, verdict UNKNOWN
+    # (fail-closed hold: never PASS, never a reset). At/beyond the bound
+    # the deployed watchdog had its full SLO window and still never
+    # acted: undetected, exactly as before. Closed episodes unaffected.
+    head_ts = ticks[-1]["__ts"]
+    pending_open = [
+        ep
+        for ep in episodes
+        if ep.get("open_pending")
+        and (head_ts - ep["start"]) < SLO_STALL_DETECT_MAX_BOUND_MIN * 60.0
+    ]
+    pending_ids = {id(ep) for ep in pending_open}
+    scored = [ep for ep in persistent if id(ep) not in pending_ids]
+
     within5 = 0
     undetected = 0
     worst: float | None = None
-    for ep in persistent:
+    for ep in scored:
         lat = ep["latency_s"]
         if lat is None:
             undetected += 1
@@ -846,7 +898,7 @@ def probe_stall_detection_ticks(
         if lat <= 300.0:
             within5 += 1
         worst = lat if worst is None else max(worst, lat)
-    denom = len(persistent)
+    denom = len(scored)
     rec.numerator = within5
     rec.denominator = denom
     rec.value = {
@@ -854,6 +906,7 @@ def probe_stall_detection_ticks(
         "transient_episodes": transient,
         "within_5m": within5,
         "undetected": undetected,
+        "pending_open_episodes": len(pending_open),
         "excused_productive_ticks": excused_productive,
         "excused_pacing_ticks": excused_pacing,
         "excused_operator_lane_ticks": excused_operator_lane,
@@ -862,9 +915,23 @@ def probe_stall_detection_ticks(
             round(worst / 60.0, 2) if worst is not None else None
         ),
     }
+    if pending_open:
+        rec.notes.append(
+            f"pending open episode(s) at journal head: "
+            f"{len(pending_open)} (younger than 15m bound; right-edge "
+            "pending, not undetected)"
+        )
     if denom == 0:
         rec.verdict = UNKNOWN
-        rec.notes.append("only transient blips in window (nothing to handle)")
+        if pending_open:
+            rec.notes.append(
+                "all persistent episodes pending at journal head; "
+                "verdict held"
+            )
+        else:
+            rec.notes.append(
+                "only transient blips in window (nothing to handle)"
+            )
         return rec
     pct = (within5 / denom) * 100.0
     bounded = (
@@ -875,6 +942,11 @@ def probe_stall_detection_ticks(
     rec.verdict = (
         PASS if pct >= SLO_STALL_DETECT_PCT_WITHIN_5M and bounded else FAIL
     )
+    if rec.verdict == PASS and pending_open:
+        # Fail-closed right edge: a scored-clean window with an episode
+        # still in flight is not judgeable yet — hold (UNKNOWN), never
+        # promote off an open right edge.
+        rec.verdict = UNKNOWN
     rec.notes.append(
         "persistent = multi-tick semantic-unhealthy runs; single-tick "
         "self-resolving blips counted separately (hysteresis by design); "
