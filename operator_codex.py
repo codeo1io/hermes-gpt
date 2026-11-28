@@ -12,6 +12,7 @@ import signal
 import subprocess
 import sys
 import threading
+import warnings
 from datetime import datetime, timezone, timedelta
 from typing import Any
 from uuid import uuid4
@@ -21,6 +22,13 @@ import operator_policy as op
 
 ENABLE_CODEX_RUNNER_ENV = "HERMES_GPT_ENABLE_CODEX_RUNNER"
 ALLOW_CODEX_WRITE_ENV = "HERMES_GPT_ALLOW_CODEX_WRITE"
+# Minimum Codex CLI version the delegated-worker surface will launch (rm-173).
+# 0.163.0 is the last release verified against this integration's protocol
+# expectations (research 2026-10-15); the npm frontier moves ~weekly
+# (0.172.0 as of 2026-11-27). Overridable per deployment via
+# CODEX_MIN_VERSION_ENV; invalid overrides fall back here with a warning.
+CODEX_MIN_VERSION_ENV = "HERMES_GPT_CODEX_MIN_VERSION"
+CODEX_MIN_VERSION_DEFAULT = "0.163.0"
 CODEX_EXE_ENV = "HERMES_GPT_CODEX_EXE"
 WINDOWS_APPS_MARKER = "WindowsApps"
 CODEX_PROBE_TIMEOUT = 10
@@ -144,6 +152,53 @@ def _probe_codex_version(exe: Path) -> str | None:
     return (result.stdout or result.stderr or "").strip()
 
 
+_CODEX_VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
+
+
+def _parse_codex_version(value: str | None) -> tuple[int, int, int] | None:
+    """Parse a ``major.minor.patch`` triple out of a ``codex --version``
+    string (e.g. ``codex-cli 0.172.0``). None when nothing parseable —
+    custom builds and unexpected banners degrade to un-floored, never
+    blocked."""
+    match = _CODEX_VERSION_RE.search(value or "")
+    if not match:
+        return None
+    return (int(match[1]), int(match[2]), int(match[3]))
+
+
+def codex_min_version() -> tuple[int, int, int]:
+    """Effective minimum Codex CLI version, as a comparable tuple.
+
+    Precedence: CODEX_MIN_VERSION_ENV override, else the built-in default.
+    An override that does not parse is NOT fatal: fall back to the default
+    with a warning (the stall-ceiling env pattern) so a typo cannot brick
+    the runner or silently disable the floor.
+    """
+    override = os.environ.get(CODEX_MIN_VERSION_ENV, "").strip()
+    if not override:
+        return _parse_codex_version(CODEX_MIN_VERSION_DEFAULT)  # type: ignore[return-value]
+    parsed = _parse_codex_version(override)
+    if parsed is None:
+        warnings.warn(
+            f"{CODEX_MIN_VERSION_ENV}={override!r} is not a parseable "
+            f"version; falling back to the default {CODEX_MIN_VERSION_DEFAULT}.",
+            stacklevel=2,
+        )
+        return _parse_codex_version(CODEX_MIN_VERSION_DEFAULT)  # type: ignore[return-value]
+    return parsed
+
+
+def _codex_version_too_old(version: str | None) -> bool:
+    """True only when the version PARSES and is below the effective floor.
+    Unparseable probe output is deliberately not blocked: the floor gates
+    versions it can read, and a readable-but-odd banner from a working CLI
+    degrades to an un-floored launch instead of a refusal."""
+    parsed = _parse_codex_version(version)
+    if parsed is None:
+        return False
+    return parsed < codex_min_version()
+
+
 def _path_candidates() -> list[Path]:
     """All `codex` candidates from PATH in order, deduplicated by resolved path."""
     seen: set[str] = set()
@@ -218,6 +273,13 @@ def _argv(*, workdir: Path, sandbox: str, execution_mode: str, prompt: str, mode
     if not resolution["path"]:
         return _safe_error("CODEX_EXE_UNAVAILABLE", resolution["reason"] or "No launchable Codex CLI executable was found.",
                            f"Install the standalone Codex CLI, or set {CODEX_EXE_ENV} to an absolute path outside {WINDOWS_APPS_MARKER}.")
+    if _codex_version_too_old(resolution.get("version")):
+        floor = ".".join(str(part) for part in codex_min_version())
+        return _safe_error(
+            "CODEX_VERSION_TOO_OLD",
+            f"Resolved Codex CLI {resolution.get('version')} is older than the required minimum {floor}.",
+            f"Update the standalone Codex CLI, or set {CODEX_MIN_VERSION_ENV} to a verified lower floor.",
+        )
     codex = resolution["path"]
     argv = [codex]
     if execution_mode == "nolo" and not review:
@@ -270,6 +332,14 @@ def hermes_codex_status(hermes_root: Path | None = None) -> dict[str, Any]:
         status["codex_reason"] = resolution["reason"]
     if resolution["skipped"]:
         status["codex_skipped"] = list(resolution["skipped"])
+    status["codex_min_version"] = ".".join(
+        str(part) for part in codex_min_version()
+    )
+    parsed_version = _parse_codex_version(resolution["version"])
+    if parsed_version is not None:
+        status["codex_version_ok"] = not _codex_version_too_old(
+            resolution["version"]
+        )
     return status
 
 

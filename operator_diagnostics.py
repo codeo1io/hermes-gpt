@@ -26,6 +26,7 @@ from typing import Any
 import operator_policy as op
 import operator_config as op_config
 import operator_workspace as op_workspace
+import operator_codex as op_codex
 from versioning import VERSION
 
 # ---------------------------------------------------------------------------
@@ -678,6 +679,78 @@ def _check_ui_mount() -> dict[str, Any]:
     )
 
 
+def _check_codex_version() -> dict[str, Any]:
+    """Codex CLI version-vs-floor (rm-173): the delegated-worker launch path
+    refuses a resolved CLI below the effective minimum version
+    (HERMES_GPT_CODEX_MIN_VERSION, default pinned in operator_codex).
+    Doctor surfaces the same verdict so the gate is visible before a
+    launch is refused. With the codex runner disabled (the default
+    read-only posture) the check is UNSUPPORTED — informational only, no
+    probe attempted."""
+    if not op.env_truthy(op_codex.ENABLE_CODEX_RUNNER_ENV):
+        return _check_result(
+            status=STATUS_UNSUPPORTED,
+            layer="codex",
+            code="CODEX_RUNNER_DISABLED",
+            message="Codex runner is disabled (default read-only posture); version floor not evaluated.",
+            suggested_action=f"Set {op_codex.ENABLE_CODEX_RUNNER_ENV}=1 to arm the delegated-worker surface.",
+        )
+    resolution = op_codex.resolve_codex_exe()
+    floor = ".".join(str(part) for part in op_codex.codex_min_version())
+    if not resolution.get("path"):
+        return _check_result(
+            status=STATUS_WARN,
+            layer="codex",
+            code="CODEX_EXE_NOT_FOUND",
+            message=(
+                "Codex runner is armed but no launchable Codex CLI was "
+                f"resolved: {resolution.get('reason') or 'unavailable'}."
+            ),
+            suggested_action=(
+                "Install the standalone Codex CLI, or set "
+                f"{op_codex.CODEX_EXE_ENV} to an absolute path."
+            ),
+            extra={"codex_min_version": floor},
+        )
+    version = resolution.get("version")
+    if op_codex._codex_version_too_old(version):
+        return _check_result(
+            status=STATUS_WARN,
+            layer="codex",
+            code="CODEX_VERSION_BELOW_FLOOR",
+            message=(
+                f"Resolved Codex CLI {version} is older than the required "
+                f"minimum {floor}; delegated launches are refused."
+            ),
+            suggested_action=(
+                "Update the standalone Codex CLI, or set "
+                f"{op_codex.CODEX_MIN_VERSION_ENV} to a verified lower floor."
+            ),
+            extra={"codex_version": version, "codex_min_version": floor},
+        )
+    if op_codex._parse_codex_version(version) is None:
+        return _check_result(
+            status=STATUS_WARN,
+            layer="codex",
+            code="CODEX_VERSION_UNPARSEABLE",
+            message=(
+                f"Resolved Codex CLI reports an unparseable version string "
+                f"({version!r}); the floor cannot be evaluated and launches "
+                "proceed un-floored."
+            ),
+            suggested_action="Verify the codex installation, or pin a known release.",
+            extra={"codex_version": version, "codex_min_version": floor},
+        )
+    return _check_result(
+        status=STATUS_PASS,
+        layer="codex",
+        code="CODEX_VERSION_OK",
+        message=f"Resolved Codex CLI {version} meets the required minimum {floor}.",
+        suggested_action="No action needed.",
+        extra={"codex_version": version, "codex_min_version": floor},
+    )
+
+
 def _check_connector_api_bridge(profile_home: Path) -> dict[str, Any]:
     """Best-effort connector check. Always reports UNSUPPORTED because hermes-gpt
     does not implement a connector re-registration API or health endpoint.
@@ -745,6 +818,7 @@ def hermes_operator_doctor(
             "ui_mount": _check_ui_mount(),
             "ui_cron_dispatch": _check_ui_cron_dispatch(),
             "connector_api_bridge": _check_connector_api_bridge(profile_home),
+            "codex_version": _check_codex_version(),
         }
 
         failed = [name for name, c in checks.items() if c["status"] == STATUS_FAIL]

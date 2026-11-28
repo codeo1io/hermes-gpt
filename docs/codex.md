@@ -189,6 +189,33 @@ Important status fields include:
 - `codex_source`
 - `codex_version` when available
 - `codex_reason` when unavailable
+- `codex_min_version` — the effective minimum version the launch path enforces
+- `codex_version_ok` when the probed version parses — `false` means launches are currently refused
+
+#### Minimum version floor
+
+The delegated-worker launch path refuses a resolved Codex CLI older than a
+minimum version (typed error `CODEX_VERSION_TOO_OLD`) instead of failing
+later with opaque protocol errors. The default floor is `0.163.0` — the
+last release verified against this integration's protocol expectations —
+and the npm frontier moves roughly weekly (0.172.0 as of 2026-11-27), so
+verify locally with `codex --version` after upgrades.
+
+Per-deployment override (invalid values fall back to the default with a
+warning, never silently disabling the floor):
+
+```powershell
+$env:HERMES_GPT_CODEX_MIN_VERSION="0.170.0"
+```
+
+A probe result that launches but does not parse (custom builds, unexpected
+banners) is not blocked: the floor gates versions it can read. The floor
+verdict is also surfaced by `hermes_operator_doctor` (check `codex_version`:
+`CODEX_VERSION_OK` / `CODEX_VERSION_BELOW_FLOOR` /
+`CODEX_VERSION_UNPARSEABLE` / `CODEX_EXE_NOT_FOUND`, or `UNSUPPORTED` when
+the codex runner is disabled). Floor-bump cadence: raise the default only
+to versions verified against the integration (see the roadmap's audit
+item for a drift-guard that reports the default vs. the npm frontier).
 
 ### Work-directory requirements
 
